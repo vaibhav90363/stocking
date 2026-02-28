@@ -16,6 +16,21 @@ sys.path.insert(0, str(ROOT))
 
 from stocking_app.strategy_loader import discover_strategies, StrategyConfig
 
+# ── Cloud Routing (Dashboard view) ──────────────────────────────────────────────
+if "strategy" in st.query_params:
+    strat_id = st.query_params["strategy"]
+    strategy_path = ROOT / "strategies" / strat_id
+    if strategy_path.exists():
+        # Override the command-line args for dashboard.py
+        sys.argv = ["streamlit", "run", "dashboard.py", "--strategy-dir", str(strategy_path)]
+        dash_path = str(ROOT / "dashboard.py")
+        import runpy
+        runpy.run_path(dash_path, run_name="__main__")
+        st.stop()
+    else:
+        st.error(f"Strategy {strat_id} not found.")
+        st.button("Back to Hub", on_click=lambda: st.query_params.clear())
+
 
 # ── Helper — read live state from a strategy's DB ─────────────────────────────
 def _read_strategy_state(sc: StrategyConfig) -> dict:
@@ -220,15 +235,10 @@ for sc, row in zip(strategies, strategy_states):
                 ], cwd=str(ROOT))
                 st.toast(f"Live engine started for {sc.name}")
         with b3:
-            port = 8501 + strategies.index(sc)
-            if st.button(f"📊 Dashboard :{port}", key=f"dash_{sc.strategy_dir.name}"):
-                subprocess.Popen([
-                    sys.executable, str(ROOT / "run_strategy.py"),
-                    str(sc.strategy_dir), "--mode", "dashboard",
-                    "--port", str(port),
-                ], cwd=str(ROOT))
-                st.toast(f"Dashboard opening at http://localhost:{port}")
-                st.markdown(f"[Open →](http://localhost:{port})")
+            def _nav_to_dashboard(s_name=sc.strategy_dir.name):
+                st.query_params["strategy"] = s_name
+
+            st.button(f"📊 View Dashboard", key=f"dash_{sc.strategy_dir.name}", on_click=_nav_to_dashboard)
         with b4:
             log_f = sc.log_dir / "engine.log"
             if log_f.exists():
