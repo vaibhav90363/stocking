@@ -97,6 +97,25 @@ def cmd_live(sc, args):
     _run_cli(["set-engine", "--enabled", "true"], env)
 
     print(f"\n  Starting engine … (Ctrl-C to stop)\n")
+    
+    # ── Render Web Service Healthcheck Bypass ──
+    if os.environ.get("RENDER") or os.environ.get("PORT"):
+        import threading
+        from http.server import HTTPServer, BaseHTTPRequestHandler
+        class HealthCheckHandler(BaseHTTPRequestHandler):
+            def do_GET(self):
+                self.send_response(200)
+                self.send_header('Content-type','text/plain')
+                self.end_headers()
+                self.wfile.write(b"Engine is running.")
+            def log_message(self, format, *args):
+                pass
+        
+        port = int(os.environ.get("PORT", 8080))
+        httpd = HTTPServer(('0.0.0.0', port), HealthCheckHandler)
+        print(f"  [Render] Starting dummy HTTP server on port {port} for health checks...")
+        threading.Thread(target=httpd.serve_forever, daemon=True).start()
+
     result = subprocess.run(
         [sys.executable, "-m", "stocking_app.cli", "run-engine"],
         env=env, cwd=str(ROOT),
