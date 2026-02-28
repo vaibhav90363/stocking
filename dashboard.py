@@ -43,9 +43,22 @@ div[data-testid="stDataFrameContainer"] { border-radius: 8px; }
 
 # ── Load config & repo ─────────────────────────────────────────────────────────
 cfg  = load_config()
-repo = TradingRepository(cfg.db_path)
+repo = TradingRepository(cfg.database_url or cfg.db_path)
 repo.init_db()
-db_dir   = Path(cfg.db_path).parent
+import sys
+import argparse
+
+parser = argparse.ArgumentParser()
+parser.add_argument("--strategy-dir", type=str, required=False)
+args, unknown = parser.parse_known_args()
+
+if args.strategy_dir:
+    strategy_dir = Path(args.strategy_dir)
+else:
+    # fallback if not provided
+    strategy_dir = Path.cwd()
+
+db_dir   = strategy_dir / "data"
 log_file = db_dir / "logs" / "engine.log"
 
 # ── Sidebar — System Parameters & Controls ─────────────────────────────────────
