@@ -9,6 +9,8 @@ strategy_type: fractal_momentum
 exchange:
   suffix: ".NS"
   timezone: "Asia/Kolkata"
+  market_open: "09:15"
+  market_close: "15:30"
 
 engine:
   cycle_seconds: 300

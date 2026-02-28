@@ -178,7 +178,39 @@ st.markdown("## Strategy Instances")
 for sc, row in zip(strategies, strategy_states):
     with st.container():
         state    = row.get("engine_state", "offline")
-        dot      = "🟢" if state == "running" else ("🟡" if state == "paused" else "⚫")
+        # Market status — compute live for this strategy's exchange
+        from stocking_app.market_schedule import (
+            market_status as _ms, fmt_duration as _fmt
+        )
+        _mkt = _ms(sc.timezone, sc.market_open, sc.market_close)
+        _mkt_open     = _mkt["market_open"]
+        _next_evt     = _mkt["next_event"]
+        _next_in      = _mkt["next_event_in"]
+        _mkt_badge    = "🟢 OPEN" if _mkt_open else "⚫ CLOSED"
+        _mkt_badge_clr= "#14532d" if _mkt_open else "#1c1917"
+
+        # Safety guard — is a cycle actively in progress?
+        _hb            = row  # hub reads heartbeat via _read_strategy_state
+        _cycle_start   = _hb.get("cycle_started_at")
+        _cycle_secs    = int(_hb.get("cycle_seconds", sc.cycle_seconds))
+        _cycle_active  = False
+        _secs_left     = 0
+        if _cycle_start and state in ("running", "starting"):
+            import datetime as _dt
+            try:
+                _started = _dt.datetime.fromisoformat(_cycle_start.replace("Z","+00:00"))
+                _age = (_dt.datetime.now(_dt.timezone.utc) - _started).total_seconds()
+                _secs_left = max(0, int(_cycle_secs - _age))
+                _cycle_active = _age < _cycle_secs
+            except Exception:
+                pass
+
+        if state in ("running", "starting"):
+            dot = "🟢" if state == "running" else "🟡"
+        elif state == "paused_market_closed":
+            dot = "⏰"
+        else:
+            dot = "⚫"
         realized = row.get("realized_pnl", 0.0)
         unreal   = row.get("unrealized_pnl", 0.0)
         n_open   = row.get("open_positions", 0)
@@ -195,6 +227,13 @@ for sc, row in zip(strategies, strategy_states):
         with c_state:
             st.markdown(f"{dot} `{state.upper()}`")
             st.caption(f"Last: {last_run}")
+            mkt_color = "#14532d" if _mkt_open else "#1e293b"
+            st.markdown(
+                f"<span style='background:{mkt_color};padding:2px 7px;border-radius:4px;"
+                f"font-size:0.72rem;color:#f1f5f9'>{_mkt_badge}</span>&nbsp;"
+                f"<span style='font-size:0.72rem;color:#64748b'>{_next_evt} {_next_in}</span>",
+                unsafe_allow_html=True,
+            )
         with c_pnl:
             st.metric("Realized P&L", f"{realized:,.2f}", delta=f"{realized:+,.0f}")
         with c_pos:
@@ -216,10 +255,11 @@ for sc, row in zip(strategies, strategy_states):
         b2, b3, b4, b5 = st.columns(4)
         with b2:
             # Engine control — write to DB so Render engine picks it up
-            is_running = (state == "running")
+            is_running = state in ("running", "starting")
             if is_running:
+                stop_disabled = _cycle_active
                 if st.button("⏹ Stop Engine", key=f"stop_{sc.strategy_dir.name}",
-                             use_container_width=True):
+                             use_container_width=True, disabled=stop_disabled):
                     try:
                         from stocking_app.db import TradingRepository
                         from stocking_app.config import load_config
@@ -232,9 +272,16 @@ for sc, row in zip(strategies, strategy_states):
                         st.rerun()
                     except Exception as e:
                         st.error(f"DB error: {e}")
+                if _cycle_active:
+                    st.warning(f"Cycle active — safe in ~{_fmt(_secs_left)}", icon="⚠️")
             else:
+                start_disabled = (
+                    os.environ.get("STOCKING_AUTO_SCHEDULE", "1") not in ("0","false","False")
+                    and _mkt_open
+                )
                 if st.button("▶ Start Engine", key=f"start_{sc.strategy_dir.name}",
-                             type="primary", use_container_width=True):
+                             type="primary", use_container_width=True,
+                             disabled=start_disabled):
                     try:
                         from stocking_app.db import TradingRepository
                         from stocking_app.config import load_config
@@ -247,6 +294,8 @@ for sc, row in zip(strategies, strategy_states):
                         st.rerun()
                     except Exception as e:
                         st.error(f"DB error: {e}")
+                if start_disabled:
+                    st.caption("🤖 Auto-schedule will start this when market opens.")
         with b3:
             dash_url = f"{_CLOUD_BASE_URL}/?strategy={sc.strategy_dir.name}"
             st.link_button("📊 View Dashboard", dash_url, use_container_width=True)

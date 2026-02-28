@@ -66,28 +66,103 @@ with st.sidebar:
     last_run  = (hb.get("last_run") or "—")[:19]
     last_err  = hb.get("error")
 
-    dot = "🟢" if state == "running" else ("🟡" if state == "paused" else "🔴")
-    st.markdown(f"**Engine State:** {dot} `{state.upper()}`")
-    st.caption(f"Last run: `{last_run}`")
+    # ── Market status from heartbeat ─────────────────────────────────────
+    mkt_open       = hb.get("market_open", None)
+    mkt_hours      = hb.get("market_hours", f"{cfg.market_open}–{cfg.market_close}")
+    mkt_tz         = hb.get("market_tz", cfg.exchange_tz)
+    next_evt       = hb.get("next_event", "")
+    next_evt_in    = hb.get("next_event_in", "")
+    auto_sched     = cfg.auto_schedule
+
+    # Compute live market status directly (so it's always fresh even if heartbeat is stale)
+    from stocking_app.market_schedule import market_status as _mkt_status, fmt_duration
+    _live = _mkt_status(cfg.exchange_tz, cfg.market_open, cfg.market_close)
+    live_open      = _live["market_open"]
+    live_next_evt  = _live["next_event"]
+    live_next_in   = _live["next_event_in"]
+
+    # ── Rich status banner ───────────────────────────────────────────────
+    if state in ("running", "starting"):
+        banner_color = "#14532d"  # dark green
+        if state == "starting":
+            banner_icon = "🟡"
+            banner_title = "STARTING — cycle in progress"
+        else:
+            banner_icon = "🟢"
+            banner_title = f"RUNNING — market closes in {live_next_in}" if live_open else "RUNNING"
+    elif state == "paused_market_closed":
+        banner_color = "#1e1b4b"  # dark indigo
+        banner_icon = "⏰"
+        banner_title = f"WAITING — market {live_next_evt} in {live_next_in}"
+    elif state == "paused":
+        banner_color = "#450a0a"  # dark red
+        banner_icon = "🔴"
+        banner_title = "MANUALLY PAUSED"
+    else:
+        banner_color = "#1c1917"  # dark stone
+        banner_icon = "⚫"
+        banner_title = f"OFFLINE — {live_next_evt} in {live_next_in}"
+
+    st.markdown(f"""
+<div style="background:{banner_color};border-radius:8px;padding:10px 14px;margin-bottom:10px">
+  <div style="font-size:1.1rem;font-weight:700;color:#f1f5f9">{banner_icon} {banner_title}</div>
+  <div style="font-size:0.78rem;color:#94a3b8;margin-top:4px">
+    Market: <b>{mkt_hours}</b> {mkt_tz}<br>
+    Last run: <code>{last_run}</code><br>
+    Auto-schedule: {"✅ ON" if auto_sched else "❌ OFF"}
+  </div>
+</div>
+""", unsafe_allow_html=True)
+
     if last_err:
         st.error(f"⚠ {last_err}")
 
+    # ── Safety guard: detect if a cycle is actively running ──────────────
+    cycle_started_at = hb.get("cycle_started_at")
+    cycle_secs       = int(hb.get("cycle_seconds", cfg.cycle_seconds))
+    cycle_in_progress = False
+    secs_left_in_cycle = 0
+    if cycle_started_at and state in ("running", "starting"):
+        import datetime as _dt
+        try:
+            started = _dt.datetime.fromisoformat(cycle_started_at.replace("Z", "+00:00"))
+            age = (_dt.datetime.now(_dt.timezone.utc) - started).total_seconds()
+            secs_left_in_cycle = max(0, int(cycle_secs - age))
+            cycle_in_progress = age < cycle_secs
+        except Exception:
+            pass
+
+    # ── Engine controls ───────────────────────────────────────────────────
+    if auto_sched:
+        st.caption("🤖 Auto-schedule is ON — engine manages itself during market hours.")
+        st.caption("Use override buttons below only for testing or emergencies.")
+
     col_a, col_b = st.columns(2)
     with col_a:
-        if st.button("▶ Start Engine in Cloud", use_container_width=True, type="primary", disabled=(state == "running")):
+        manual_start_disabled = (state in ("running", "starting")) or (auto_sched and live_open)
+        if st.button("▶ Start", use_container_width=True, type="primary",
+                     disabled=manual_start_disabled):
             repo.set_engine_enabled(True)
-            st.toast("Start signal sent to database. Engine will resume shortly.")
+            st.toast("▶ Start signal sent. Engine will resume shortly.", icon="🟢")
             time.sleep(1.5)
             st.rerun()
 
     with col_b:
-        if st.button("⏹ Stop Engine in Cloud", use_container_width=True, disabled=(state != "running")):
+        stop_disabled = cycle_in_progress
+        stop_label = "⏹ Stop"
+        if st.button(stop_label, use_container_width=True, disabled=stop_disabled):
             repo.set_engine_enabled(False)
-            st.toast("Stop signal sent to database. Engine will pause shortly.")
+            st.toast("⏹ Stop signal sent. Engine will pause after current cycle.", icon="🟡")
             time.sleep(1.5)
             st.rerun()
 
-    st.divider()
+    if cycle_in_progress:
+        st.warning(
+            f"⚠ Cycle in progress — safe to stop in ~{fmt_duration(secs_left_in_cycle)}. "
+            f"Stop button will re-enable once cycle ends.",
+            icon="⚠️"
+        )
+
     st.markdown("## 📐 Parameters")
     params = {
         "DB Path":       str(cfg.db_path),
@@ -133,7 +208,8 @@ last_duration     = float(latest_run["duration_seconds"].iloc[0]) if not latest_
 fetched_last      = int(latest_run["symbols_fetched"].iloc[0]) if not latest_run.empty else 0
 
 k1, k2, k3, k4, k5, k6, k7 = st.columns(7)
-k1.metric("Engine",         f"{dot} {state.upper()}")
+_dot = "🟢" if state in ("running", "starting") else ("🟡" if state in ("paused", "paused_market_closed") else "⚫")
+k1.metric("Engine",         f"{_dot} {state.upper()}")
 k2.metric("Universe",       uni_summary["active"])
 k3.metric("Open Positions", n_open)
 k4.metric("Realized P&L",   f"{realized:,.2f}")

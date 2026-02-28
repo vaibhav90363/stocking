@@ -9,6 +9,8 @@ strategy_type: fractal_momentum
 exchange:
   suffix: ".L"
   timezone: "Europe/London"
+  market_open: "08:00"
+  market_close: "16:30"
 
 engine:
   cycle_seconds: 300

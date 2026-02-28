@@ -29,6 +29,8 @@ class StrategyConfig:
     # exchange
     suffix: str
     timezone: str
+    market_open: str
+    market_close: str
 
     # engine
     cycle_seconds: int
@@ -101,6 +103,8 @@ def load_strategy(strategy_dir: str | Path) -> StrategyConfig:
 
         suffix            = exc.get("suffix", ".NS"),
         timezone          = exc.get("timezone", "Asia/Kolkata"),
+        market_open       = exc.get("market_open",  "09:15"),
+        market_close      = exc.get("market_close", "15:30"),
 
         cycle_seconds         = int(eng.get("cycle_seconds", 300)),
         fetch_lookback_days   = int(eng.get("fetch_lookback_days", 10)),

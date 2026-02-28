@@ -14,6 +14,7 @@ from typing import Any
 from .config import AppConfig, load_config
 from .data_fetcher import fetch_5m_bars_sync
 from .db import SignalRecord, TradingRepository, utc_now_iso
+from .market_schedule import market_status as get_market_status
 from .strategy import compute_symbol_signal
 
 
@@ -105,17 +106,55 @@ class ScalableEngine:
 
         cycle_num = 0
         while self._running:
+            # ── Market-hours auto-scheduler ─────────────────────────────────
+            mkt = get_market_status(
+                self.cfg.exchange_tz,
+                self.cfg.market_open,
+                self.cfg.market_close,
+            )
+            if self.cfg.auto_schedule:
+                currently_enabled = self.repo.get_engine_enabled()
+                if mkt["market_open"] and not currently_enabled:
+                    self.log.info(
+                        f"🟢 Market OPEN ({self.cfg.market_open} {self.cfg.exchange_tz}) "
+                        f"— auto-enabling engine."
+                    )
+                    self.repo.set_engine_enabled(True)
+                elif not mkt["market_open"] and currently_enabled:
+                    self.log.info(
+                        f"⚫ Market CLOSED — auto-disabling engine. "
+                        f"{mkt['next_event'].capitalize()} in {mkt['next_event_in']}."
+                    )
+                    self.repo.set_engine_enabled(False)
+
             if not self.repo.get_engine_enabled():
-                self.log.debug("Engine paused — waiting for enable signal.")
-                self.repo.set_engine_heartbeat(
-                    {"state": "paused", "ts": utc_now_iso(), "cycle_seconds": self.cfg.cycle_seconds}
+                status_str = "paused_market_closed" if not mkt["market_open"] else "paused"
+                self.log.debug(
+                    f"Engine paused — {mkt['next_event']} in {mkt['next_event_in']} "
+                    f"({mkt['market_hours']} {mkt['market_tz']})"
                 )
+                self.repo.set_engine_heartbeat({
+                    "state": status_str,
+                    "ts": utc_now_iso(),
+                    "cycle_seconds": self.cfg.cycle_seconds,
+                    **mkt,
+                })
                 time.sleep(self.cfg.disabled_poll_seconds)
                 continue
 
             cycle_num += 1
             loop_start = time.monotonic()
             run_started_at = utc_now_iso()
+
+            # Announce cycle start (STARTING state) so UI can show safety guard
+            self.repo.set_engine_heartbeat({
+                "state": "starting",
+                "ts": utc_now_iso(),
+                "cycle_num": cycle_num,
+                "cycle_started_at": run_started_at,
+                "cycle_seconds": self.cfg.cycle_seconds,
+                **mkt,
+            })
 
             self.log.info(f"┌─ Cycle #{cycle_num} started  [{run_started_at}]")
 
@@ -135,6 +174,10 @@ class ScalableEngine:
                         "compute_seconds": stats.compute_seconds,
                         "persist_seconds": stats.persist_seconds,
                         "error": stats.error,
+                        "cycle_num": cycle_num,
+                        "cycle_started_at": run_started_at,
+                        "cycle_seconds": self.cfg.cycle_seconds,
+                        **mkt,
                     }
                 )
                 self.log.info(
