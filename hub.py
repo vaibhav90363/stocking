@@ -1,11 +1,4 @@
 #!/usr/bin/env python3
-"""
-hub.py — Multi-Strategy Hub Dashboard
-Auto-discovers all strategy folders under strategies/ and shows a comparison view.
-
-Run:
-  streamlit run hub.py --server.port 8500
-"""
 from __future__ import annotations
 
 import json
