@@ -733,12 +733,8 @@ def run_backtest_for_strategy(
     t1 = _time.monotonic()
 
     for i, symbol in enumerate(sym_list, 1):
-        daily_series = _build_daily_series(
-            daily_all[symbol],
-            intra_all.get(symbol, pd.DataFrame()),
-        )
-        # Patch local timezone into _build_daily_series output (it uses the global)
-        # Re-run with correct tz
+        # Build daily series with the correct exchange timezone (do NOT use _build_daily_series
+        # which hard-codes the module-level EXCHANGE_TZ global = "Asia/Kolkata")
         daily_loc = daily_all[symbol].copy()
         daily_loc.index = daily_loc.index.tz_convert(exchange_tz)
         agg = {"open": "first", "high": "max", "low": "min", "close": "last", "volume": "sum"}
@@ -751,20 +747,41 @@ def run_backtest_for_strategy(
             daily_loc.update(intra_d)
             daily_loc.sort_index(inplace=True)
 
-        events = _compute_signals_full(daily_loc)
-        for (day, sig, price, reason) in events:
+        all_sym_events = _compute_signals_full(daily_loc)   # full history
+        n_in_window = 0
+        for (day, sig, price, reason) in all_sym_events:
             if day >= bt_cutoff:
                 all_events.append((day, symbol, sig, price, reason))
+                n_in_window += 1
 
         elapsed2 = _time.monotonic() - t1
         rate2 = i / elapsed2 if elapsed2 > 0 else 0
         rem2 = int((len(sym_list) - i) / rate2) if rate2 > 0 else 0
         _emit_progress(i, len(sym_list), symbol,
                        f"⚙️  Compute — {i}/{len(sym_list)} • "
-                       f"{elapsed2:.0f}s elapsed • ~{rem2}s left")
+                       f"{elapsed2:.0f}s elapsed • ~{rem2}s left • "
+                       f"signals (all-time): {len(all_sym_events)}  (in window): {n_in_window}")
 
     all_events.sort(key=lambda x: x[0])
-    _emit_status(f"✅ Signals computed — {len(all_events)} events in backtest window")
+
+    # Diagnostic summary
+    syms_with_events = len({e[1] for e in all_events})
+    _emit_status(
+        f"✅ Signals computed — {len(all_events)} events in last {backtest_days}d window "
+        f"across {syms_with_events}/{len(sym_list)} symbols"
+    )
+    if all_events:
+        sample = all_events[:3]
+        _emit_status(
+            f"📋 Sample events: " +
+            " | ".join(f"{e[2]} {e[1]} @ {e[3]:.2f} [{str(e[0])[:10]}]" for e in sample)
+        )
+    else:
+        _emit_status(
+            f"⚠ Zero signals in the {backtest_days}-day window. "
+            f"Downloaded {len(daily_all)} symbols ({len(failed)} failed). "
+            f"Try increasing backtest_days or check that the suffix '{suffix}' is correct for this universe."
+        )
 
     # ── 4. Ledger replay ──────────────────────────────────────────────────────
     _emit_status("📒 Stage 3 / 3 — Replaying ledger & generating report …")
@@ -785,9 +802,10 @@ def run_backtest_for_strategy(
                                 price=price, capital=qty * price,
                                 ts=day, reason=reason))
 
-    # Force-close open positions
+    # Force-close open positions at last known price
+    # FIX: use explicit 'in' check instead of 'or' to avoid DataFrame truth-value error
     for symbol, pos in positions.items():
-        src = intra_all.get(symbol) or daily_all.get(symbol)
+        src = intra_all[symbol] if symbol in intra_all else daily_all.get(symbol)
         last_price = float(src["close"].iloc[-1]) if src is not None and not src.empty else pos.avg_price
         pnl = (last_price - pos.avg_price) * pos.qty
         trades.append(Trade(symbol=symbol, side="SELL_EOB", qty=pos.qty,
