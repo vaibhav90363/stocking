@@ -2,8 +2,7 @@
 from __future__ import annotations
 
 import json
-import sqlite3
-import subprocess
+import os
 import sys
 import time
 from pathlib import Path
@@ -16,20 +15,36 @@ sys.path.insert(0, str(ROOT))
 
 from stocking_app.strategy_loader import discover_strategies, StrategyConfig
 
+# ── Page Config — MUST be first Streamlit call ───────────────────────────────
+st.set_page_config(
+    page_title="Stocking Hub — All Strategies",
+    layout="wide",
+    page_icon="🏦",
+    initial_sidebar_state="expanded",
+)
+
+# ── Cloud URL (used for dashboard deep-links) ─────────────────────────────────
+# Set STREAMLIT_CLOUD_APP_URL in Streamlit Cloud secrets/env if your app URL differs.
+_CLOUD_BASE_URL = os.environ.get(
+    "STREAMLIT_CLOUD_APP_URL",
+    "https://stocking-vaibhav2.streamlit.app",
+).rstrip("/")
+
 # ── Cloud Routing (Dashboard view) ──────────────────────────────────────────────
 if "strategy" in st.query_params:
     strat_id = st.query_params["strategy"]
     strategy_path = ROOT / "strategies" / strat_id
     if strategy_path.exists():
-        # Override the command-line args for dashboard.py
         sys.argv = ["streamlit", "run", "dashboard.py", "--strategy-dir", str(strategy_path)]
         dash_path = str(ROOT / "dashboard.py")
         import runpy
         runpy.run_path(dash_path, run_name="__main__")
         st.stop()
     else:
-        st.error(f"Strategy {strat_id} not found.")
-        st.button("Back to Hub", on_click=lambda: st.query_params.clear())
+        st.error(f"Strategy '{strat_id}' not found. Available: fractal_momentum_lse, fractal_momentum_nse")
+        if st.button("← Back to Hub"):
+            st.query_params.clear()
+            st.rerun()
 
 
 # ── Helper — read live state from a strategy's DB ─────────────────────────────
@@ -87,13 +102,6 @@ def _read_strategy_state(sc: StrategyConfig) -> dict:
         pass
     return result
 
-st.set_page_config(
-    page_title="Stocking Hub — All Strategies",
-    layout="wide",
-    page_icon="🏦",
-    initial_sidebar_state="expanded",
-)
-
 st.markdown("""
 <style>
 [data-testid="stMetricValue"] { font-size: 1.3rem; font-weight: 700; }
@@ -116,28 +124,14 @@ with st.sidebar:
         st.rerun()
     auto = st.checkbox("⏱ Auto-refresh (30s)", value=False)
     st.divider()
-    st.markdown("### ➕ Launch Strategy")
+    st.markdown("### 📊 Strategy Dashboards")
     strat_dirs = [
         d.name for d in (ROOT / "strategies").iterdir()
         if d.is_dir() and (d / "strategy.yaml").exists()
     ] if (ROOT / "strategies").exists() else []
-
-    sel_dir  = st.selectbox("Strategy folder", strat_dirs)
-    sel_mode = st.radio("Mode", ["backtest", "live", "dashboard"], horizontal=True)
-    sel_port = st.number_input("Dashboard port", min_value=8500, max_value=9000, value=8501, step=1)
-
-    if st.button("▶ Run", use_container_width=True, type="primary"):
-        cmd = [
-            sys.executable, str(ROOT / "run_strategy.py"),
-            str(ROOT / "strategies" / sel_dir),
-            "--mode", sel_mode,
-        ]
-        if sel_mode == "dashboard":
-            cmd += ["--port", str(sel_port)]
-        subprocess.Popen(cmd, cwd=str(ROOT))
-        st.success(f"Launched {sel_dir} in {sel_mode} mode")
-        time.sleep(1)
-        st.rerun()
+    for sdir in strat_dirs:
+        url = f"{_CLOUD_BASE_URL}/?strategy={sdir}"
+        st.link_button(f"Open {sdir}", url, use_container_width=True)
 
 # ── Header ────────────────────────────────────────────────────────────────────
 st.title("🏦 Strategy Hub")
@@ -221,24 +215,14 @@ for sc, row in zip(strategies, strategy_states):
         # Action buttons
         b1, b2, b3, b4 = st.columns(4)
         with b1:
-            if st.button(f"▶ Backtest",  key=f"bt_{sc.strategy_dir.name}"):
-                subprocess.Popen([
-                    sys.executable, str(ROOT / "run_strategy.py"),
-                    str(sc.strategy_dir), "--mode", "backtest",
-                ], cwd=str(ROOT))
-                st.toast(f"Backtest started for {sc.name}")
+            if st.button(f"▶ Backtest", key=f"bt_{sc.strategy_dir.name}"):
+                st.toast("Backtest runs via the Render engine — trigger it there or locally.", icon="ℹ️")
         with b2:
-            if st.button(f"🔴 Start Live", key=f"live_{sc.strategy_dir.name}"):
-                subprocess.Popen([
-                    sys.executable, str(ROOT / "run_strategy.py"),
-                    str(sc.strategy_dir), "--mode", "live",
-                ], cwd=str(ROOT))
-                st.toast(f"Live engine started for {sc.name}")
+            if st.button(f"🔴 Start/Stop Live", key=f"live_{sc.strategy_dir.name}"):
+                st.toast("Use the Engine controls inside the strategy dashboard to start/stop the live engine.", icon="ℹ️")
         with b3:
-            def _nav_to_dashboard(s_name=sc.strategy_dir.name):
-                st.query_params["strategy"] = s_name
-
-            st.button(f"📊 View Dashboard", key=f"dash_{sc.strategy_dir.name}", on_click=_nav_to_dashboard)
+            dash_url = f"{_CLOUD_BASE_URL}/?strategy={sc.strategy_dir.name}"
+            st.link_button("📊 View Dashboard", dash_url, use_container_width=True)
         with b4:
             log_f = sc.log_dir / "engine.log"
             if log_f.exists():
