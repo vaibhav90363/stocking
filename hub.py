@@ -213,13 +213,40 @@ for sc, row in zip(strategies, strategy_states):
                 st.caption("No backtest yet")
 
         # Action buttons
-        b1, b2, b3, b4 = st.columns(4)
-        with b1:
-            if st.button(f"▶ Backtest", key=f"bt_{sc.strategy_dir.name}"):
-                st.toast("Backtest runs via the Render engine — trigger it there or locally.", icon="ℹ️")
+        b2, b3, b4 = st.columns(3)
         with b2:
-            if st.button(f"🔴 Start/Stop Live", key=f"live_{sc.strategy_dir.name}"):
-                st.toast("Use the Engine controls inside the strategy dashboard to start/stop the live engine.", icon="ℹ️")
+            # Engine control — write to DB so Render engine picks it up
+            is_running = (state == "running")
+            if is_running:
+                if st.button("⏹ Stop Engine", key=f"stop_{sc.strategy_dir.name}",
+                             use_container_width=True):
+                    try:
+                        from stocking_app.db import TradingRepository
+                        from stocking_app.config import load_config
+                        _cfg = load_config()
+                        _repo = TradingRepository(_cfg.database_url or _cfg.db_path)
+                        _repo.set_engine_enabled(False)
+                        _repo.close()
+                        st.toast(f"⏹ Stop signal sent for {sc.name}.", icon="🟡")
+                        time.sleep(1)
+                        st.rerun()
+                    except Exception as e:
+                        st.error(f"DB error: {e}")
+            else:
+                if st.button("▶ Start Engine", key=f"start_{sc.strategy_dir.name}",
+                             type="primary", use_container_width=True):
+                    try:
+                        from stocking_app.db import TradingRepository
+                        from stocking_app.config import load_config
+                        _cfg = load_config()
+                        _repo = TradingRepository(_cfg.database_url or _cfg.db_path)
+                        _repo.set_engine_enabled(True)
+                        _repo.close()
+                        st.toast(f"▶ Start signal sent for {sc.name}. Engine will resume shortly.", icon="🟢")
+                        time.sleep(1)
+                        st.rerun()
+                    except Exception as e:
+                        st.error(f"DB error: {e}")
         with b3:
             dash_url = f"{_CLOUD_BASE_URL}/?strategy={sc.strategy_dir.name}"
             st.link_button("📊 View Dashboard", dash_url, use_container_width=True)
@@ -231,6 +258,7 @@ for sc, row in zip(strategies, strategy_states):
                     st.code("\n".join(reversed(lines)), language=None)
             else:
                 st.caption("No log yet")
+
 
         st.divider()
 
