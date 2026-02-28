@@ -102,23 +102,61 @@ def cmd_live(sc, args):
 
     print(f"\n  Starting engine … (Ctrl-C to stop)\n")
     
-    # ── Render Web Service Healthcheck Bypass ──
+    # ── Render Web Service: Health endpoint + Keep-Alive self-ping ─────────────
     if os.environ.get("RENDER") or os.environ.get("PORT"):
         import threading
+        import json as _json
         from http.server import HTTPServer, BaseHTTPRequestHandler
+        from datetime import datetime as _dt, timezone as _tz
+
+        _engine_start_time = _dt.now(_tz.utc).isoformat()
+
         class HealthCheckHandler(BaseHTTPRequestHandler):
             def do_GET(self):
+                payload = _json.dumps({
+                    "status":  "running",
+                    "service": "stocking-engine",
+                    "started": _engine_start_time,
+                    "ts":      _dt.now(_tz.utc).isoformat(),
+                }).encode()
                 self.send_response(200)
-                self.send_header('Content-type','text/plain')
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(payload)))
                 self.end_headers()
-                self.wfile.write(b"Engine is running.")
-            def log_message(self, format, *args):
-                pass
-        
+                self.wfile.write(payload)
+            def log_message(self, fmt, *args):
+                pass  # suppress access logs
+
         port = int(os.environ.get("PORT", 8080))
-        httpd = HTTPServer(('0.0.0.0', port), HealthCheckHandler)
-        print(f"  [Render] Starting dummy HTTP server on port {port} for health checks...")
+        httpd = HTTPServer(("0.0.0.0", port), HealthCheckHandler)
+        print(f"  [Render] Health endpoint listening on port {port}")
         threading.Thread(target=httpd.serve_forever, daemon=True).start()
+
+        # ── Self-ping keep-alive ────────────────────────────────────────────
+        # Render free instances spin down after ~15 min of inactivity.
+        # Ping our own URL every 8 minutes to stay alive during market-closed
+        # periods (nights, weekends) when the engine is paused but must persist.
+        _self_url = os.environ.get("RENDER_EXTERNAL_URL", "").strip()
+        if _self_url:
+            import urllib.request as _urllib
+
+            _PING_INTERVAL = 8 * 60  # 8 minutes
+
+            def _keep_alive_loop():
+                import time as _time
+                while True:
+                    _time.sleep(_PING_INTERVAL)
+                    try:
+                        _urllib.urlopen(_self_url, timeout=10)
+                        print(f"  [keep-alive] Pinged {_self_url} ✓")
+                    except Exception as _e:
+                        print(f"  [keep-alive] Ping failed: {_e}")
+
+            _ka = threading.Thread(target=_keep_alive_loop, daemon=True, name="keep-alive")
+            _ka.start()
+            print(f"  [Render] Keep-alive thread started — will self-ping every 8 min")
+        else:
+            print("  [Render] RENDER_EXTERNAL_URL not set — keep-alive disabled")
 
     result = subprocess.run(
         [sys.executable, "-m", "stocking_app.cli", "run-engine"],
