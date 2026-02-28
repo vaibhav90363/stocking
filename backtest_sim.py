@@ -623,3 +623,231 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Streamlit-callable API  (no globals mutated; progress via callbacks)
+# ═══════════════════════════════════════════════════════════════════════════
+
+def run_backtest_for_strategy(
+    *,
+    universe_csv: str,
+    suffix: str = ".NS",
+    exchange_tz: str = "Asia/Kolkata",
+    daily_lookback: str = "2y",
+    intraday_days: int = 60,
+    backtest_days: int = 30,
+    capital_per_trade: float = 100_000,
+    fetch_concurrency: int = 16,
+    on_progress=None,   # callable(done: int, total: int, symbol: str, stage: str)
+    on_status=None,     # callable(msg: str)
+) -> tuple[str, "pd.DataFrame"]:
+    """
+    Run a full backtest in-process and return (report_text, trades_df).
+
+    Parameters
+    ----------
+    on_progress : optional callable(done, total, symbol, stage)
+        Called after every symbol is processed.
+    on_status   : optional callable(msg)
+        Called to emit a brief status line.
+    """
+    import asyncio, time as _time
+    from pathlib import Path as _Path
+
+    def _emit_status(msg: str):
+        if on_status:
+            on_status(msg)
+
+    def _emit_progress(done: int, total: int, symbol: str, stage: str):
+        if on_progress:
+            on_progress(done, total, symbol, stage)
+
+    # ── 1. Read symbols ──────────────────────────────────────────────────────
+    _emit_status(f"📂 Reading universe CSV …")
+    sym_df = pd.read_csv(universe_csv)
+    col = next((c for c in sym_df.columns if c.strip().lower() == "symbol"), None)
+    if col is None:
+        raise ValueError(f"No 'Symbol' column in {universe_csv}. Found: {list(sym_df.columns)}")
+    raw_symbols = sorted({
+        s.strip().upper() + ("" if s.strip().upper().endswith(suffix) else suffix)
+        for s in sym_df[col].dropna() if str(s).strip()
+    })
+    total = len(raw_symbols)
+    _emit_status(f"🔢 {total} symbols to download ({suffix}, {exchange_tz})")
+
+    # ── 2. Download with per-symbol progress ──────────────────────────────────
+    _emit_status(f"📡 Stage 1 / 3 — Downloading {total} symbols from Yahoo Finance …")
+
+    daily_all: dict[str, pd.DataFrame] = {}
+    intra_all: dict[str, pd.DataFrame] = {}
+    failed: list[str] = []
+    t0 = _time.monotonic()
+
+    # We run one symbol at a time so we can emit progress after each.
+    # For speed we still use async batching in chunks of `fetch_concurrency`.
+    CHUNK = fetch_concurrency
+
+    async def _fetch_chunk(chunk: list[str]):
+        sem = asyncio.Semaphore(CHUNK)
+        async def _one(sym):
+            async with sem:
+                return sym, *await asyncio.to_thread(_fetch_one_symbol, sym)
+        return await asyncio.gather(*[_one(s) for s in chunk])
+
+    done_count = 0
+    for chunk_start in range(0, total, CHUNK):
+        chunk = raw_symbols[chunk_start: chunk_start + CHUNK]
+        results = asyncio.run(_fetch_chunk(chunk))
+        for sym, daily, intra, err in results:
+            done_count += 1
+            if err or daily.empty:
+                failed.append(sym)
+            else:
+                daily_all[sym] = daily
+                if not intra.empty:
+                    intra_all[sym] = intra
+            elapsed = _time.monotonic() - t0
+            rate = done_count / elapsed if elapsed > 0 else 0
+            remaining = int((total - done_count) / rate) if rate > 0 else 0
+            _emit_progress(done_count, total, sym,
+                           f"⬇ Download — {done_count}/{total} • "
+                           f"{elapsed:.0f}s elapsed • "
+                           f"~{remaining}s left")
+
+    elapsed_dl = _time.monotonic() - t0
+    _emit_status(
+        f"✅ Download done in {elapsed_dl:.1f}s — "
+        f"{len(daily_all)} ok, {len(failed)} failed"
+    )
+
+    # ── 3. Signal computation & replay ────────────────────────────────────────
+    _emit_status("⚙️  Stage 2 / 3 — Computing signals & replaying ledger …")
+
+    # pd is already imported at module level
+    now_ist = pd.Timestamp.now(tz=exchange_tz).normalize()
+    bt_cutoff = now_ist - pd.Timedelta(days=backtest_days)
+
+    all_events: list[tuple] = []
+    sym_list = list(daily_all.keys())
+    t1 = _time.monotonic()
+
+    for i, symbol in enumerate(sym_list, 1):
+        daily_series = _build_daily_series(
+            daily_all[symbol],
+            intra_all.get(symbol, pd.DataFrame()),
+        )
+        # Patch local timezone into _build_daily_series output (it uses the global)
+        # Re-run with correct tz
+        daily_loc = daily_all[symbol].copy()
+        daily_loc.index = daily_loc.index.tz_convert(exchange_tz)
+        agg = {"open": "first", "high": "max", "low": "min", "close": "last", "volume": "sum"}
+        daily_loc = daily_loc.resample("1D").agg(agg).dropna(subset=["open","high","low","close"])
+        if symbol in intra_all:
+            intra_loc = intra_all[symbol].copy()
+            intra_loc.index = intra_loc.index.tz_convert(exchange_tz)
+            intra_d = intra_loc.resample("1D").agg(agg).dropna(subset=["open","high","low","close"])
+            daily_loc = daily_loc.combine_first(intra_d)
+            daily_loc.update(intra_d)
+            daily_loc.sort_index(inplace=True)
+
+        events = _compute_signals_full(daily_loc)
+        for (day, sig, price, reason) in events:
+            if day >= bt_cutoff:
+                all_events.append((day, symbol, sig, price, reason))
+
+        elapsed2 = _time.monotonic() - t1
+        rate2 = i / elapsed2 if elapsed2 > 0 else 0
+        rem2 = int((len(sym_list) - i) / rate2) if rate2 > 0 else 0
+        _emit_progress(i, len(sym_list), symbol,
+                       f"⚙️  Compute — {i}/{len(sym_list)} • "
+                       f"{elapsed2:.0f}s elapsed • ~{rem2}s left")
+
+    all_events.sort(key=lambda x: x[0])
+    _emit_status(f"✅ Signals computed — {len(all_events)} events in backtest window")
+
+    # ── 4. Ledger replay ──────────────────────────────────────────────────────
+    _emit_status("📒 Stage 3 / 3 — Replaying ledger & generating report …")
+    positions: dict[str, Position] = {}
+    trades: list[Trade] = []
+    for (day, symbol, sig, price, reason) in all_events:
+        if sig == "SELL" and symbol in positions:
+            pos = positions.pop(symbol)
+            pnl = (price - pos.avg_price) * pos.qty
+            trades.append(Trade(symbol=symbol, side="SELL", qty=pos.qty,
+                                price=price, capital=pos.qty * pos.avg_price,
+                                ts=day, reason=reason, pnl=pnl))
+        elif sig == "BUY" and symbol not in positions:
+            qty = max(1, int(capital_per_trade / price)) if price > 0 else 1
+            positions[symbol] = Position(symbol=symbol, qty=qty,
+                                         avg_price=price, opened_at=day)
+            trades.append(Trade(symbol=symbol, side="BUY", qty=qty,
+                                price=price, capital=qty * price,
+                                ts=day, reason=reason))
+
+    # Force-close open positions
+    for symbol, pos in positions.items():
+        src = intra_all.get(symbol) or daily_all.get(symbol)
+        last_price = float(src["close"].iloc[-1]) if src is not None and not src.empty else pos.avg_price
+        pnl = (last_price - pos.avg_price) * pos.qty
+        trades.append(Trade(symbol=symbol, side="SELL_EOB", qty=pos.qty,
+                            price=last_price, capital=pos.qty * pos.avg_price,
+                            ts=now_ist, reason="end_of_backtest", pnl=pnl))
+
+    # ── 5. Build report ───────────────────────────────────────────────────────
+    rows = [{"symbol": t.symbol, "side": t.side, "qty": t.qty,
+             "price": t.price, "capital": t.capital,
+             "ts": str(t.ts)[:19], "reason": t.reason, "pnl": t.pnl}
+            for t in trades]
+    trades_df = pd.DataFrame(rows)
+
+    if trades_df.empty:
+        report_text = "No trades generated in the backtest window."
+    else:
+        closed = trades_df[trades_df["pnl"].notna()].copy()
+        buys_df = trades_df[trades_df["side"] == "BUY"]
+        realized = closed["pnl"].sum()
+        n_closed = len(closed)
+        n_wins = int((closed["pnl"] > 0).sum())
+        n_loss = int((closed["pnl"] <= 0).sum())
+        win_rate = n_wins / n_closed * 100 if n_closed else 0.0
+        avg_win  = closed.loc[closed["pnl"] > 0, "pnl"].mean() if n_wins else 0.0
+        avg_loss = closed.loc[closed["pnl"] <= 0, "pnl"].mean() if n_loss else 0.0
+        cum = closed["pnl"].cumsum()
+        max_dd = (cum - cum.cummax()).min() if not cum.empty else 0.0
+
+        top_win  = closed.nlargest(10,  "pnl")[["symbol","ts","price","pnl","reason"]]
+        top_loss = closed.nsmallest(10, "pnl")[["symbol","ts","price","pnl","reason"]]
+
+        lines = [
+            "=" * 60,
+            f"  Fractal Momentum Backtest — {suffix} / {exchange_tz}",
+            f"  Data   : {daily_lookback} daily + {intraday_days}d 5m (warmup)",
+            f"  Window : last {backtest_days} days",
+            f"  Universe: {total} symbols  |  Capital/trade: {capital_per_trade:,.0f}",
+            "=" * 60, "",
+            "  ── Summary ──────────────────────────────────────────",
+            f"  BUY entries           : {len(buys_df)}",
+            f"  Closed trade legs     : {n_closed}",
+            f"  Winning trades        : {n_wins}",
+            f"  Losing  trades        : {n_loss}",
+            f"  Win rate              : {win_rate:.1f}%",
+            f"  Realized P&L          : {realized:>12,.2f}",
+            f"  Avg winning trade     : {avg_win:>12,.2f}",
+            f"  Avg losing  trade     : {avg_loss:>12,.2f}",
+            f"  Max drawdown          : {max_dd:>12,.2f}",
+            f"  Failed downloads      : {len(failed)}",
+            "", "  ── Top 10 Winners ───────────────────────────────────",
+        ]
+        for _, r in top_win.iterrows():
+            lines.append(f"  {r['symbol']:<18}  P&L {r['pnl']:>10,.2f}  @ {r['price']:>8,.2f}  [{str(r['ts'])[:10]}]")
+        lines += ["", "  ── Top 10 Losers ────────────────────────────────────"]
+        for _, r in top_loss.iterrows():
+            lines.append(f"  {r['symbol']:<18}  P&L {r['pnl']:>10,.2f}  @ {r['price']:>8,.2f}  [{str(r['ts'])[:10]}]")
+        lines += ["", "=" * 60]
+        report_text = "\n".join(lines)
+
+    total_elapsed = _time.monotonic() - t0
+    _emit_status(f"🏁 Backtest complete in {total_elapsed:.1f}s — {len(trades)} trade legs")
+    return report_text, trades_df
+

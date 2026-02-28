@@ -212,8 +212,8 @@ for sc, row in zip(strategies, strategy_states):
             else:
                 st.caption("No backtest yet")
 
-        # Action buttons
-        b2, b3, b4 = st.columns(3)
+        # Action buttons — 4 columns now
+        b2, b3, b4, b5 = st.columns(4)
         with b2:
             # Engine control — write to DB so Render engine picks it up
             is_running = (state == "running")
@@ -258,9 +258,126 @@ for sc, row in zip(strategies, strategy_states):
                     st.code("\n".join(reversed(lines)), language=None)
             else:
                 st.caption("No log yet")
+        with b5:
+            strat_key = sc.strategy_dir.name
+            if st.button("🔬 Run Backtest", key=f"bt_run_{strat_key}",
+                         use_container_width=True):
+                st.session_state[f"bt_trigger_{strat_key}"] = True
+                # Clear any old results so the UI refreshes cleanly
+                st.session_state.pop(f"bt_result_{strat_key}", None)
 
+        # ── Live Backtest Runner ────────────────────────────────────────────
+        strat_key = sc.strategy_dir.name
+        if st.session_state.get(f"bt_trigger_{strat_key}"):
+            st.session_state[f"bt_trigger_{strat_key}"] = False  # reset trigger
+
+            universe_csv = str(sc.universe_csv)
+            if not sc.universe_csv.exists():
+                st.error(f"universe.csv not found at {universe_csv}")
+            else:
+                from backtest_sim import run_backtest_for_strategy
+
+                # Placeholders updated from callbacks
+                status_box  = st.empty()
+                prog_bar    = st.progress(0.0, text="Initialising …")
+                eta_box     = st.empty()
+                log_lines:  list[str] = []
+                log_box     = st.expander("📋 Backtest log", expanded=True)
+
+                def _on_status(msg: str):
+                    status_box.info(msg)
+                    log_lines.append(msg)
+                    with log_box:
+                        st.text("\n".join(log_lines[-20:]))  # show last 20 lines
+
+                def _on_progress(done: int, total: int, sym: str, stage_msg: str):
+                    pct = done / total if total else 0
+                    prog_bar.progress(pct, text=f"{stage_msg}  |  last: `{sym}`")
+                    eta_box.caption(stage_msg)
+
+                try:
+                    report_text, trades_df = run_backtest_for_strategy(
+                        universe_csv  = universe_csv,
+                        suffix        = sc.suffix,
+                        exchange_tz   = sc.timezone,
+                        daily_lookback= sc.daily_lookback,
+                        intraday_days = sc.intraday_days,
+                        backtest_days = sc.backtest_days,
+                        capital_per_trade = float(sc.parameters.get("capital_per_trade", 100_000)),
+                        fetch_concurrency = sc.fetch_concurrency,
+                        on_progress   = _on_progress,
+                        on_status     = _on_status,
+                    )
+                    prog_bar.progress(1.0, text="✅ Complete")
+                    st.session_state[f"bt_result_{strat_key}"] = (report_text, trades_df)
+                except Exception as exc:
+                    st.error(f"Backtest failed: {exc}")
+
+        # Show persisted results (survive reruns after backtest completes)
+        bt_result = st.session_state.get(f"bt_result_{strat_key}")
+        if bt_result:
+            report_text, trades_df = bt_result
+            st.markdown(f"### 🔬 Backtest Results — {sc.name}")
+
+            # Summary metrics
+            if not trades_df.empty:
+                closed = trades_df[trades_df["pnl"].notna()].copy()
+                n_wins = int((closed["pnl"] > 0).sum()) if not closed.empty else 0
+                n_loss = int((closed["pnl"] <= 0).sum()) if not closed.empty else 0
+                total_pnl = closed["pnl"].sum() if not closed.empty else 0.0
+                win_rate = n_wins / len(closed) * 100 if len(closed) else 0.0
+                r1, r2, r3, r4, r5 = st.columns(5)
+                r1.metric("BUY entries", len(trades_df[trades_df["side"] == "BUY"]))
+                r2.metric("Closed legs", len(closed))
+                r3.metric("Win rate", f"{win_rate:.1f}%")
+                r4.metric("Realized P&L", f"{total_pnl:,.2f}", delta=f"{total_pnl:+,.0f}")
+                r5.metric("Wins / Losses", f"{n_wins} / {n_loss}")
+
+                # P&L chart
+                if not closed.empty:
+                    cum = closed[["ts","pnl"]].copy()
+                    cum["cum_pnl"] = cum["pnl"].cumsum()
+                    cum["ts"] = pd.to_datetime(cum["ts"])
+                    st.markdown("**Cumulative P&L over backtest window**")
+                    st.line_chart(cum.set_index("ts")["cum_pnl"])
+
+                # Trade table
+                with st.expander("📋 All trades"):
+                    def _side_color(val):
+                        if val == "BUY":      return "background-color:#14532d;color:#4ade80;font-weight:700"
+                        if val == "SELL":     return "background-color:#450a0a;color:#f87171;font-weight:700"
+                        if val == "SELL_EOB": return "background-color:#312e81;color:#a5b4fc;font-weight:700"
+                        return ""
+                    def _pnl_clr(val):
+                        try:
+                            return "color:#4ade80" if float(val) > 0 else ("color:#f87171" if float(val) < 0 else "")
+                        except Exception:
+                            return ""
+                    st.dataframe(
+                        trades_df.style.applymap(_side_color, subset=["side"])
+                                       .applymap(_pnl_clr,   subset=["pnl"]),
+                        use_container_width=True, hide_index=True,
+                    )
+
+            # Full text report
+            with st.expander("📄 Full report"):
+                st.code(report_text, language=None)
+
+            # CSV download
+            if not trades_df.empty:
+                st.download_button(
+                    "⬇ Download trades CSV",
+                    data=trades_df.to_csv(index=False).encode(),
+                    file_name=f"backtest_{strat_key}.csv",
+                    mime="text/csv",
+                    key=f"dl_{strat_key}",
+                )
+            if st.button("🗑 Clear results", key=f"bt_clear_{strat_key}"):
+                st.session_state.pop(f"bt_result_{strat_key}", None)
+                st.rerun()
 
         st.divider()
+
 
 # ── Comparison table ──────────────────────────────────────────────────────────
 st.markdown("## 📊 Side-by-Side Comparison")
