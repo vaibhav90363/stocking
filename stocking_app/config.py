@@ -36,9 +36,10 @@ def load_config() -> AppConfig:
     except Exception:
         pass
 
+    url_str = database_url.strip() if database_url else ""
     return AppConfig(
         db_path=Path(os.getenv("STOCKING_DB_PATH", default_db)),
-        database_url=database_url,
+        database_url=url_str,
         cycle_seconds=int(os.getenv("STOCKING_CYCLE_SECONDS", "300")),
         disabled_poll_seconds=int(os.getenv("STOCKING_DISABLED_POLL_SECONDS", "5")),
         fetch_lookback_days=int(os.getenv("STOCKING_FETCH_LOOKBACK_DAYS", "10")),

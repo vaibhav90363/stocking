@@ -84,6 +84,10 @@ def cmd_live(sc, args):
         "STOCKING_ORDER_QTY":            str(sc.order_qty),
         "STOCKING_LOG_DIR":              str(sc.log_dir),
     })
+    
+    # Let Supabase db_url pass through to child processes if it exists
+    if "DATABASE_URL" in os.environ:
+        env["DATABASE_URL"] = os.environ["DATABASE_URL"]
 
     # Init DB + import universe
     _run_cli(["init-db"], env)
