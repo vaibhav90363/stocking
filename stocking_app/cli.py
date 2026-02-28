@@ -47,7 +47,7 @@ def _apply_suffix(symbol: str, suffix: str | None) -> str:
 
 def cmd_init_db(repo: TradingRepository) -> None:
     repo.init_db()
-    print(f"Initialized database at {repo.db_path}")
+    print(f"Initialized database at {repo.db_url}")
 
 
 def cmd_import_universe(repo: TradingRepository, csv_path: str, symbol_column: str, suffix: str | None) -> None:
@@ -71,7 +71,7 @@ def cmd_status(repo: TradingRepository) -> None:
     universe = repo.get_universe_summary()
     open_positions = len(repo.get_open_positions())
 
-    print(f"DB: {repo.db_path}")
+    print(f"DB: {repo.db_url}")
     print(f"engine_enabled: {state}")
     print(f"universe: {universe}")
     print(f"open_positions: {open_positions}")
@@ -119,7 +119,7 @@ def main() -> None:
     args = parser.parse_args()
 
     cfg = load_config()
-    repo = TradingRepository(cfg.db_path)
+    repo = TradingRepository(cfg.database_url or cfg.db_path)
 
     try:
         if args.command == "init-db":

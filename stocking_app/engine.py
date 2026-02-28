@@ -67,7 +67,7 @@ class CycleStats:
 class ScalableEngine:
     def __init__(self, cfg: AppConfig):
         self.cfg = cfg
-        self.repo = TradingRepository(cfg.db_path)
+        self.repo = TradingRepository(cfg.database_url or cfg.db_path)
         self.repo.init_db()
         self._running = True
         self.executor = ProcessPoolExecutor(max_workers=max(1, cfg.compute_workers))

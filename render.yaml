@@ -1,0 +1,15 @@
+services:
+  - type: worker
+    name: stocking-engine
+    env: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: python3 run_strategy.py strategies/fractal_momentum_nse --mode live
+    envVars:
+      - key: DATABASE_URL
+        sync: false
+      - key: SUPABASE_URL
+        sync: false
+      - key: SUPABASE_KEY
+        sync: false
+      - key: PYTHONUNBUFFERED
+        value: "true"

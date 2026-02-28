@@ -8,6 +8,7 @@ from pathlib import Path
 @dataclass(frozen=True)
 class AppConfig:
     db_path: Path
+    database_url: str
     cycle_seconds: int
     disabled_poll_seconds: int
     fetch_lookback_days: int
@@ -20,11 +21,14 @@ class AppConfig:
 
 
 def load_config() -> AppConfig:
+    from dotenv import load_dotenv
+    load_dotenv()
     root = Path(__file__).resolve().parents[1]
     default_db = root / "data" / "stocking.db"
 
     return AppConfig(
         db_path=Path(os.getenv("STOCKING_DB_PATH", default_db)),
+        database_url=os.getenv("DATABASE_URL", ""),
         cycle_seconds=int(os.getenv("STOCKING_CYCLE_SECONDS", "300")),
         disabled_poll_seconds=int(os.getenv("STOCKING_DISABLED_POLL_SECONDS", "5")),
         fetch_lookback_days=int(os.getenv("STOCKING_FETCH_LOOKBACK_DAYS", "10")),

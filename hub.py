@@ -26,7 +26,12 @@ from stocking_app.strategy_loader import discover_strategies, StrategyConfig
 
 # ── Helper — read live state from a strategy's DB ─────────────────────────────
 def _read_strategy_state(sc: StrategyConfig) -> dict:
-    db = sc.db_path
+    from stocking_app.config import load_config
+    import psycopg2
+    from psycopg2.extras import RealDictCursor
+    cfg = load_config()
+    db_url = cfg.database_url
+    
     result = {
         "engine_state":      "offline",
         "last_run":          None,
@@ -37,43 +42,38 @@ def _read_strategy_state(sc: StrategyConfig) -> dict:
         "unrealized_pnl":    0.0,
         "open_positions":    0,
     }
-    if not db.exists():
+    if not db_url:
         return result
     try:
-        conn = sqlite3.connect(str(db), timeout=5)
-        conn.row_factory = sqlite3.Row
-        try:
-            row = conn.execute(
-                "SELECT value FROM engine_state WHERE key='heartbeat'"
-            ).fetchone()
-            if row:
-                hb = json.loads(row["value"])
-                result["engine_state"] = hb.get("state", "offline")
-                result["last_run"]     = hb.get("last_run")
-        except Exception:
-            pass
-        try:
-            row = conn.execute(
-                "SELECT status, symbols_fetched, symbols_total "
-                "FROM run_metrics ORDER BY id DESC LIMIT 1"
-            ).fetchone()
-            if row:
-                result["last_cycle_status"] = row["status"] or "—"
-                result["symbols_fetched"]   = int(row["symbols_fetched"] or 0)
-                result["symbols_total"]     = int(row["symbols_total"] or 0)
-        except Exception:
-            pass
-        try:
-            row = conn.execute(
-                "SELECT realized_pnl, unrealized_pnl, open_positions "
-                "FROM pnl_snapshots ORDER BY ts DESC LIMIT 1"
-            ).fetchone()
-            if row:
-                result["realized_pnl"]   = float(row["realized_pnl"] or 0)
-                result["unrealized_pnl"] = float(row["unrealized_pnl"] or 0)
-                result["open_positions"] = int(row["open_positions"] or 0)
-        except Exception:
-            pass
+        conn = psycopg2.connect(db_url, cursor_factory=RealDictCursor)
+        with conn.cursor() as cur:
+            try:
+                cur.execute("SELECT value FROM engine_state WHERE key='engine_heartbeat'")
+                row = cur.fetchone()
+                if row:
+                    hb = json.loads(row["value"])
+                    result["engine_state"] = hb.get("state", "offline")
+                    result["last_run"]     = hb.get("last_run")
+            except Exception:
+                pass
+            try:
+                cur.execute("SELECT status, symbols_fetched, symbols_total FROM run_metrics ORDER BY id DESC LIMIT 1")
+                row = cur.fetchone()
+                if row:
+                    result["last_cycle_status"] = row["status"] or "—"
+                    result["symbols_fetched"]   = int(row["symbols_fetched"] or 0)
+                    result["symbols_total"]     = int(row["symbols_total"] or 0)
+            except Exception:
+                pass
+            try:
+                cur.execute("SELECT realized_pnl, unrealized_pnl, open_positions FROM pnl_snapshots ORDER BY ts DESC LIMIT 1")
+                row = cur.fetchone()
+                if row:
+                    result["realized_pnl"]   = float(row["realized_pnl"] or 0)
+                    result["unrealized_pnl"] = float(row["unrealized_pnl"] or 0)
+                    result["open_positions"] = int(row["open_positions"] or 0)
+            except Exception:
+                pass
         conn.close()
     except Exception:
         pass

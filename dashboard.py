@@ -65,41 +65,18 @@ with st.sidebar:
         st.error(f"⚠ {last_err}")
 
     col_a, col_b = st.columns(2)
-    pid_file = db_dir / "engine.pid"
-    
-    def _is_running() -> bool:
-        if not pid_file.exists(): return False
-        try:
-            pid = int(pid_file.read_text().strip())
-            os.kill(pid, 0)
-            return True
-        except Exception:
-            return False
-
-    is_running = _is_running()
-
     with col_a:
-        if st.button("▶ Start", use_container_width=True, type="primary", disabled=is_running):
+        if st.button("▶ Start Engine in Cloud", use_container_width=True, type="primary", disabled=(state == "running")):
             repo.set_engine_enabled(True)
-            # Find strategy dir by going up past /data/
-            strategy_dir = db_dir.parent
-            root_dir = strategy_dir.parent.parent
-            cmd = [sys.executable, str(root_dir / "run_strategy.py"), str(strategy_dir), "--mode", "live"]
-            subprocess.Popen(cmd, cwd=str(root_dir))
+            st.toast("Start signal sent to database. Engine will resume shortly.")
             time.sleep(1.5)
             st.rerun()
 
     with col_b:
-        if st.button("⏹ Stop", use_container_width=True, disabled=not is_running):
+        if st.button("⏹ Stop Engine in Cloud", use_container_width=True, disabled=(state != "running")):
             repo.set_engine_enabled(False)
-            if pid_file.exists():
-                try:
-                    pid = int(pid_file.read_text().strip())
-                    os.kill(pid, signal.SIGTERM)
-                except Exception:
-                    pass
-                pid_file.unlink(missing_ok=True)
-            time.sleep(1)
+            st.toast("Stop signal sent to database. Engine will pause shortly.")
+            time.sleep(1.5)
             st.rerun()
 
     st.divider()
