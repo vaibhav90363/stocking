@@ -471,8 +471,15 @@ class TradingRepository:
         self.conn.commit()
 
     def read_df(self, sql: str, params: tuple[Any, ...] = ()) -> pd.DataFrame:
-        # In Pandas, passing a connection string with SQLAlchemy or raw connection is typically fine
-        # Although passing raw psycopg2 connections throws a warning in recent Pandas versions,
-        # it shouldn't fail immediately. For Postgres/Supabase, we can use read_sql.
-        return pd.read_sql_query(sql, self.conn, params=params)
+        # pd.read_sql_query does not support raw psycopg2 connections in pandas 2.x+.
+        # Use the cursor directly to execute and build a DataFrame from column names + rows.
+        with self.conn.cursor() as cur:
+            cur.execute(sql, params or None)
+            rows = cur.fetchall()
+            if not rows:
+                # Return empty DataFrame with correct column names when possible
+                cols = [desc[0] for desc in cur.description] if cur.description else []
+                return pd.DataFrame(columns=cols)
+            cols = [desc[0] for desc in cur.description]
+        return pd.DataFrame([dict(r) for r in rows], columns=cols)
 
