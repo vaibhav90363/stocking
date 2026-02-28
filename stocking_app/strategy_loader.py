@@ -176,8 +176,8 @@ def _minimal_yaml(text: str) -> dict:
         key = key.strip()
         val = val.strip().strip('"').strip("'")
 
-        # Pop stack to current indent level
-        while len(stack) > 1 and stack[-1][0] >= indent:
+        # Pop stack to current indent level (strictly greater so parent stays)
+        while len(stack) > 1 and stack[-1][0] > indent:
             stack.pop()
 
         parent_dict = stack[-1][1]
