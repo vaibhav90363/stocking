@@ -2,6 +2,7 @@ services:
   - type: worker
     name: stocking-engine
     env: python
+    plan: free
     buildCommand: pip install -r requirements.txt
     startCommand: python3 run_strategy.py strategies/fractal_momentum_nse --mode live
     envVars:
