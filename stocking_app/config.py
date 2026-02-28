@@ -26,9 +26,18 @@ def load_config() -> AppConfig:
     root = Path(__file__).resolve().parents[1]
     default_db = root / "data" / "stocking.db"
 
+    database_url = os.getenv("DATABASE_URL", "")
+    try:
+        import streamlit as st
+        from streamlit.runtime.scriptrunner import get_script_run_ctx
+        if get_script_run_ctx() and "DATABASE_URL" in st.secrets:
+            database_url = st.secrets["DATABASE_URL"]
+    except Exception:
+        pass
+
     return AppConfig(
         db_path=Path(os.getenv("STOCKING_DB_PATH", default_db)),
-        database_url=os.getenv("DATABASE_URL", ""),
+        database_url=database_url,
         cycle_seconds=int(os.getenv("STOCKING_CYCLE_SECONDS", "300")),
         disabled_poll_seconds=int(os.getenv("STOCKING_DISABLED_POLL_SECONDS", "5")),
         fetch_lookback_days=int(os.getenv("STOCKING_FETCH_LOOKBACK_DAYS", "10")),
