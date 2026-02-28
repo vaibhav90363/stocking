@@ -29,8 +29,9 @@ def load_config() -> AppConfig:
     database_url = os.getenv("DATABASE_URL", "")
     try:
         import streamlit as st
-        from streamlit.runtime.scriptrunner import get_script_run_ctx
-        if get_script_run_ctx() and "DATABASE_URL" in st.secrets:
+        # Directly attempt to read from st.secrets
+        # If not running in Streamlit, this will raise a RuntimeError or FileNotFoundError
+        if "DATABASE_URL" in st.secrets:
             database_url = st.secrets["DATABASE_URL"]
     except Exception:
         pass
