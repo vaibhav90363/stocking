@@ -43,7 +43,12 @@ div[data-testid="stDataFrameContainer"] { border-radius: 8px; }
 
 # ── Load config & repo ─────────────────────────────────────────────────────────
 cfg  = load_config()
-repo = TradingRepository(cfg.database_url or cfg.db_path)
+
+# DEBUG
+db_target = cfg.database_url or cfg.db_path
+st.error(f"Connecting to: {str(db_target).split('@')[-1]}")
+
+repo = TradingRepository(db_target)
 repo.init_db()
 import sys
 import argparse
