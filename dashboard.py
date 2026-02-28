@@ -1,11 +1,5 @@
 from __future__ import annotations
 
-"""
-dashboard.py — Stocking Strategy Dashboard
-Full tabbed UX with system visibility, portfolio analytics, universe sync status,
-live log tail, and real-time engine monitoring.
-"""
-
 import os
 import signal
 import subprocess
@@ -188,23 +182,24 @@ with tab_overview:
     history = repo.read_df(
         """
         SELECT id AS cycle,
-               SUBSTR(run_started_at,1,19) AS started,
+               SUBSTR(CAST(run_started_at AS TEXT),1,19) AS started,
                status,
                symbols_total AS total,
                symbols_fetched AS fetched,
                symbols_computed AS computed,
-               ROUND(fetch_seconds,1)   AS fetch_s,
-               ROUND(compute_seconds,1) AS compute_s,
-               ROUND(duration_seconds,1) AS total_s,
+               fetch_seconds    AS fetch_s,
+               compute_seconds  AS compute_s,
+               duration_seconds AS total_s,
                error
         FROM run_metrics
-        ORDER BY id DESC
-        LIMIT 50
+        ORDER BY id DESC LIMIT 50
         """
     )
-    if history.empty:
-        st.info("No cycle history yet.")
-    else:
+    if not history.empty:
+        history['fetch_s'] = history['fetch_s'].round(1)
+        history['compute_s'] = history['compute_s'].round(1)
+        history['total_s'] = history['total_s'].round(1)
+    
         def _color_status(val):
             if val == "OK":     return "background-color:#14532d; color:#4ade80"
             if val == "FAILED": return "background-color:#450a0a; color:#f87171"
