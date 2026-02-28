@@ -1,0 +1,36 @@
+from __future__ import annotations
+
+import os
+from dataclasses import dataclass
+from pathlib import Path
+
+
+@dataclass(frozen=True)
+class AppConfig:
+    db_path: Path
+    cycle_seconds: int
+    disabled_poll_seconds: int
+    fetch_lookback_days: int
+    compute_lookback_days: int
+    max_fetch_concurrency: int
+    compute_workers: int
+    order_qty: int
+    ticker_suffix: str
+
+
+
+def load_config() -> AppConfig:
+    root = Path(__file__).resolve().parents[1]
+    default_db = root / "data" / "stocking.db"
+
+    return AppConfig(
+        db_path=Path(os.getenv("STOCKING_DB_PATH", default_db)),
+        cycle_seconds=int(os.getenv("STOCKING_CYCLE_SECONDS", "300")),
+        disabled_poll_seconds=int(os.getenv("STOCKING_DISABLED_POLL_SECONDS", "5")),
+        fetch_lookback_days=int(os.getenv("STOCKING_FETCH_LOOKBACK_DAYS", "10")),
+        compute_lookback_days=int(os.getenv("STOCKING_COMPUTE_LOOKBACK_DAYS", "365")),
+        max_fetch_concurrency=int(os.getenv("STOCKING_FETCH_CONCURRENCY", "12")),
+        compute_workers=int(os.getenv("STOCKING_COMPUTE_WORKERS", "4")),
+        order_qty=int(os.getenv("STOCKING_ORDER_QTY", "1")),
+        ticker_suffix=os.getenv("STOCKING_TICKER_SUFFIX", ".NS"),
+    )

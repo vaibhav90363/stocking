@@ -1,0 +1,32 @@
+name: "Fractal Momentum — LSE"
+description: >
+  Fractal Chaos Band upper-band breakout as the BUY trigger,
+  Chande Momentum Oscillator EMA/SMA crossdown as the SELL trigger.
+  Runs on FTSE 350 universe (LSE), daily aggregation of 5m bars.
+
+strategy_type: fractal_momentum
+
+exchange:
+  suffix: ".L"
+  timezone: "Europe/London"
+
+engine:
+  cycle_seconds: 300
+  fetch_lookback_days: 10
+  compute_lookback_days: 365
+  fetch_concurrency: 16
+  compute_workers: 4
+  order_qty: 10
+
+parameters:
+  fractal_left: 2
+  fractal_right: 2
+  cmo_period: 11
+  cmo_ema_period: 5
+  cmo_sma_period: 11
+  capital_per_trade: 10000
+
+backtest:
+  daily_lookback: "2y"
+  intraday_days: 60
+  backtest_days: 30
