@@ -233,10 +233,10 @@ with tab_portfolio:
         """
         SELECT symbol,
                qty,
-               ROUND(avg_price,4)   AS avg_price,
-               ROUND(last_price,4)  AS last_price,
-               ROUND((last_price - avg_price) * qty, 2) AS unrealized_pnl,
-               ROUND((last_price - avg_price) / avg_price * 100, 2) AS pct_chg,
+               ROUND(avg_price::NUMERIC,4)   AS avg_price,
+               ROUND(last_price::NUMERIC,4)  AS last_price,
+               ROUND(((last_price - avg_price) * qty)::NUMERIC, 2) AS unrealized_pnl,
+               ROUND(((last_price - avg_price) / avg_price * 100)::NUMERIC, 2) AS pct_chg,
                opened_at,
                last_updated_at
         FROM positions_ledger
@@ -368,8 +368,8 @@ with tab_signals:
             COUNT(*) AS total,
             SUM(acted) AS acted,
             COUNT(*) - SUM(acted) AS not_acted,
-            ROUND(AVG(price),4) AS avg_price,
-            SUBSTR(MAX(ts),1,19) AS latest
+            ROUND(AVG(price)::NUMERIC,4) AS avg_price,
+            MAX(ts) AS latest
         FROM signals
         GROUP BY signal_type
         """
@@ -384,7 +384,7 @@ with tab_signals:
 
     signals = repo.read_df(
         """
-        SELECT id, symbol, SUBSTR(ts,1,19) AS ts, signal_type, ROUND(price,4) AS price, reason, acted
+        SELECT id, symbol, SUBSTR(ts,1,19) AS ts, signal_type, ROUND(price::NUMERIC,4) AS price, reason, acted
         FROM signals
         ORDER BY id DESC
         LIMIT 500
@@ -426,8 +426,8 @@ with tab_ledger:
                symbol,
                side,
                qty,
-               ROUND(price,4) AS price,
-               ROUND(pnl,2)   AS pnl,
+               ROUND(price::NUMERIC,4) AS price,
+               ROUND(pnl::NUMERIC,2)   AS pnl,
                SUBSTR(ts,1,19) AS ts,
                reason
         FROM trade_activity_log
