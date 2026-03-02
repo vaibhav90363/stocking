@@ -38,7 +38,7 @@ div[data-testid="stDataFrameContainer"] { border-radius: 8px; }
 # ── Load config & repo ─────────────────────────────────────────────────────────
 cfg  = load_config()
 
-repo = TradingRepository(cfg.database_url or cfg.db_path)
+repo = TradingRepository(cfg.database_url or cfg.db_path, suffix=cfg.ticker_suffix)
 repo.init_db()
 import sys
 import argparse
@@ -197,13 +197,13 @@ open_pos_map = repo.get_open_positions()
 n_open       = len(open_pos_map)
 
 pnl_snap = repo.read_df(
-    "SELECT realized_pnl, unrealized_pnl, total_pnl FROM pnl_snapshots ORDER BY ts DESC LIMIT 1"
+    f"SELECT realized_pnl, unrealized_pnl, total_pnl FROM pnl_snapshots WHERE suffix='{cfg.ticker_suffix}' ORDER BY ts DESC LIMIT 1"
 )
 realized   = float(pnl_snap["realized_pnl"].iloc[0])   if not pnl_snap.empty else 0.0
 unrealized = float(pnl_snap["unrealized_pnl"].iloc[0]) if not pnl_snap.empty else 0.0
 total_pnl  = float(pnl_snap["total_pnl"].iloc[0])      if not pnl_snap.empty else 0.0
 
-latest_run = repo.read_df("SELECT * FROM run_metrics ORDER BY id DESC LIMIT 1")
+latest_run = repo.read_df(f"SELECT * FROM run_metrics WHERE suffix='{cfg.ticker_suffix}' ORDER BY id DESC LIMIT 1")
 last_cycle_status = str(latest_run["status"].iloc[0]) if not latest_run.empty else "—"
 last_duration     = float(latest_run["duration_seconds"].iloc[0]) if not latest_run.empty else 0.0
 fetched_last      = int(latest_run["symbols_fetched"].iloc[0]) if not latest_run.empty else 0
@@ -280,8 +280,10 @@ with tab_overview:
                duration_seconds AS total_s,
                error
         FROM run_metrics
+        WHERE suffix = %s
         ORDER BY id DESC LIMIT 50
-        """
+        """,
+        (cfg.ticker_suffix,)
     )
     if not history.empty:
         history['fetch_s'] = history['fetch_s'].round(1)
@@ -301,8 +303,9 @@ with tab_overview:
     pnl_hist = repo.read_df(
         """
         SELECT ts, realized_pnl, unrealized_pnl, total_pnl
-        FROM pnl_snapshots ORDER BY ts ASC LIMIT 500
-        """
+        FROM pnl_snapshots WHERE suffix = %s ORDER BY ts ASC LIMIT 500
+        """,
+        (cfg.ticker_suffix,)
     )
     if not pnl_hist.empty:
         pnl_hist["ts"] = pd.to_datetime(pnl_hist["ts"], utc=True)
@@ -327,9 +330,10 @@ with tab_portfolio:
                ROUND(((last_price - avg_price) / avg_price * 100)::NUMERIC, 2) AS pct_chg,
                opened_at,
                last_updated_at
-        FROM positions_ledger
+        WHERE symbol LIKE %s
         ORDER BY unrealized_pnl DESC
-        """
+        """,
+        (f"%{cfg.ticker_suffix}",)
     )
 
     if positions.empty:
@@ -395,8 +399,10 @@ with tab_universe:
             SUBSTR(ss.updated_at, 1, 19) AS state_updated
         FROM universe u
         LEFT JOIN symbol_state ss ON ss.symbol = u.symbol
+        WHERE u.symbol LIKE %s
         ORDER BY u.is_active DESC, sync_status, u.symbol
-        """
+        """,
+        (f"%{cfg.ticker_suffix}",)
     )
 
     if sync_df.empty:
@@ -459,8 +465,10 @@ with tab_signals:
             ROUND(AVG(price)::NUMERIC,4) AS avg_price,
             MAX(ts) AS latest
         FROM signals
+        WHERE symbol LIKE %s
         GROUP BY signal_type
-        """
+        """,
+        (f"%{cfg.ticker_suffix}",)
     )
     if not sig_summary.empty:
         st.dataframe(sig_summary, use_container_width=True, hide_index=True)
@@ -474,9 +482,11 @@ with tab_signals:
         """
         SELECT id, symbol, SUBSTR(ts,1,19) AS ts, signal_type, ROUND(price::NUMERIC,4) AS price, reason, acted
         FROM signals
+        WHERE symbol LIKE %s
         ORDER BY id DESC
         LIMIT 500
-        """
+        """,
+        (f"%{cfg.ticker_suffix}",)
     )
 
     if not signals.empty:
@@ -519,9 +529,11 @@ with tab_ledger:
                SUBSTR(ts,1,19) AS ts,
                reason
         FROM trade_activity_log
+        WHERE symbol LIKE %s
         ORDER BY id DESC
         LIMIT 500
-        """
+        """,
+        (f"%{cfg.ticker_suffix}",)
     )
 
     if trades.empty:

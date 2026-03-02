@@ -267,7 +267,7 @@ with tab_strategies:
                             from stocking_app.db import TradingRepository
                             from stocking_app.config import load_config
                             _cfg = load_config()
-                            _repo = TradingRepository(_cfg.database_url or _cfg.db_path)
+                            _repo = TradingRepository(_cfg.database_url or _cfg.db_path, suffix=sc.suffix)
                             _repo.set_engine_enabled(False)
                             _repo.close()
                             st.toast(f"⏹ Stop signal sent for {sc.name}.", icon="🟡")
@@ -289,7 +289,7 @@ with tab_strategies:
                             from stocking_app.db import TradingRepository
                             from stocking_app.config import load_config
                             _cfg = load_config()
-                            _repo = TradingRepository(_cfg.database_url or _cfg.db_path)
+                            _repo = TradingRepository(_cfg.database_url or _cfg.db_path, suffix=sc.suffix)
                             _repo.set_engine_enabled(True)
                             _repo.close()
                             st.toast(f"▶ Start signal sent for {sc.name}. Engine will resume shortly.", icon="🟢")

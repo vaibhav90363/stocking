@@ -70,6 +70,7 @@ CREATE TABLE IF NOT EXISTS trade_activity_log (
 
 CREATE TABLE IF NOT EXISTS pnl_snapshots (
     ts TEXT PRIMARY KEY,
+    suffix TEXT NOT NULL,
     realized_pnl REAL NOT NULL,
     unrealized_pnl REAL NOT NULL,
     total_pnl REAL NOT NULL,
@@ -91,6 +92,7 @@ CREATE TABLE IF NOT EXISTS symbol_state (
 
 CREATE TABLE IF NOT EXISTS run_metrics (
     id SERIAL PRIMARY KEY,
+    suffix TEXT NOT NULL,
     run_started_at TEXT NOT NULL,
     run_ended_at TEXT,
     status TEXT NOT NULL,
@@ -122,6 +124,7 @@ CREATE TABLE IF NOT EXISTS system_logs (
     id SERIAL PRIMARY KEY,
     ts TEXT NOT NULL,
     level TEXT NOT NULL,
+    suffix TEXT NOT NULL,
     message TEXT NOT NULL
 );
 """
@@ -137,7 +140,7 @@ class SignalRecord:
 
 
 class TradingRepository:
-    def __init__(self, db_path_or_url: str | Path):
+    def __init__(self, db_path_or_url: str | Path, suffix: str = ".NS"):
         # Allow passing either a database URL directly (for Postgres/Supabase)
         # or a local generic fallback path that gets ignored if using URL string.
         if isinstance(db_path_or_url, Path):
@@ -145,6 +148,7 @@ class TradingRepository:
         else:
             self.db_url = db_path_or_url
 
+        self.suffix = suffix
         self.conn = None
         self._ensure_connection()
 
@@ -198,20 +202,22 @@ class TradingRepository:
 
     def set_engine_enabled(self, enabled: bool) -> None:
         now = utc_now_iso()
+        key = f"engine_enabled_{self.suffix}"
         with self.conn.cursor() as cur:
             cur.execute(
                 """
                 INSERT INTO engine_state(key, value, updated_at)
-                VALUES('engine_enabled', %s, %s)
+                VALUES(%s, %s, %s)
                 ON CONFLICT(key) DO UPDATE SET value=EXCLUDED.value, updated_at=EXCLUDED.updated_at
                 """,
-                ("1" if enabled else "0", now),
+                (key, "1" if enabled else "0", now),
             )
         self.conn.commit()
 
     def get_engine_enabled(self) -> bool | None:
+        key = f"engine_enabled_{self.suffix}"
         with self.conn.cursor() as cur:
-            cur.execute("SELECT value FROM engine_state WHERE key='engine_enabled'")
+            cur.execute("SELECT value FROM engine_state WHERE key=%s", (key,))
             row = cur.fetchone()
         if row is None:
             return None
@@ -219,20 +225,22 @@ class TradingRepository:
 
     def set_engine_heartbeat(self, payload: dict[str, Any]) -> None:
         now = utc_now_iso()
+        key = f"engine_heartbeat_{self.suffix}"
         with self.conn.cursor() as cur:
             cur.execute(
                 """
                 INSERT INTO engine_state(key, value, updated_at)
-                VALUES('engine_heartbeat', %s, %s)
+                VALUES(%s, %s, %s)
                 ON CONFLICT(key) DO UPDATE SET value=EXCLUDED.value, updated_at=EXCLUDED.updated_at
                 """,
-                (json.dumps(payload), now),
+                (key, json.dumps(payload), now),
             )
         self.conn.commit()
 
     def get_engine_heartbeat(self) -> dict[str, Any] | None:
+        key = f"engine_heartbeat_{self.suffix}"
         with self.conn.cursor() as cur:
-            cur.execute("SELECT value FROM engine_state WHERE key='engine_heartbeat'")
+            cur.execute("SELECT value FROM engine_state WHERE key=%s", (key,))
             row = cur.fetchone()
         if row is None:
             return None
@@ -264,11 +272,12 @@ class TradingRepository:
         with self.conn.cursor() as cur:
             cur.execute(
                 """
-                SELECT symbol FROM universe WHERE is_active=1
+                SELECT symbol FROM universe WHERE is_active=1 AND symbol LIKE %s
                 UNION
-                SELECT symbol FROM positions_ledger
+                SELECT symbol FROM positions_ledger WHERE symbol LIKE %s
                 ORDER BY symbol
-                """
+                """,
+                (f"%{self.suffix}", f"%{self.suffix}")
             )
             rows = cur.fetchall()
         return [r["symbol"] for r in rows]
@@ -282,7 +291,9 @@ class TradingRepository:
                   SUM(CASE WHEN is_selected=1 THEN 1 ELSE 0 END) AS selected,
                   SUM(CASE WHEN is_active=1 THEN 1 ELSE 0 END) AS active
                 FROM universe
-                """
+                WHERE symbol LIKE %s
+                """,
+                (f"%{self.suffix}",)
             )
             row = cur.fetchone()
         return {
@@ -353,7 +364,7 @@ class TradingRepository:
 
     def get_open_positions(self) -> dict[str, dict]:
         with self.conn.cursor() as cur:
-            cur.execute("SELECT * FROM positions_ledger ORDER BY symbol")
+            cur.execute("SELECT * FROM positions_ledger WHERE symbol LIKE %s ORDER BY symbol", (f"%{self.suffix}",))
             rows = cur.fetchall()
         return {r["symbol"]: dict(r) for r in rows}
 
@@ -460,14 +471,16 @@ class TradingRepository:
 
     def snapshot_pnl(self, ts: str) -> dict[str, float]:
         with self.conn.cursor() as cur:
-            cur.execute("SELECT COALESCE(SUM(pnl), 0.0) AS realized FROM trade_activity_log WHERE side='SELL'")
+            cur.execute("SELECT COALESCE(SUM(pnl), 0.0) AS realized FROM trade_activity_log WHERE side='SELL' AND symbol LIKE %s", (f"%{self.suffix}",))
             realized_row = cur.fetchone()
             cur.execute(
                 """
                 SELECT COALESCE(SUM((last_price - avg_price) * qty), 0.0) AS unrealized,
                        COUNT(*) AS open_positions
                 FROM positions_ledger
-                """
+                WHERE symbol LIKE %s
+                """,
+                (f"%{self.suffix}",)
             )
             unrealized_row = cur.fetchone()
             
@@ -478,15 +491,16 @@ class TradingRepository:
 
             cur.execute(
                 """
-                INSERT INTO pnl_snapshots(ts, realized_pnl, unrealized_pnl, total_pnl, open_positions)
-                VALUES(%s, %s, %s, %s, %s)
+                INSERT INTO pnl_snapshots(ts, suffix, realized_pnl, unrealized_pnl, total_pnl, open_positions)
+                VALUES(%s, %s, %s, %s, %s, %s)
                 ON CONFLICT(ts) DO UPDATE SET
+                    suffix=EXCLUDED.suffix,
                     realized_pnl=EXCLUDED.realized_pnl,
                     unrealized_pnl=EXCLUDED.unrealized_pnl,
                     total_pnl=EXCLUDED.total_pnl,
                     open_positions=EXCLUDED.open_positions
                 """,
-                (ts, realized, unrealized, total, open_positions),
+                (ts, self.suffix, realized, unrealized, total, open_positions),
             )
         return {
             "realized": realized,
@@ -503,14 +517,15 @@ class TradingRepository:
             cur.execute(
                 """
                 INSERT INTO run_metrics(
-                    run_started_at, run_ended_at, status,
+                    run_started_at, suffix, run_ended_at, status,
                     symbols_total, symbols_fetched, symbols_computed,
                     fetch_seconds, compute_seconds, persist_seconds,
                     duration_seconds, error
-                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                 """,
                 (
                     payload["run_started_at"],
+                    self.suffix,
                     payload.get("run_ended_at"),
                     payload["status"],
                     payload["symbols_total"],
@@ -543,15 +558,15 @@ class TradingRepository:
         with self.conn.cursor() as cur:
             cur.execute(
                 """
-                INSERT INTO system_logs(ts, level, message)
-                VALUES(%s, %s, %s)
+                INSERT INTO system_logs(ts, level, suffix, message)
+                VALUES(%s, %s, %s, %s)
                 """,
-                (now, level, message),
+                (now, level, self.suffix, message),
             )
         self.conn.commit()
 
     def get_recent_logs(self, limit: int = 200) -> pd.DataFrame:
         return self.read_df(
-            "SELECT ts, level, message FROM system_logs ORDER BY id DESC LIMIT %s",
-            (limit,)
+            "SELECT ts, level, message FROM system_logs WHERE suffix = %s ORDER BY id DESC LIMIT %s",
+            (self.suffix, limit)
         )

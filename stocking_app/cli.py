@@ -47,7 +47,7 @@ def _apply_suffix(symbol: str, suffix: str | None) -> str:
 
 def cmd_init_db(repo: TradingRepository) -> None:
     repo.init_db()
-    print(f"Initialized database at {repo.db_url}")
+    print(f"Initialized database at {repo.db_url} for suffix {repo.suffix}")
 
 
 def cmd_import_universe(repo: TradingRepository, csv_path: str, symbol_column: str, suffix: str | None) -> None:
@@ -57,7 +57,7 @@ def cmd_import_universe(repo: TradingRepository, csv_path: str, symbol_column: s
 
     symbols = [_apply_suffix(str(x), suffix) for x in df[symbol_column].dropna().tolist()]
     inserted = repo.upsert_universe(symbols)
-    print(f"Imported {inserted} symbols into universe")
+    print(f"Imported {inserted} symbols into universe for suffix {repo.suffix}")
 
 
 def cmd_set_engine(repo: TradingRepository, enabled: bool) -> None:
@@ -119,7 +119,7 @@ def main() -> None:
     args = parser.parse_args()
 
     cfg = load_config()
-    repo = TradingRepository(cfg.database_url or cfg.db_path)
+    repo = TradingRepository(cfg.database_url or cfg.db_path, suffix=cfg.ticker_suffix)
 
     try:
         if args.command == "init-db":

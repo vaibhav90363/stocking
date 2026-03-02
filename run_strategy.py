@@ -244,15 +244,46 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=__doc__,
     )
-    parser.add_argument("strategy_dir", help="Path to strategy folder (contains strategy.yaml)")
+    parser.add_argument("strategy_dir", nargs='?', help="Path to strategy folder (contains strategy.yaml). Mutually exclusive with --all-strategies.")
     parser.add_argument(
         "--mode", required=True,
         choices=["backtest", "live", "dashboard", "all"],
         help="backtest=historical sim | live=paper trading engine | dashboard=open UI",
     )
+    parser.add_argument("--all-strategies", action="store_true", help="Run the mode on all discovered strategies concurrently (only useful for 'live' mode in Render).")
     parser.add_argument("--port",          type=int, default=None, help="Dashboard port (default: 8501)")
     parser.add_argument("--skip-download", action="store_true",    help="[backtest] reuse cached DB data")
     args = parser.parse_args()
+
+    if args.all_strategies:
+        print("\n  [Runner] Launching all strategies concurrently …")
+        strategies_dir = ROOT / "strategies"
+        processes = []
+        for d in strategies_dir.iterdir():
+            if d.is_dir() and (d / "strategy.yaml").exists():
+                print(f"  --> Launching {d.name} in mode {args.mode}")
+                p = subprocess.Popen([
+                    sys.executable, __file__, str(d),
+                    "--mode", args.mode,
+                ])
+                processes.append(p)
+        
+        if not processes:
+            print("  No strategies found.")
+            sys.exit(1)
+            
+        print(f"  Started {len(processes)} engines in the background. Waiting for them...")
+        try:
+            for p in processes:
+                p.wait()
+        except KeyboardInterrupt:
+            print("\n  Shutting down all engines...")
+            for p in processes:
+                p.terminate()
+        sys.exit(0)
+
+    if not args.strategy_dir:
+        parser.error("strategy_dir is required unless --all-strategies is used")
 
     sc = load_strategy(args.strategy_dir)
     print(f"\n  Strategy  : {sc.name}")
