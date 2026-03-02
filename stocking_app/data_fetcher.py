@@ -65,7 +65,16 @@ async def fetch_5m_bars(symbols: list[str], lookback_days: int, max_concurrency:
 
     async def _wrapped(symbol: str) -> FetchResult:
         async with semaphore:
-            return await asyncio.to_thread(_fetch_symbol_blocking, symbol, lookback_days)
+            try:
+                # Add strict 15-second timeout to prevent indefinite hangs from Yahoo Finance
+                return await asyncio.wait_for(
+                    asyncio.to_thread(_fetch_symbol_blocking, symbol, lookback_days),
+                    timeout=15.0
+                )
+            except asyncio.TimeoutError:
+                return FetchResult(symbol=symbol, bars=pd.DataFrame(), error="Fetch timed out after 15s")
+            except Exception as exc:
+                return FetchResult(symbol=symbol, bars=pd.DataFrame(), error=f"Fetch failed: {exc}")
 
     tasks = [_wrapped(symbol) for symbol in symbols]
     return await asyncio.gather(*tasks)
