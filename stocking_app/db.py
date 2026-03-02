@@ -35,8 +35,6 @@ CREATE TABLE IF NOT EXISTS candles_5m (
     PRIMARY KEY (symbol, ts)
 );
 
-CREATE INDEX IF NOT EXISTS idx_candles_symbol_ts ON candles_5m(symbol, ts);
-
 CREATE TABLE IF NOT EXISTS signals (
     id SERIAL PRIMARY KEY,
     symbol TEXT NOT NULL,
