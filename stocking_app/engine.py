@@ -13,12 +13,9 @@ from typing import TYPE_CHECKING, Any
 
 from .config import AppConfig, load_config
 from .data_fetcher import fetch_5m_bars_async_gen
-from .db import SignalRecord, utc_now_iso
+from .db import SignalRecord, TradingRepository, utc_now_iso
 from .market_schedule import market_status as get_market_status
 from .strategy import compute_symbol_signal
-
-if TYPE_CHECKING:
-    from .db import TradingRepository
 
 
 # ── Logging setup ─────────────────────────────────────────────────────────────
