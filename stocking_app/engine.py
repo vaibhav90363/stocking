@@ -9,17 +9,33 @@ from concurrent.futures import ProcessPoolExecutor, as_completed
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from .config import AppConfig, load_config
 from .data_fetcher import fetch_5m_bars_sync
-from .db import SignalRecord, TradingRepository, utc_now_iso
+from .db import SignalRecord, utc_now_iso
 from .market_schedule import market_status as get_market_status
 from .strategy import compute_symbol_signal
 
+if TYPE_CHECKING:
+    from .db import TradingRepository
+
 
 # ── Logging setup ─────────────────────────────────────────────────────────────
-def _setup_logger(log_dir: Path) -> logging.Logger:
+class DatabaseLogHandler(logging.Handler):
+    def __init__(self, repo: 'TradingRepository'):
+        super().__init__()
+        self.repo = repo
+
+    def emit(self, record: logging.LogRecord) -> None:
+        try:
+            msg = self.format(record)
+            self.repo.insert_log(record.levelname, msg)
+        except Exception:
+            self.handleError(record)
+
+
+def _setup_logger(log_dir: Path, repo: 'TradingRepository') -> logging.Logger:
     log_dir.mkdir(parents=True, exist_ok=True)
     log_file = log_dir / "engine.log"
 
@@ -43,8 +59,14 @@ def _setup_logger(log_dir: Path) -> logging.Logger:
     ch.setLevel(logging.INFO)
     ch.setFormatter(fmt)
 
+    # Database handler — INFO and above
+    db_h = DatabaseLogHandler(repo)
+    db_h.setLevel(logging.INFO)
+    db_h.setFormatter(fmt)
+
     logger.addHandler(fh)
     logger.addHandler(ch)
+    logger.addHandler(db_h)
     return logger
 
 
@@ -73,9 +95,9 @@ class ScalableEngine:
         self._running = True
         self.executor = ProcessPoolExecutor(max_workers=max(1, cfg.compute_workers))
 
-        # Logger writes to <db_path_dir>/logs/engine.log
+        # Logger writes to <db_path_dir>/logs/engine.log and the Supabase db
         log_dir = Path(cfg.db_path).parent / "logs"
-        self.log = _setup_logger(log_dir)
+        self.log = _setup_logger(log_dir, self.repo)
         self.log.info("═" * 60)
         self.log.info("  Stocking Engine starting up")
         self.log.info(f"  DB          : {cfg.db_path}")

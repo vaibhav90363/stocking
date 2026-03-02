@@ -103,6 +103,27 @@ CREATE TABLE IF NOT EXISTS run_metrics (
     duration_seconds REAL,
     error TEXT
 );
+CREATE TABLE IF NOT EXISTS run_metrics (
+    id SERIAL PRIMARY KEY,
+    run_started_at TEXT NOT NULL,
+    run_ended_at TEXT,
+    status TEXT NOT NULL,
+    symbols_total INTEGER NOT NULL,
+    symbols_fetched INTEGER NOT NULL,
+    symbols_computed INTEGER NOT NULL,
+    fetch_seconds REAL NOT NULL,
+    compute_seconds REAL NOT NULL,
+    persist_seconds REAL NOT NULL,
+    duration_seconds REAL,
+    error TEXT
+);
+
+CREATE TABLE IF NOT EXISTS system_logs (
+    id SERIAL PRIMARY KEY,
+    ts TEXT NOT NULL,
+    level TEXT NOT NULL,
+    message TEXT NOT NULL
+);
 """
 
 

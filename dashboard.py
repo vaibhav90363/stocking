@@ -604,21 +604,33 @@ with tab_system:
 with tab_log:
     st.markdown('<p class="section-header">Live Engine Log</p>', unsafe_allow_html=True)
 
-    n_lines = st.slider("Lines to show", min_value=20, max_value=200, value=80, step=20)
+    n_lines = st.slider("Lines to show", min_value=20, max_value=500, value=100, step=20)
 
-    if log_file.exists():
-        lines = log_file.read_text(encoding="utf-8", errors="replace").splitlines()
-        recent = "\n".join(reversed(lines[-n_lines:]))
+    # Read from Supabase instead of local file system
+    logs_df = repo.get_recent_logs(limit=n_lines)
+    
+    if not logs_df.empty:
+        # Construct a code block to simulate a terminal view
+        # The logs come back sorted DESC, so we reverse them to chronologically display them top-to-bottom
+        log_lines = []
+        for _, row in logs_df.iloc[::-1].iterrows():
+            # Format: 2026-03-02T12:00:00Z  INFO     Message
+            ts = row["ts"][:19].replace("T", " ")
+            level = str(row["level"]).ljust(7)
+            log_lines.append(f"{ts}  {level}  {row['message']}")
+            
+        recent = "\n".join(log_lines)
         st.code(recent, language=None)
+        
+        counts = logs_df["level"].value_counts().to_dict()
+        count_str = " | ".join(f"{k}: {v}" for k,v in counts.items())
+        
         st.caption(
-            f"📄 `{log_file}`  |  "
-            f"{len(lines):,} total lines  |  "
-            f"Size: {log_file.stat().st_size / 1024:.1f} KB"
+            f"📄 Reading live from Supabase `system_logs` | "
+            f"Showing last {len(logs_df)} lines | {count_str}"
         )
-        st.info("💡 Showing most-recent lines first. Tail live in terminal: "
-                f"`tail -f {log_file}`")
     else:
-        st.warning(f"Log not created yet at `{log_file}`. Engine needs to run at least one cycle.")
+        st.warning("No logs found in the database. Engine needs to run at least one cycle with the new database handler.")
 
 # ── Footer / auto-refresh ──────────────────────────────────────────────────────
 st.divider()
