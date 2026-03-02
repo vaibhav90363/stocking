@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, AsyncGenerator
 
 import pandas as pd
 import yfinance as yf
@@ -60,7 +60,10 @@ def _fetch_symbol_blocking(symbol: str, lookback_days: int) -> FetchResult:
         return FetchResult(symbol=symbol, bars=pd.DataFrame(), error=str(exc))
 
 
-async def fetch_5m_bars(symbols: list[str], lookback_days: int, max_concurrency: int) -> list[FetchResult]:
+async def fetch_5m_bars_async_gen(
+    symbols: list[str], lookback_days: int, max_concurrency: int
+) -> AsyncGenerator[FetchResult, None]:
+    # We yield results asynchronously as they complete
     semaphore = asyncio.Semaphore(max(1, max_concurrency))
 
     async def _wrapped(symbol: str) -> FetchResult:
@@ -77,10 +80,5 @@ async def fetch_5m_bars(symbols: list[str], lookback_days: int, max_concurrency:
                 return FetchResult(symbol=symbol, bars=pd.DataFrame(), error=f"Fetch failed: {exc}")
 
     tasks = [_wrapped(symbol) for symbol in symbols]
-    return await asyncio.gather(*tasks)
-
-
-def fetch_5m_bars_sync(symbols: list[str], lookback_days: int, max_concurrency: int) -> list[FetchResult]:
-    if not symbols:
-        return []
-    return asyncio.run(fetch_5m_bars(symbols, lookback_days, max_concurrency))
+    for completed_task in asyncio.as_completed(tasks):
+        yield await completed_task

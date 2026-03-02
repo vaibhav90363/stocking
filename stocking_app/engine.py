@@ -12,7 +12,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from .config import AppConfig, load_config
-from .data_fetcher import fetch_5m_bars_sync
+from .data_fetcher import fetch_5m_bars_async_gen
 from .db import SignalRecord, utc_now_iso
 from .market_schedule import market_status as get_market_status
 from .strategy import compute_symbol_signal
@@ -274,33 +274,61 @@ class ScalableEngine:
             )
 
         fetch_start = time.monotonic()
-        fetch_results = fetch_5m_bars_sync(
-            symbols,
-            lookback_days=self.cfg.fetch_lookback_days,
-            max_concurrency=self.cfg.max_fetch_concurrency,
-        )
-        fetch_seconds = time.monotonic() - fetch_start
-
+        
         fetched_symbols: list[str] = []
         failed_symbols: list[str] = []
-        total_bars = 0
-        for result in fetch_results:
-            if result.error or result.bars.empty:
-                failed_symbols.append(result.symbol)
-                continue
-            self.repo.upsert_candles(result.symbol, result.bars)
-            fetched_symbols.append(result.symbol)
-            total_bars += len(result.bars)
+        state = {"total_bars": 0}
+        
+        async def _run_fetcher():
+            gen = fetch_5m_bars_async_gen(
+                symbols,
+                lookback_days=self.cfg.fetch_lookback_days,
+                max_concurrency=self.cfg.max_fetch_concurrency,
+            )
+            count = 0
+            async for result in gen:
+                count += 1
+                if result.error or result.bars.empty:
+                    failed_symbols.append(result.symbol)
+                else:
+                    self.repo.upsert_candles(result.symbol, result.bars)
+                    fetched_symbols.append(result.symbol)
+                    state["total_bars"] += len(result.bars)
+                
+                # Update heartbeat dynamically every 20 symbols
+                if count % 20 == 0 or count == total:
+                    self.repo.set_engine_heartbeat(
+                        self.repo.get_engine_heartbeat() | {
+                            "state": "fetching",
+                            "fetch_progress": f"{count} / {total}",
+                            "fetch_count": count,
+                            "fetch_total": total
+                        }
+                    )
+        
+        import asyncio
+        asyncio.run(_run_fetcher())
+
+        fetch_seconds = time.monotonic() - fetch_start
 
         self.log.info(
             f"       ✓ {len(fetched_symbols)}/{total} fetched  "
-            f"({total_bars:,} bars)  "
+            f"({state['total_bars']:,} bars)  "
             f"| {fetch_seconds:.1f}s"
             + (f"  | {len(failed_symbols)} failed: {', '.join(failed_symbols[:5])}" if failed_symbols else "")
         )
 
         symbols_to_compute = self.repo.get_symbols_pending_compute(fetched_symbols)
         self.log.info(f"  [2/3] COMPUTE — {len(symbols_to_compute)} symbols pending")
+        
+        self.repo.set_engine_heartbeat(
+            self.repo.get_engine_heartbeat() | {
+                "state": "computing",
+                "compute_progress": f"0 / {len(symbols_to_compute)}",
+                "compute_count": 0,
+                "compute_total": len(symbols_to_compute)
+            }
+        )
 
         compute_start = time.monotonic()
         compute_payloads: list[dict[str, Any]] = []
@@ -316,7 +344,11 @@ class ScalableEngine:
         }
 
         compute_errors = 0
+        computed_count = 0
+        total_to_compute = len(symbols_to_compute)
+        
         for fut in as_completed(futures):
+            computed_count += 1
             symbol = futures[fut]
             try:
                 compute_payloads.append(fut.result())
@@ -330,6 +362,17 @@ class ScalableEngine:
                         "signal": None,
                         "signal_price": None,
                         "signal_reason": f"compute_error:{exc}",
+                    }
+                )
+                
+            # Broadcast live compute progress
+            if computed_count % 10 == 0 or computed_count == total_to_compute:
+                self.repo.set_engine_heartbeat(
+                    self.repo.get_engine_heartbeat() | {
+                        "state": "computing",
+                        "compute_progress": f"{computed_count} / {total_to_compute}",
+                        "compute_count": computed_count,
+                        "compute_total": total_to_compute
                     }
                 )
 

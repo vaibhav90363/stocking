@@ -538,3 +538,20 @@ class TradingRepository:
             cols = [desc[0] for desc in cur.description]
         return pd.DataFrame([dict(r) for r in rows], columns=cols)
 
+    def insert_log(self, level: str, message: str) -> None:
+        now = utc_now_iso()
+        with self.conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO system_logs(ts, level, message)
+                VALUES(%s, %s, %s)
+                """,
+                (now, level, message),
+            )
+        self.conn.commit()
+
+    def get_recent_logs(self, limit: int = 200) -> pd.DataFrame:
+        return self.read_df(
+            "SELECT ts, level, message FROM system_logs ORDER BY id DESC LIMIT %s",
+            (limit,)
+        )

@@ -82,11 +82,12 @@ with st.sidebar:
     live_next_in   = _live["next_event_in"]
 
     # ── Rich status banner ───────────────────────────────────────────────
-    if state in ("running", "starting"):
+    if state in ("running", "starting", "fetching", "computing"):
         banner_color = "#14532d"  # dark green
-        if state == "starting":
+        if state in ("starting", "fetching", "computing"):
             banner_icon = "🟡"
-            banner_title = "STARTING — cycle in progress"
+            act_str = hb.get('fetch_progress') if state == 'fetching' else hb.get('compute_progress') if state == 'computing' else ''
+            banner_title = f"{state.upper()} — {act_str}"
         else:
             banner_icon = "🟢"
             banner_title = f"RUNNING — market closes in {live_next_in}" if live_open else "RUNNING"
@@ -122,7 +123,7 @@ with st.sidebar:
     cycle_secs       = int(hb.get("cycle_seconds", cfg.cycle_seconds))
     cycle_in_progress = False
     secs_left_in_cycle = 0
-    if cycle_started_at and state in ("running", "starting"):
+    if cycle_started_at and state in ("running", "starting", "fetching", "computing"):
         import datetime as _dt
         try:
             started = _dt.datetime.fromisoformat(cycle_started_at.replace("Z", "+00:00"))
@@ -139,7 +140,7 @@ with st.sidebar:
 
     col_a, col_b = st.columns(2)
     with col_a:
-        manual_start_disabled = (state in ("running", "starting")) or (auto_sched and live_open)
+        manual_start_disabled = (state in ("running", "starting", "fetching", "computing")) or (auto_sched and live_open)
         if st.button("▶ Start", use_container_width=True, type="primary",
                      disabled=manual_start_disabled):
             repo.set_engine_enabled(True)
@@ -208,8 +209,19 @@ last_duration     = float(latest_run["duration_seconds"].iloc[0]) if not latest_
 fetched_last      = int(latest_run["symbols_fetched"].iloc[0]) if not latest_run.empty else 0
 
 k1, k2, k3, k4, k5, k6, k7 = st.columns(7)
-_dot = "🟢" if state in ("running", "starting") else ("🟡" if state in ("paused", "paused_market_closed") else "⚫")
-k1.metric("Engine",         f"{_dot} {state.upper()}")
+
+# Build a dynamic engine state string using the live progress payloads
+engine_status_str = f"{state.upper()}"
+if state == "fetching" and hb.get("fetch_progress"):
+    engine_status_str = f"fetching: {hb['fetch_progress']}"
+elif state == "computing" and hb.get("compute_progress"):
+    engine_status_str = f"computing: {hb['compute_progress']}"
+elif state == "starting":
+    engine_status_str = "STARTING"
+
+_dot = "🟢" if state in ("running", "starting", "fetching", "computing") else ("🟡" if state in ("paused", "paused_market_closed") else "⚫")
+
+k1.metric("Engine",         f"{_dot} {engine_status_str}")
 k2.metric("Universe",       uni_summary["active"])
 k3.metric("Open Positions", n_open)
 k4.metric("Realized P&L",   f"{realized:,.2f}")
