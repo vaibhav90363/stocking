@@ -207,11 +207,21 @@ class ScalableEngine:
                     duration_seconds=duration,
                     error=str(exc),
                 )
-                self.repo.record_run_metrics(asdict(failed))
-                self.repo.set_engine_heartbeat(
-                    {"state": "running", "last_run": failed.run_ended_at, "status": "FAILED", "error": failed.error}
-                )
                 self.log.error(f"└─ Cycle #{cycle_num} FAILED: {exc}", exc_info=True)
+                
+                # If the DB connection was what failed, we need to ensure it's alive before we write the error state!
+                try:
+                    if hasattr(self.repo, "_ensure_connection"):
+                        self.repo._ensure_connection()
+                        
+                    self.repo.record_run_metrics(asdict(failed))
+                    self.repo.set_engine_heartbeat(
+                        {"state": "running", "last_run": failed.run_ended_at, "status": "FAILED", "error": failed.error, **mkt}
+                    )
+                except Exception as write_exc:
+                    self.log.error(f"   FATAL: Could not record failure state to DB: {write_exc}")
+                    
+                # We intentionally don't `raise` here. We wait for the next cycle and retry.
 
             elapsed = time.monotonic() - loop_start
             wait = max(0.0, self.cfg.cycle_seconds - elapsed)
