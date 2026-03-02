@@ -126,12 +126,48 @@ class TradingRepository:
         else:
             self.db_url = db_path_or_url
 
+        self.conn = None
+        self._ensure_connection()
+
+    def _ensure_connection(self) -> None:
+        """Ensure connection is alive; reconnect if closed/dropped."""
+        try:
+            if self.conn and not self.conn.closed:
+                # Test the connection quickly
+                with self.conn.cursor() as cur:
+                    cur.execute("SELECT 1")
+                return
+        except Exception:
+            pass  # Connection is dead, we need a new one
+
+        if self.conn:
+            try:
+                self.conn.close()
+            except Exception:
+                pass
+
         # Establish connection with RealDictCursor for dictionaries
-        self.conn = psycopg2.connect(self.db_url, cursor_factory=RealDictCursor)
-        self.conn.autocommit = False # keep explicit commits
+        # Add TCP keepalives to prevent Supabase/firewalls from dropping idle connections
+        try:
+            self.conn = psycopg2.connect(
+                self.db_url,
+                cursor_factory=RealDictCursor,
+                keepalives=1,
+                keepalives_idle=60,
+                keepalives_interval=10,
+                keepalives_count=5
+            )
+            self.conn.autocommit = False # keep explicit commits
+        except Exception as e:
+            if "sqlite" not in str(self.db_url).lower():
+                raise e
+            # Fallback if someone mistakenly uses psycopg2 URL but points to sqlite logic 
+            # (though this repo implies all uses are now Postgres)
+            self.conn = psycopg2.connect(self.db_url, cursor_factory=RealDictCursor)
+            self.conn.autocommit = False
 
     def close(self) -> None:
-        if self.conn:
+        if self.conn and not self.conn.closed:
             self.conn.close()
 
     def init_db(self) -> None:
