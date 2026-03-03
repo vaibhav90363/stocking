@@ -54,9 +54,10 @@ class StrategyConfig:
     intraday_days: int
     backtest_days: int
 
-    def to_app_config(self) -> AppConfig:
+    def to_app_config(self, database_url: str = "") -> AppConfig:
         return AppConfig(
             db_path=self.db_path,
+            database_url=database_url,
             cycle_seconds=self.cycle_seconds,
             disabled_poll_seconds=5,
             fetch_lookback_days=self.fetch_lookback_days,
@@ -65,6 +66,9 @@ class StrategyConfig:
             compute_workers=self.compute_workers,
             order_qty=self.order_qty,
             ticker_suffix=self.suffix,
+            exchange_tz=self.timezone,
+            market_open=self.market_open,
+            market_close=self.market_close,
         )
 
 

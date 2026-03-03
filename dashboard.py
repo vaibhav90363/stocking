@@ -36,25 +36,45 @@ div[data-testid="stDataFrameContainer"] { border-radius: 8px; }
 """, unsafe_allow_html=True)
 
 # ── Load config & repo ─────────────────────────────────────────────────────────
-cfg  = load_config()
-
-repo = TradingRepository(cfg.database_url or cfg.db_path, suffix=cfg.ticker_suffix)
-repo.init_db()
 import sys
 import argparse
+from stocking_app.strategy_loader import load_strategy
+
+global_cfg = load_config()
+database_url = global_cfg.database_url
 
 parser = argparse.ArgumentParser()
 parser.add_argument("--strategy-dir", type=str, required=False)
 args, unknown = parser.parse_known_args()
 
-if args.strategy_dir:
-    strategy_dir = Path(args.strategy_dir)
+strategy_name_or_path = args.strategy_dir
+
+if "strategy" in st.query_params:
+    strategy_name_or_path = st.query_params["strategy"]
+
+if strategy_name_or_path:
+    p = Path(strategy_name_or_path)
+    if not p.is_absolute() and not p.exists():
+        root = Path(__file__).resolve().parent
+        strategy_dir = root / "strategies" / p.name
+    else:
+        strategy_dir = p
 else:
     # fallback if not provided
     strategy_dir = Path.cwd()
 
-db_dir   = strategy_dir / "data"
-log_file = db_dir / "logs" / "engine.log"
+if not strategy_dir.exists() or not (strategy_dir / "strategy.yaml").exists():
+    st.error(f"Strategy config not found in {strategy_dir}. Please access via the Hub or pass a valid `--strategy-dir`.")
+    st.stop()
+
+strat_config = load_strategy(strategy_dir)
+cfg = strat_config.to_app_config(database_url=database_url)
+
+repo = TradingRepository(cfg.database_url or cfg.db_path, suffix=cfg.ticker_suffix)
+repo.init_db()
+
+db_dir   = strat_config.strategy_dir / "data"
+log_file = strat_config.log_dir / "engine.log"
 
 # ── Sidebar — System Parameters & Controls ─────────────────────────────────────
 with st.sidebar:
@@ -612,9 +632,9 @@ with tab_system:
     files = {
         "Live DB": str(cfg.db_path),
         "Engine Log": str(log_file),
-        "Backtest DB (.L)": str(db_dir / "backtest_L.db"),
-        "Backtest Report": str(db_dir / "backtest_L_report.txt"),
-        "Backtest Trades": str(db_dir / "backtest_L_trades.csv"),
+        "Backtest DB": str(strat_config.backtest_dir / "backtest.db"),
+        "Backtest Report": str(strat_config.backtest_dir / "report.txt"),
+        "Backtest Trades": str(strat_config.backtest_dir / "trades.csv"),
     }
     files_df = pd.DataFrame(
         [{"File": k, "Path": v, "Exists": "✅" if Path(v).exists() else "❌"}
