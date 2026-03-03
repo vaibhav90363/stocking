@@ -41,7 +41,8 @@ if "strategy" in st.query_params:
         runpy.run_path(dash_path, run_name="__main__")
         st.stop()
     else:
-        st.error(f"Strategy '{strat_id}' not found. Available: fractal_momentum_lse, fractal_momentum_nse")
+        avail = [d.name for d in (ROOT / "strategies").iterdir() if d.is_dir() and (d / "strategy.yaml").exists()]
+        st.error(f"Strategy '{strat_id}' not found. Available: {', '.join(avail)}")
         if st.button("← Back to Hub"):
             st.query_params.clear()
             st.rerun()
