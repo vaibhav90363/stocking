@@ -15,6 +15,32 @@ def utc_now_iso() -> str:
     return datetime.now(timezone.utc).replace(microsecond=0).isoformat()
 
 
+def retry_on_disconnect(max_retries=3):
+    """Decorator to catch 'server closed the connection unexpectedly' errors and reconnect."""
+    def decorator(func):
+        from functools import wraps
+        @wraps(func)
+        def wrapper(self, *args, **kwargs):
+            import psycopg2
+            last_err = None
+            for _ in range(max_retries):
+                try:
+                    self._ensure_connection()
+                    return func(self, *args, **kwargs)
+                except (psycopg2.OperationalError, psycopg2.InterfaceError) as e:
+                    last_err = e
+                    # Connection dropped - wipe it so _ensure_connection opens a new one
+                    if self.conn:
+                        try:
+                            self.conn.close()
+                        except Exception:
+                            pass
+                    self.conn = None
+            raise last_err
+        return wrapper
+    return decorator
+
+
 SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS universe (
     symbol TEXT PRIMARY KEY,
@@ -193,6 +219,7 @@ class TradingRepository:
         if self.conn and not self.conn.closed:
             self.conn.close()
 
+    @retry_on_disconnect()
     def init_db(self) -> None:
         with self.conn.cursor() as cur:
             cur.execute(SCHEMA_SQL)
@@ -200,6 +227,7 @@ class TradingRepository:
         if self.get_engine_enabled() is None:
             self.set_engine_enabled(False)
 
+    @retry_on_disconnect()
     def set_engine_enabled(self, enabled: bool) -> None:
         now = utc_now_iso()
         key = f"engine_enabled_{self.suffix}"
@@ -214,6 +242,7 @@ class TradingRepository:
             )
         self.conn.commit()
 
+    @retry_on_disconnect()
     def get_engine_enabled(self) -> bool | None:
         key = f"engine_enabled_{self.suffix}"
         with self.conn.cursor() as cur:
@@ -223,6 +252,7 @@ class TradingRepository:
             return None
         return row["value"] == "1"
 
+    @retry_on_disconnect()
     def set_engine_heartbeat(self, payload: dict[str, Any]) -> None:
         now = utc_now_iso()
         key = f"engine_heartbeat_{self.suffix}"
@@ -237,6 +267,7 @@ class TradingRepository:
             )
         self.conn.commit()
 
+    @retry_on_disconnect()
     def get_engine_heartbeat(self) -> dict[str, Any] | None:
         key = f"engine_heartbeat_{self.suffix}"
         with self.conn.cursor() as cur:
@@ -249,6 +280,7 @@ class TradingRepository:
         except json.JSONDecodeError:
             return {"raw": row["value"]}
 
+    @retry_on_disconnect()
     def upsert_universe(self, symbols: list[str], selected: bool = True, active: bool = True) -> int:
         now = utc_now_iso()
         cleaned = sorted({s.strip().upper() for s in symbols if s and s.strip()})
@@ -268,6 +300,7 @@ class TradingRepository:
         self.conn.commit()
         return len(rows)
 
+    @retry_on_disconnect()
     def get_monitor_symbols(self) -> list[str]:
         with self.conn.cursor() as cur:
             cur.execute(
@@ -282,6 +315,7 @@ class TradingRepository:
             rows = cur.fetchall()
         return [r["symbol"] for r in rows]
 
+    @retry_on_disconnect()
     def get_universe_summary(self) -> dict[str, int]:
         with self.conn.cursor() as cur:
             cur.execute(
@@ -302,6 +336,7 @@ class TradingRepository:
             "active": int(row["active"] or 0),
         }
 
+    @retry_on_disconnect()
     def upsert_candles(self, symbol: str, bars: pd.DataFrame) -> int:
         if bars.empty:
             return 0
@@ -348,6 +383,7 @@ class TradingRepository:
         self.conn.commit()
         return len(rows)
 
+    @retry_on_disconnect()
     def mark_symbol_computed(self, symbol: str, asof_ts: str | None) -> None:
         now = utc_now_iso()
         with self.conn.cursor() as cur:
@@ -362,12 +398,14 @@ class TradingRepository:
                 (symbol, asof_ts, now),
             )
 
+    @retry_on_disconnect()
     def get_open_positions(self) -> dict[str, dict]:
         with self.conn.cursor() as cur:
             cur.execute("SELECT * FROM positions_ledger WHERE symbol LIKE %s ORDER BY symbol", (f"%{self.suffix}",))
             rows = cur.fetchall()
         return {r["symbol"]: dict(r) for r in rows}
 
+    @retry_on_disconnect()
     def get_symbols_pending_compute(self, symbols: list[str]) -> list[str]:
         if not symbols:
             return []
@@ -388,6 +426,7 @@ class TradingRepository:
             rows = cur.fetchall()
         return [r["symbol"] for r in rows]
 
+    @retry_on_disconnect()
     def upsert_signal(self, signal: SignalRecord, acted: bool = False) -> None:
         with self.conn.cursor() as cur:
             cur.execute(
@@ -411,6 +450,7 @@ class TradingRepository:
                 ),
             )
 
+    @retry_on_disconnect()
     def execute_buy(self, symbol: str, qty: int, price: float, ts: str, reason: str) -> None:
         now = utc_now_iso()
         with self.conn.cursor() as cur:
@@ -435,6 +475,7 @@ class TradingRepository:
                 (symbol, qty, price, ts, reason, now),
             )
 
+    @retry_on_disconnect()
     def execute_sell(self, symbol: str, price: float, ts: str, reason: str) -> float | None:
         with self.conn.cursor() as cur:
             cur.execute("SELECT symbol, qty, avg_price FROM positions_ledger WHERE symbol=%s", (symbol,))
@@ -457,6 +498,7 @@ class TradingRepository:
             )
         return pnl
 
+    @retry_on_disconnect()
     def update_position_prices(self, prices: dict[str, tuple[float, str]]) -> None:
         rows = [(price, ts, sym) for sym, (price, ts) in prices.items()]
         with self.conn.cursor() as cur:
@@ -469,6 +511,7 @@ class TradingRepository:
                 rows,
             )
 
+    @retry_on_disconnect()
     def snapshot_pnl(self, ts: str) -> dict[str, float]:
         with self.conn.cursor() as cur:
             cur.execute("SELECT COALESCE(SUM(pnl), 0.0) AS realized FROM trade_activity_log WHERE side='SELL' AND symbol LIKE %s", (f"%{self.suffix}",))
@@ -512,6 +555,7 @@ class TradingRepository:
     def commit(self) -> None:
         self.conn.commit()
 
+    @retry_on_disconnect()
     def record_run_metrics(self, payload: dict[str, Any]) -> None:
         with self.conn.cursor() as cur:
             cur.execute(
@@ -540,6 +584,7 @@ class TradingRepository:
             )
         self.conn.commit()
 
+    @retry_on_disconnect()
     def read_df(self, sql: str, params: tuple[Any, ...] = ()) -> pd.DataFrame:
         # pd.read_sql_query does not support raw psycopg2 connections in pandas 2.x+.
         # Use the cursor directly to execute and build a DataFrame from column names + rows.
@@ -553,6 +598,7 @@ class TradingRepository:
             cols = [desc[0] for desc in cur.description]
         return pd.DataFrame([dict(r) for r in rows], columns=cols)
 
+    @retry_on_disconnect()
     def insert_log(self, level: str, message: str) -> None:
         now = utc_now_iso()
         with self.conn.cursor() as cur:
@@ -565,6 +611,7 @@ class TradingRepository:
             )
         self.conn.commit()
 
+    @retry_on_disconnect()
     def get_recent_logs(self, limit: int = 200) -> pd.DataFrame:
         return self.read_df(
             "SELECT ts, level, message FROM system_logs WHERE suffix = %s ORDER BY id DESC LIMIT %s",
