@@ -48,7 +48,10 @@ def _normalize_ohlcv(data: pd.DataFrame) -> pd.DataFrame:
 
 def _fetch_symbol_blocking(symbol: str, lookback_days: int) -> FetchResult:
     try:
-        hist = yf.Ticker(symbol).history(
+        # Yahoo Finance expects US stocks without suffixes (e.g. AAPL instead of AAPL.US)
+        yahoo_symbol = symbol[:-3] if symbol.endswith('.US') else symbol
+        
+        hist = yf.Ticker(yahoo_symbol).history(
             period=f"{lookback_days}d",
             interval="5m",
             auto_adjust=True,

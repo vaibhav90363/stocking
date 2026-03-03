@@ -1,0 +1,18 @@
+name: "Fractal Momentum — US (Nasdaq 100)"
+description: "US stocks breakout strategy using 5m timeframe"
+version: "1.0"
+type: "fractal_breakout"
+
+exchange:
+  suffix: ".US"
+  timezone: "America/New_York"
+  market_open: "09:30"
+  market_close: "16:00"
+
+engine:
+  cycle_seconds: 300
+  fetch_lookback_days: 10
+  compute_lookback_days: 30
+  fetch_concurrency: 16
+  compute_workers: 4
+  order_qty: 1

@@ -126,7 +126,10 @@ def _normalize_ohlcv(data: pd.DataFrame) -> pd.DataFrame:
 def _fetch_one_symbol(symbol: str) -> tuple[pd.DataFrame, pd.DataFrame, str | None]:
     """Return (daily_df, intraday_5m_df, error)."""
     try:
-        ticker = yf.Ticker(symbol)
+        # Yahoo Finance expects US stocks without suffixes (e.g. AAPL instead of AAPL.US)
+        yahoo_symbol = symbol[:-3] if symbol.endswith('.US') else symbol
+        
+        ticker = yf.Ticker(yahoo_symbol)
 
         # Daily — 2 years
         daily_raw = ticker.history(period=DAILY_LOOKBACK, interval="1d",
