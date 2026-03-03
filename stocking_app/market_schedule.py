@@ -26,6 +26,7 @@ _DEFAULTS: dict[str, tuple[str, str, str]] = {
     ".AX": ("Australia/Sydney","10:00","16:10"),
     ".T":  ("Asia/Tokyo",     "09:00", "15:30"),
     ".HK": ("Asia/Hong_Kong", "09:30", "16:00"),
+    ".US": ("America/New_York", "09:30", "16:00"),
 }
 
 WEEKDAYS = {0, 1, 2, 3, 4}   # Mon–Fri

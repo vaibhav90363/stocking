@@ -83,6 +83,9 @@ def cmd_live(sc, args):
         "STOCKING_COMPUTE_WORKERS":      str(sc.compute_workers),
         "STOCKING_ORDER_QTY":            str(sc.order_qty),
         "STOCKING_LOG_DIR":              str(sc.log_dir),
+        "STOCKING_EXCHANGE_TZ":          sc.timezone,
+        "STOCKING_MARKET_OPEN":          sc.market_open,
+        "STOCKING_MARKET_CLOSE":         sc.market_close,
     })
     
     # Let Supabase db_url pass through to child processes if it exists
