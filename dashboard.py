@@ -330,6 +330,7 @@ with tab_portfolio:
                ROUND(((last_price - avg_price) / avg_price * 100)::NUMERIC, 2) AS pct_chg,
                opened_at,
                last_updated_at
+        FROM positions_ledger
         WHERE symbol LIKE %s
         ORDER BY unrealized_pnl DESC
         """,
