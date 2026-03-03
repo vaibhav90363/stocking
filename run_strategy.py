@@ -230,10 +230,11 @@ def _count_csv(path: Path) -> int:
 
 def _detect_symbol_column(csv_path: Path) -> str:
     try:
-        header = csv_path.open().readline().strip()
-        for col in header.split(","):
-            if col.strip().lower() == "symbol":
-                return col.strip()
+        import pandas as pd
+        df = pd.read_csv(csv_path, nrows=0)
+        for col in df.columns:
+            if str(col).strip().lower() in ("symbol", "ticker"):
+                return str(col)
     except Exception:
         pass
     return "Symbol"
