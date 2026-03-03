@@ -629,15 +629,20 @@ with tab_system:
     st.dataframe(cfg_df, use_container_width=True, hide_index=True)
 
     st.markdown('<p class="section-header">Data Files</p>', unsafe_allow_html=True)
-    files = {
-        "Live DB": str(cfg.db_path),
-        "Engine Log": str(log_file),
-        "Backtest DB": str(strat_config.backtest_dir / "backtest.db"),
-        "Backtest Report": str(strat_config.backtest_dir / "report.txt"),
-        "Backtest Trades": str(strat_config.backtest_dir / "trades.csv"),
-    }
+    files = {}
+    if cfg.database_url:
+        files["Live DB"] = ("Supabase (PostgreSQL)", True)
+        files["Engine Log"] = ("Supabase (system_logs)", True)
+    else:
+        files["Live DB"] = (str(cfg.db_path), Path(cfg.db_path).exists())
+        files["Engine Log"] = (str(log_file), Path(log_file).exists())
+        
+    files["Backtest DB"] = (str(strat_config.backtest_dir / "backtest.db"), (strat_config.backtest_dir / "backtest.db").exists())
+    files["Backtest Report"] = (str(strat_config.backtest_dir / "report.txt"), (strat_config.backtest_dir / "report.txt").exists())
+    files["Backtest Trades"] = (str(strat_config.backtest_dir / "trades.csv"), (strat_config.backtest_dir / "trades.csv").exists())
+
     files_df = pd.DataFrame(
-        [{"File": k, "Path": v, "Exists": "✅" if Path(v).exists() else "❌"}
+        [{"File": k, "Path": v[0], "Exists": "✅" if v[1] else "❌"}
          for k, v in files.items()]
     )
     st.dataframe(files_df, use_container_width=True, hide_index=True)
