@@ -251,6 +251,36 @@ class TradingRepository:
         with self.conn.cursor() as cur:
             cur.execute(SCHEMA_SQL)
         self.conn.commit()
+        # ── Idempotent migrations for live databases ────────────────────────
+        # These ALTER statements are no-ops if the constraint/index already exists.
+        # They fix databases created before the constraint was in SCHEMA_SQL.
+        _migrations = [
+            # pnl_snapshots PRIMARY KEY — needed for ON CONFLICT(ts, suffix)
+            """
+            DO $$ BEGIN
+                IF NOT EXISTS (
+                    SELECT 1 FROM pg_constraint
+                    WHERE conname = 'pnl_snapshots_pkey'
+                    AND conrelid = 'pnl_snapshots'::regclass
+                ) THEN
+                    ALTER TABLE pnl_snapshots ADD PRIMARY KEY (ts, suffix);
+                END IF;
+            END $$;
+            """,
+        ]
+        for _sql in _migrations:
+            try:
+                with self.conn.cursor() as cur:
+                    cur.execute(_sql)
+                self.conn.commit()
+            except Exception as _me:
+                self.conn.rollback()
+                # Log but don't crash — the engine can still run without the constraint,
+                # it just won't upsert PnL snapshots (it will insert fresh rows instead)
+                import logging as _log
+                _log.getLogger("stocking.engine").warning(
+                    f"Migration skipped (non-fatal): {_me}"
+                )
         if self.get_engine_enabled() is None:
             self.set_engine_enabled(False)
 
@@ -631,18 +661,31 @@ class TradingRepository:
             open_positions = int(unrealized_row["open_positions"] or 0)
             total = realized + unrealized
 
-            cur.execute(
-                """
-                INSERT INTO pnl_snapshots(ts, suffix, realized_pnl, unrealized_pnl, total_pnl, open_positions)
-                VALUES(%s, %s, %s, %s, %s, %s)
-                ON CONFLICT(ts, suffix) DO UPDATE SET
-                    realized_pnl=EXCLUDED.realized_pnl,
-                    unrealized_pnl=EXCLUDED.unrealized_pnl,
-                    total_pnl=EXCLUDED.total_pnl,
-                    open_positions=EXCLUDED.open_positions
-                """,
-                (ts, self.suffix, realized, unrealized, total, open_positions),
-            )
+            try:
+                cur.execute(
+                    """
+                    INSERT INTO pnl_snapshots(ts, suffix, realized_pnl, unrealized_pnl, total_pnl, open_positions)
+                    VALUES(%s, %s, %s, %s, %s, %s)
+                    ON CONFLICT(ts, suffix) DO UPDATE SET
+                        realized_pnl=EXCLUDED.realized_pnl,
+                        unrealized_pnl=EXCLUDED.unrealized_pnl,
+                        total_pnl=EXCLUDED.total_pnl,
+                        open_positions=EXCLUDED.open_positions
+                    """,
+                    (ts, self.suffix, realized, unrealized, total, open_positions),
+                )
+            except Exception:
+                # Fallback: the PRIMARY KEY constraint may not exist on old databases yet.
+                # Do a plain INSERT (migration in init_db will fix this on next startup).
+                self.conn.rollback()
+                with self.conn.cursor() as _cur:
+                    _cur.execute(
+                        """
+                        INSERT INTO pnl_snapshots(ts, suffix, realized_pnl, unrealized_pnl, total_pnl, open_positions)
+                        VALUES(%s, %s, %s, %s, %s, %s)
+                        """,
+                        (ts, self.suffix, realized, unrealized, total, open_positions),
+                    )
         return {
             "realized": realized,
             "unrealized": unrealized,
