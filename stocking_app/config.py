@@ -51,7 +51,7 @@ def load_config() -> AppConfig:
         database_url=url_str,
         cycle_seconds=int(os.getenv("STOCKING_CYCLE_SECONDS", "300")),
         disabled_poll_seconds=int(os.getenv("STOCKING_DISABLED_POLL_SECONDS", "60")),
-        fetch_lookback_days=int(os.getenv("STOCKING_FETCH_LOOKBACK_DAYS", "10")),
+        fetch_lookback_days=int(os.getenv("STOCKING_FETCH_LOOKBACK_DAYS", "3")),
         # 90 days gives enough bar history for weekly signals (~7k rows/symbol)
         # vs 365 days (28k rows/symbol) which OOMs a 512 MB Render instance with 3 engines
         compute_lookback_days=int(os.getenv("STOCKING_COMPUTE_LOOKBACK_DAYS", "90")),

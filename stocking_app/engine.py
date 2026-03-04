@@ -14,7 +14,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from .config import AppConfig, load_config
-from .data_fetcher import fetch_5m_bars_async_gen
+from .data_fetcher import FetchResult, fetch_5m_bars_async_gen
 from .db import SignalRecord, TradingRepository, utc_now_iso
 from .market_schedule import market_status as get_market_status
 from .strategy import compute_symbol_signal
@@ -290,11 +290,11 @@ class ScalableEngine:
             )
 
         fetch_start = time.monotonic()
-        
+
         fetched_symbols: list[str] = []
         failed_symbols: list[str] = []
         state = {"total_bars": 0}
-        
+
         async def _run_fetcher():
             gen = fetch_5m_bars_async_gen(
                 symbols,
@@ -302,26 +302,34 @@ class ScalableEngine:
                 max_concurrency=self.cfg.max_fetch_concurrency,
             )
             count = 0
+            # ── Buffer all results; do NOT upsert inside the hot async loop ──
+            # Mixing DB writes with in-flight yfinance requests serialises I/O:
+            # each symbol blocks the fetcher while waiting for a DB round-trip.
+            # Collect everything first, then upsert in one sequential pass below.
+            good_results: list[FetchResult] = []
             async for result in gen:
                 count += 1
                 if result.error or result.bars.empty:
                     failed_symbols.append(result.symbol)
                 else:
-                    self.repo.upsert_candles(result.symbol, result.bars)
-                    fetched_symbols.append(result.symbol)
-                    state["total_bars"] += len(result.bars)
-                
-                # Update heartbeat dynamically every 50 symbols (was 20)
-                # Fewer DB writes per cycle: 500 symbols → 10 writes instead of 25
+                    good_results.append(result)
+
+                # Heartbeat every 50 symbols so the UI stays responsive
                 if count % 50 == 0 or count == total:
                     self.repo.set_engine_heartbeat(
                         (self.repo.get_engine_heartbeat() or {}) | {
                             "state": "fetching",
                             "fetch_progress": f"{count} / {total}",
                             "fetch_count": count,
-                            "fetch_total": total
+                            "fetch_total": total,
                         }
                     )
+
+            # ── Bulk upsert after all batches have landed ────────────────────
+            for result in good_results:
+                self.repo.upsert_candles(result.symbol, result.bars)
+                fetched_symbols.append(result.symbol)
+                state["total_bars"] += len(result.bars)
         
         # ── Background DB keepalive during fetch ──────────────────────────────
         # Supabase/PgBouncer kills idle connections after ~5 minutes.
