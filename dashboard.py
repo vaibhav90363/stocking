@@ -8,6 +8,7 @@ from pathlib import Path
 
 import pandas as pd
 import streamlit as st
+from streamlit_autorefresh import st_autorefresh
 
 from stocking_app.config import load_config
 from stocking_app.db import TradingRepository
@@ -199,7 +200,9 @@ with st.sidebar:
         st.markdown(f"**{k}:** `{v}`")
 
     st.divider()
-    auto = st.checkbox("⏱ Auto-refresh (30s)", value=False)
+    auto = st.checkbox("⏱ Auto-refresh (10s)", value=False)
+    if auto:
+        st_autorefresh(interval=10 * 1000, key="dash_refresh")
     if st.button("🔄 Refresh now", use_container_width=True):
         st.rerun()
 
@@ -694,9 +697,6 @@ st.caption(
     f"Open positions: `{n_open}`  |  Universe: `{uni_summary['active']} active`"
 )
 
-if auto:
-    st.caption("⏱ Auto-refreshing every 30 seconds…")
-    time.sleep(30)
-    st.rerun()
+# Auto-refresh handled by st_autorefresh in sidebar
 
 repo.close()

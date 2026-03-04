@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Any
 
 import pandas as pd
+from psycopg2.pool import ThreadedConnectionPool
 
 
 def utc_now_iso() -> str:
@@ -157,6 +158,25 @@ class SignalRecord:
 
 
 class TradingRepository:
+    # Class-level cache of connection pools by database URL
+    _pools: dict[str, ThreadedConnectionPool] = {}
+
+    @classmethod
+    def get_pool(cls, db_url: str) -> ThreadedConnectionPool:
+        from psycopg2.extras import RealDictCursor
+        if db_url not in cls._pools:
+            cls._pools[db_url] = ThreadedConnectionPool(
+                minconn=1,
+                maxconn=20,     # Safely within Supabase free-tier limits, spread across workers
+                dsn=db_url,
+                cursor_factory=RealDictCursor,
+                keepalives=1,
+                keepalives_idle=60,
+                keepalives_interval=10,
+                keepalives_count=5
+            )
+        return cls._pools[db_url]
+
     def __init__(self, db_path_or_url: str | Path, suffix: str = ".NS"):
         # Allow passing either a database URL directly (for Postgres/Supabase)
         # or a local generic fallback path that gets ignored if using URL string.
@@ -189,14 +209,8 @@ class TradingRepository:
         # Establish connection with RealDictCursor for dictionaries
         # Add TCP keepalives to prevent Supabase/firewalls from dropping idle connections
         try:
-            self.conn = psycopg2.connect(
-                self.db_url,
-                cursor_factory=RealDictCursor,
-                keepalives=1,
-                keepalives_idle=60,
-                keepalives_interval=10,
-                keepalives_count=5
-            )
+            pool = self.get_pool(self.db_url)
+            self.conn = pool.getconn()
             self.conn.autocommit = False # keep explicit commits
         except Exception as e:
             if "sqlite" not in str(self.db_url).lower():
@@ -208,7 +222,13 @@ class TradingRepository:
 
     def close(self) -> None:
         if self.conn and not self.conn.closed:
-            self.conn.close()
+            try:
+                pool = self.get_pool(self.db_url)
+                pool.putconn(self.conn)
+            except Exception:
+                self.conn.close()
+            finally:
+                self.conn = None
 
     def keepalive_ping(self) -> None:
         """Send a lightweight SELECT 1 to keep the Postgres connection alive.

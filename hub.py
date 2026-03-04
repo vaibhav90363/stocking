@@ -10,6 +10,7 @@ from pathlib import Path
 
 import pandas as pd
 import streamlit as st
+from streamlit_autorefresh import st_autorefresh
 
 ROOT = Path(__file__).resolve().parent
 sys.path.insert(0, str(ROOT))
@@ -142,7 +143,9 @@ with st.sidebar:
     st.caption("Manages all strategy instances")
     if st.button("🔄 Refresh", use_container_width=True):
         st.rerun()
-    auto = st.checkbox("⏱ Auto-refresh (30s)", value=False)
+    auto = st.checkbox("⏱ Auto-refresh (10s)", value=False)
+    if auto:
+        st_autorefresh(interval=10 * 1000, key="hub_refresh")
     st.divider()
     st.markdown("### 📊 Strategy Dashboards")
     strat_dirs = [
@@ -718,6 +721,4 @@ RENDER_HEALTH_URL = "{_render_svc}"
 
 
 # ── Auto-refresh ──────────────────────────────────────────────────────────────
-if auto:
-    time.sleep(30)
-    st.rerun()
+# Handled by st_autorefresh in sidebar
