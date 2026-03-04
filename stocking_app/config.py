@@ -50,11 +50,15 @@ def load_config() -> AppConfig:
         db_path=Path(os.getenv("STOCKING_DB_PATH", default_db)),
         database_url=url_str,
         cycle_seconds=int(os.getenv("STOCKING_CYCLE_SECONDS", "300")),
-        disabled_poll_seconds=int(os.getenv("STOCKING_DISABLED_POLL_SECONDS", "5")),
+        disabled_poll_seconds=int(os.getenv("STOCKING_DISABLED_POLL_SECONDS", "60")),
         fetch_lookback_days=int(os.getenv("STOCKING_FETCH_LOOKBACK_DAYS", "10")),
-        compute_lookback_days=int(os.getenv("STOCKING_COMPUTE_LOOKBACK_DAYS", "365")),
-        max_fetch_concurrency=int(os.getenv("STOCKING_FETCH_CONCURRENCY", "12")),
-        compute_workers=int(os.getenv("STOCKING_COMPUTE_WORKERS", "4")),
+        # 90 days gives enough bar history for weekly signals (~7k rows/symbol)
+        # vs 365 days (28k rows/symbol) which OOMs a 512 MB Render instance with 3 engines
+        compute_lookback_days=int(os.getenv("STOCKING_COMPUTE_LOOKBACK_DAYS", "90")),
+        # 5 concurrent batches is safe for Yahoo Finance free tier
+        max_fetch_concurrency=int(os.getenv("STOCKING_FETCH_CONCURRENCY", "5")),
+        # 1 worker avoids fork/spawn overhead & CPU thrashing on 0.15 CPU free tier
+        compute_workers=int(os.getenv("STOCKING_COMPUTE_WORKERS", "1")),
         order_qty=int(os.getenv("STOCKING_ORDER_QTY", "1")),
         ticker_suffix=suffix,
         exchange_tz=os.getenv("STOCKING_EXCHANGE_TZ", def_tz),

@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import asyncio
 import logging
 import logging.handlers
 import os
 import signal
+import threading
 import time
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from dataclasses import asdict, dataclass
@@ -309,8 +311,9 @@ class ScalableEngine:
                     fetched_symbols.append(result.symbol)
                     state["total_bars"] += len(result.bars)
                 
-                # Update heartbeat dynamically every 20 symbols
-                if count % 20 == 0 or count == total:
+                # Update heartbeat dynamically every 50 symbols (was 20)
+                # Fewer DB writes per cycle: 500 symbols → 10 writes instead of 25
+                if count % 50 == 0 or count == total:
                     self.repo.set_engine_heartbeat(
                         (self.repo.get_engine_heartbeat() or {}) | {
                             "state": "fetching",
@@ -324,17 +327,16 @@ class ScalableEngine:
         # Supabase/PgBouncer kills idle connections after ~5 minutes.
         # While yfinance fetches are running (can take 60-90s for 500 symbols),
         # the main DB connection sits idle. Ping it every 30s to keep it alive.
-        import threading
         _keepalive_stop = threading.Event()
 
         def _keepalive_worker():
             while not _keepalive_stop.wait(timeout=30):
                 self.repo.keepalive_ping()
 
+        import asyncio
         _ka_thread = threading.Thread(target=_keepalive_worker, daemon=True, name="db-keepalive")
         _ka_thread.start()
 
-        import asyncio
         try:
             asyncio.run(_run_fetcher())
         finally:
@@ -412,8 +414,9 @@ class ScalableEngine:
                     }
                 )
                 
-            # Broadcast live compute progress
-            if computed_count % 10 == 0 or computed_count == total_to_compute:
+            # Broadcast live compute progress every 25 symbols (was 10)
+            # Fewer DB writes per cycle: 500 symbols → 20 writes instead of 50
+            if computed_count % 25 == 0 or computed_count == total_to_compute:
                 self.repo.set_engine_heartbeat(
                     (self.repo.get_engine_heartbeat() or {}) | {
                         "state": "computing",
@@ -447,12 +450,14 @@ class ScalableEngine:
         open_positions = self.repo.get_open_positions()
         position_prices: dict[str, tuple[float, str]] = {}
 
+        # Collect (symbol, asof_ts) pairs for batch upsert at end — avoids N DB round-trips
+        computed_pairs: list[tuple[str, str | None]] = []
         actions_taken = []
         for payload in compute_payloads:
             symbol = payload["symbol"]
             asof_ts = payload.get("asof_ts")
             if asof_ts:
-                self.repo.mark_symbol_computed(symbol, asof_ts)
+                computed_pairs.append((symbol, asof_ts))
 
             last_price = payload.get("last_price")
             if symbol in open_positions and last_price is not None and asof_ts:
@@ -492,6 +497,10 @@ class ScalableEngine:
 
         if position_prices:
             self.repo.update_position_prices(position_prices)
+
+        # Single batch upsert for all symbol compute states — replaces N individual commits
+        if computed_pairs:
+            self.repo.batch_mark_symbols_computed(computed_pairs)
 
         snap_ts = utc_now_iso()
         self.repo.snapshot_pnl(ts=snap_ts)

@@ -68,7 +68,8 @@ def _fetch_batch_blocking(batch: list[str], lookback_days: int) -> list[FetchRes
             auto_adjust=True,
             prepost=False,
             group_by="ticker",
-            threads=True,
+            threads=False,   # Disable yfinance internal threading — we control concurrency via asyncio
+            progress=False,  # Suppress tqdm stdout I/O
             timeout=30,
         )
         
@@ -116,7 +117,7 @@ async def fetch_5m_bars_async_gen(
 ) -> AsyncGenerator[FetchResult, None]:
     # We yield results asynchronously as batch loops complete
     # Chunk the symbols into blocks of 100 to avoid long URL lengths
-    BATCH_SIZE = 100
+    BATCH_SIZE = 50   # Smaller batches = less Yahoo throttling and more reliable results
     batches = [symbols[i:i + BATCH_SIZE] for i in range(0, len(symbols), BATCH_SIZE)]
     
     semaphore = asyncio.Semaphore(max(1, max_concurrency))
