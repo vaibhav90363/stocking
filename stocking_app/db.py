@@ -453,6 +453,42 @@ class TradingRepository:
         return [r["symbol"] for r in rows]
 
     @retry_on_disconnect()
+    def get_all_candles_for_symbols(self, symbols: list[str], lookback_days: int) -> pd.DataFrame:
+        """
+        Pulls candles for multiple symbols at once into a single giant DataFrame.
+        This minimizes separate DB connections and scalar queries.
+        """
+        import pandas as pd
+        from datetime import datetime, timedelta, timezone
+        
+        if not symbols:
+            return pd.DataFrame()
+
+        cutoff = (
+            datetime.now(timezone.utc) - timedelta(days=lookback_days)
+        ).replace(microsecond=0).isoformat()
+        
+        with self.conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT symbol, ts, open, high, low, close, volume
+                FROM candles_5m
+                WHERE symbol = ANY(%s) AND ts >= %s
+                ORDER BY ts
+                """,
+                (symbols, cutoff),
+            )
+            rows = cur.fetchall()
+            
+            if not rows:
+                return pd.DataFrame()
+            cols = [desc[0] for desc in cur.description]
+
+        df = pd.DataFrame([dict(r) for r in rows], columns=cols)
+        df["ts"] = pd.to_datetime(df["ts"], utc=True)
+        return df
+
+    @retry_on_disconnect()
     def upsert_signal(self, signal: SignalRecord, acted: bool = False) -> None:
         with self.conn.cursor() as cur:
             cur.execute(
