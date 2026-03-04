@@ -34,7 +34,14 @@ def run():
             print(f"Skipping {s_dir}, no universe.csv")
             continue
             
-        df = pd.read_csv(csv_path)
+        try:
+            df = pd.read_csv(csv_path, encoding='utf-8-sig')
+        except Exception as e:
+            try:
+                df = pd.read_csv(csv_path, encoding='latin-1')
+            except Exception as e2:
+                print(f"Failed to read {csv_path}: {e2}")
+                continue
         sym_col = _detect_symbol_column(csv_path)
         
         symbols = []

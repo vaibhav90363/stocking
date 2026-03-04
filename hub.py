@@ -48,13 +48,19 @@ if "strategy" in st.query_params:
             st.rerun()
 
 
+
+def _get_db_url() -> str:
+    """Centralised DB URL resolution — avoids creating a load_config() per card."""
+    from stocking_app.config import load_config
+    cfg = load_config()
+    return cfg.database_url
+
+
 # ── Helper — read live state from a strategy's DB ─────────────────────────────
 def _read_strategy_state(sc: StrategyConfig) -> dict:
-    from stocking_app.config import load_config
     import psycopg2
     from psycopg2.extras import RealDictCursor
-    cfg = load_config()
-    db_url = cfg.database_url
+    db_url = _get_db_url()
 
     result = {
         "engine_state":      "offline",
@@ -69,10 +75,12 @@ def _read_strategy_state(sc: StrategyConfig) -> dict:
     if not db_url:
         return result
     try:
-        conn = psycopg2.connect(db_url, cursor_factory=RealDictCursor)
+        conn = psycopg2.connect(db_url, cursor_factory=RealDictCursor, connect_timeout=8)
         with conn.cursor() as cur:
+            # Heartbeat key is suffix-namespaced: engine_heartbeat_.NS, engine_heartbeat_.L etc.
             try:
-                cur.execute("SELECT value FROM engine_state WHERE key='engine_heartbeat'")
+                hb_key = f"engine_heartbeat_{sc.suffix}"
+                cur.execute("SELECT value FROM engine_state WHERE key=%s", (hb_key,))
                 row = cur.fetchone()
                 if row:
                     hb = json.loads(row["value"])
@@ -80,8 +88,13 @@ def _read_strategy_state(sc: StrategyConfig) -> dict:
                     result["last_run"]     = hb.get("last_run")
             except Exception:
                 pass
+            # Cycle metrics are suffix-scoped
             try:
-                cur.execute("SELECT status, symbols_fetched, symbols_total FROM run_metrics ORDER BY id DESC LIMIT 1")
+                cur.execute(
+                    "SELECT status, symbols_fetched, symbols_total FROM run_metrics "
+                    "WHERE suffix=%s ORDER BY id DESC LIMIT 1",
+                    (sc.suffix,)
+                )
                 row = cur.fetchone()
                 if row:
                     result["last_cycle_status"] = row["status"] or "—"
@@ -90,7 +103,11 @@ def _read_strategy_state(sc: StrategyConfig) -> dict:
             except Exception:
                 pass
             try:
-                cur.execute("SELECT realized_pnl, unrealized_pnl, open_positions FROM pnl_snapshots ORDER BY ts DESC LIMIT 1")
+                cur.execute(
+                    "SELECT realized_pnl, unrealized_pnl, open_positions FROM pnl_snapshots "
+                    "WHERE suffix=%s ORDER BY ts DESC LIMIT 1",
+                    (sc.suffix,)
+                )
                 row = cur.fetchone()
                 if row:
                     result["realized_pnl"]   = float(row["realized_pnl"] or 0)
@@ -115,6 +132,7 @@ st.markdown("""
 .state-running { color: #4ade80; font-weight: bold; }
 .state-paused  { color: #facc15; font-weight: bold; }
 .state-offline { color: #f87171; font-weight: bold; }
+span:has(> b:contains("PAUSED")) { white-space: nowrap !important; }
 </style>
 """, unsafe_allow_html=True)
 
@@ -132,7 +150,7 @@ with st.sidebar:
         if d.is_dir() and (d / "strategy.yaml").exists()
     ] if (ROOT / "strategies").exists() else []
     for sdir in strat_dirs:
-        url = f"{_CLOUD_BASE_URL}/?strategy={sdir}"
+        url = f"/?strategy={sdir}"
         st.link_button(f"Open {sdir}", url, use_container_width=True)
 
 # ── Header ────────────────────────────────────────────────────────────────────
@@ -225,19 +243,18 @@ with tab_strategies:
             last_cycle_ok = row.get("last_cycle_status", "—")
             fetched       = row.get("symbols_fetched", "—")
             total_sym     = row.get("symbols_total", "—")
-
-            c_name, c_state, c_pnl, c_pos, c_cycle, c_btlink = st.columns([3, 1.5, 2, 1.5, 2, 1.5])
+            c_name, c_state, c_pnl, c_pos, c_cycle, c_btlink = st.columns([3, 2.5, 2, 1.5, 2, 1.5])
             with c_name:
                 st.markdown(f"**{sc.name}**")
                 st.caption(f"`{sc.strategy_dir.name}`  ·  {sc.suffix}  ·  {sc.timezone}")
             with c_state:
-                st.markdown(f"{dot} `{state.upper()}`")
+                st.markdown(f"<div style='white-space:nowrap;'>{dot} `{state.upper()}`</div>", unsafe_allow_html=True)
                 st.caption(f"Last: {last_run}")
                 mkt_color = "#14532d" if _mkt_open else "#1e293b"
                 st.markdown(
-                    f"<span style='background:{mkt_color};padding:2px 7px;border-radius:4px;"
+                    f"<div style='white-space:nowrap;'><span style='background:{mkt_color};padding:2px 7px;border-radius:4px;"
                     f"font-size:0.72rem;color:#f1f5f9'>{_mkt_badge}</span>&nbsp;"
-                    f"<span style='font-size:0.72rem;color:#64748b'>{_next_evt} {_next_in}</span>",
+                    f"<span style='font-size:0.72rem;color:#64748b'>{_next_evt} {_next_in}</span></div>",
                     unsafe_allow_html=True,
                 )
             with c_pnl:
@@ -281,7 +298,7 @@ with tab_strategies:
                 else:
                     start_disabled = (
                         os.environ.get("STOCKING_AUTO_SCHEDULE", "1") not in ("0", "false", "False")
-                        and _mkt_open
+                        and not _mkt_open
                     )
                     if st.button("▶ Start Engine", key=f"start_{sc.strategy_dir.name}",
                                  type="primary", use_container_width=True,
@@ -301,7 +318,7 @@ with tab_strategies:
                     if start_disabled:
                         st.caption("🤖 Auto-schedule will start this when market opens.")
             with b3:
-                dash_url = f"{_CLOUD_BASE_URL}/?strategy={sc.strategy_dir.name}"
+                dash_url = f"/?strategy={sc.strategy_dir.name}"
                 st.link_button("📊 View Dashboard", dash_url, use_container_width=True)
             with b4:
                 log_f = sc.log_dir / "engine.log"
@@ -541,108 +558,110 @@ with tab_health:
 
     st.divider()
 
-    # ── Section 2: Engine Heartbeat ───────────────────────────────────────────
-    st.markdown("### 💓 Engine Heartbeat")
+    # ── Section 2: Per-strategy Engine Heartbeats ─────────────────────────────
+    st.markdown("### 💓 Engine Heartbeats (per strategy)")
     try:
-        from stocking_app.config import load_config as _lc2
         import psycopg2 as _pg2
         from psycopg2.extras import RealDictCursor as _RDC
-        _cfg2 = _lc2()
-        _conn2 = _pg2.connect(_cfg2.database_url, cursor_factory=_RDC)
-        with _conn2.cursor() as _cur2:
-            _cur2.execute("SELECT value, updated_at FROM engine_state WHERE key='engine_heartbeat'")
-            _hb_row = _cur2.fetchone()
-        _conn2.close()
+        _db_url = _get_db_url()
+        _conn_hb = _pg2.connect(_db_url, cursor_factory=_RDC, connect_timeout=8)
 
-        if _hb_row:
-            _hb_data  = json.loads(_hb_row["value"])
-            _hb_upd   = str(_hb_row["updated_at"])
-            _hb_state = _hb_data.get("state", "unknown")
-            _hb_ts    = _hb_data.get("last_run") or _hb_data.get("ts", "—")
+        _hb_cols = st.columns(max(1, len(strategies)))
+        for _hb_idx, _hb_sc in enumerate(strategies):
+            with _hb_cols[_hb_idx]:
+                st.markdown(f"**{_hb_sc.suffix}** — {_hb_sc.name.split('—')[-1].strip()}")
+                try:
+                    _hb_key = f"engine_heartbeat_{_hb_sc.suffix}"
+                    with _conn_hb.cursor() as _hb_cur:
+                        _hb_cur.execute(
+                            "SELECT value, updated_at FROM engine_state WHERE key=%s",
+                            (_hb_key,)
+                        )
+                        _hb_row = _hb_cur.fetchone()
 
-            try:
-                _hb_dt   = datetime.fromisoformat(_hb_upd.replace("Z", "+00:00"))
-                _hb_age  = (datetime.now(timezone.utc) - _hb_dt).total_seconds()
-                _age_str = f"{int(_hb_age // 60)}m {int(_hb_age % 60)}s ago"
-                _stale   = _hb_age > 600  # stale if no heartbeat for 10 min
-            except Exception:
-                _age_str = "unknown"
-                _stale   = False
+                    if _hb_row:
+                        _hb_data  = json.loads(_hb_row["value"])
+                        _hb_upd   = str(_hb_row["updated_at"])
+                        _hb_state = _hb_data.get("state", "unknown")
+                        _hb_ts    = _hb_data.get("last_run") or _hb_data.get("ts", "—")
 
-            hb_c1, hb_c2, hb_c3, hb_c4 = st.columns(4)
-            with hb_c1:
-                _dot = {"running": "🟢", "starting": "🟡", "paused_market_closed": "⏰"}.get(_hb_state, "⚫")
-                st.metric("Engine State", f"{_dot} {_hb_state.upper()}")
-            with hb_c2:
-                st.metric("Heartbeat Age", _age_str)
-                if _stale:
-                    st.warning("No heartbeat for >10 min — engine may be stuck or down", icon="⚠️")
-            with hb_c3:
-                st.metric("Last Completed Run", (_hb_ts or "—")[:16])
-            with hb_c4:
-                _f = _hb_data.get("fetch_seconds")
-                _c = _hb_data.get("compute_seconds")
-                st.metric("Last Cycle Time",
-                          f"{float(_f) + float(_c):.1f}s" if (_f is not None and _c is not None) else "—")
+                        try:
+                            _hb_dt  = datetime.fromisoformat(_hb_upd.replace("Z", "+00:00"))
+                            _hb_age = (datetime.now(timezone.utc) - _hb_dt).total_seconds()
+                            _age_str = f"{int(_hb_age // 60)}m {int(_hb_age % 60)}s ago"
+                            _stale   = _hb_age > 600
+                        except Exception:
+                            _age_str = "unknown"
+                            _stale   = False
 
-            _mkt_open_hb = _hb_data.get("market_open", False)
-            _mkt_next    = _hb_data.get("next_event", "")
-            _mkt_next_in = _hb_data.get("next_event_in", "")
-            st.caption(
-                f"Market: {'🟢 OPEN' if _mkt_open_hb else '⚫ CLOSED'}  "
-                f"· {_mkt_next.capitalize()} {_mkt_next_in}  "
-                f"· Heartbeat updated: {_hb_upd[:19]}"
-            )
-        else:
-            st.info("No heartbeat yet. Start the engine to see data here.")
+                        _dot = {"running": "🟢", "starting": "🟡", "paused_market_closed": "⏰"}.get(_hb_state, "⚫")
+                        st.metric("State", f"{_dot} {_hb_state.upper()}")
+                        _f = _hb_data.get("fetch_seconds")
+                        _c = _hb_data.get("compute_seconds")
+                        st.metric("Last Cycle", f"{float(_f)+float(_c):.1f}s" if (_f and _c) else "—")
+                        st.caption(f"Age: {_age_str}")
+                        if _stale:
+                            st.warning("⚠️ Stale >10m", icon="⚠️")
+                    else:
+                        st.caption("No heartbeat yet")
+                except Exception as _hbe:
+                    st.caption(f"Error: {str(_hbe)[:60]}")
+        _conn_hb.close()
     except Exception as _he:
-        st.error(f"Could not read engine heartbeat: {_he}")
+        st.error(f"Could not read heartbeats: {_he}")
 
     st.divider()
 
-    # ── Section 3: Last 10 Engine Cycles ─────────────────────────────────────
-    st.markdown("### 🔄 Last 10 Engine Cycles")
+    # ── Section 3: Last 10 Engine Cycles (per strategy) ─────────────────────
+    st.markdown("### 🔄 Recent Engine Cycles")
     try:
-        from stocking_app.config import load_config as _lc4
-        from stocking_app.db import TradingRepository as _TR4
-        _cfg4   = _lc4()
-        _repo4  = _TR4(_cfg4.database_url or _cfg4.db_path)
-        _cyc_df = _repo4.read_df(
-            """
-            SELECT
-                run_started_at,
-                status,
-                symbols_total,
-                symbols_fetched,
-                ROUND(fetch_seconds::numeric,    1) AS fetch_s,
-                ROUND(compute_seconds::numeric,  1) AS compute_s,
-                ROUND(duration_seconds::numeric, 1) AS total_s,
-                error
-            FROM run_metrics
-            ORDER BY id DESC
-            LIMIT 10
-            """
-        )
-        _repo4.close()
+        import psycopg2 as _pg3
+        from psycopg2.extras import RealDictCursor as _RDC3
+        _db_url3 = _get_db_url()
+        _conn3 = _pg3.connect(_db_url3, cursor_factory=_RDC3, connect_timeout=8)
 
-        if _cyc_df.empty:
-            st.info("No cycle data yet. The engine hasn't run any cycles.")
-        else:
-            def _cyc_color(val):
-                if val == "OK":     return "color:#4ade80;font-weight:700"
-                if val == "FAILED": return "color:#f87171;font-weight:700"
-                return ""
-            st.dataframe(
-                _cyc_df.style.applymap(_cyc_color, subset=["status"]),
-                use_container_width=True, hide_index=True,
-            )
-            _n_ok   = int((_cyc_df["status"] == "OK").sum())
-            _n_fail = int((_cyc_df["status"] == "FAILED").sum())
-            _avg_s  = _cyc_df["total_s"].mean() if not _cyc_df["total_s"].isna().all() else 0
-            sc1, sc2, sc3 = st.columns(3)
-            sc1.metric("✅ OK cycles",     _n_ok)
-            sc2.metric("❌ Failed cycles", _n_fail)
-            sc3.metric("⏱ Avg duration",  f"{_avg_s:.1f}s" if _avg_s else "—")
+        for _cyc_sc in strategies:
+            st.markdown(f"**{_cyc_sc.name}** (`{_cyc_sc.suffix}`):")
+            try:
+                with _conn3.cursor() as _cur3:
+                    _cur3.execute("""
+                        SELECT
+                            run_started_at,
+                            status,
+                            symbols_total,
+                            symbols_fetched,
+                            ROUND(fetch_seconds::numeric,    1) AS fetch_s,
+                            ROUND(compute_seconds::numeric,  1) AS compute_s,
+                            ROUND(duration_seconds::numeric, 1) AS total_s,
+                            error
+                        FROM run_metrics
+                        WHERE suffix = %s
+                        ORDER BY id DESC
+                        LIMIT 10
+                    """, (_cyc_sc.suffix,))
+                    _cyc_rows = _cur3.fetchall()
+
+                if _cyc_rows:
+                    _cyc_df = pd.DataFrame([dict(r) for r in _cyc_rows])
+                    def _cyc_color(val):
+                        if val == "OK":     return "color:#4ade80;font-weight:700"
+                        if val == "FAILED": return "color:#f87171;font-weight:700"
+                        return ""
+                    st.dataframe(
+                        _cyc_df.style.applymap(_cyc_color, subset=["status"]),
+                        use_container_width=True, hide_index=True,
+                    )
+                    _n_ok   = sum(1 for r in _cyc_rows if r["status"] == "OK")
+                    _n_fail = sum(1 for r in _cyc_rows if r["status"] == "FAILED")
+                    sc1, sc2 = st.columns(2)
+                    sc1.metric("✅ OK cycles",     _n_ok)
+                    sc2.metric("❌ Failed cycles", _n_fail)
+                else:
+                    st.caption("No cycles yet for this strategy.")
+            except Exception as _cye:
+                st.caption(f"Error reading cycles: {str(_cye)[:80]}")
+
+        _conn3.close()
     except Exception as _ce:
         st.error(f"Could not read cycle history: {_ce}")
 

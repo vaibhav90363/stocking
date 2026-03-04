@@ -1,12 +1,10 @@
 from __future__ import annotations
 
-import sqlite3
+import os
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
 import pandas as pd
-
-from .indicators import calculate_cmo, ema, fractal_chaos_bands, sma
 
 
 CMO_PERIOD = 11
@@ -27,17 +25,55 @@ def _empty(symbol: str, reason: str) -> dict[str, Any]:
     }
 
 
-def _load_candles(conn: sqlite3.Connection, symbol: str, lookback_days: int) -> pd.DataFrame:
-    cutoff = (datetime.now(timezone.utc) - timedelta(days=lookback_days)).replace(microsecond=0).isoformat()
-    q = """
+def _get_db_url(db_path: str) -> str:
+    """
+    Return the Postgres DATABASE_URL from the environment.
+    The `db_path` argument is kept for backward compatibility but is ignored —
+    the actual data lives in Supabase, not in a local SQLite file.
+    """
+    url = os.environ.get("DATABASE_URL", "").strip()
+    if not url:
+        raise RuntimeError(
+            "DATABASE_URL environment variable is not set. "
+            "Strategy compute requires a live Postgres/Supabase connection."
+        )
+    return url
+
+
+def _load_candles(db_url: str, symbol: str, lookback_days: int) -> pd.DataFrame:
+    """Load 5m candles for a symbol from the Postgres/Supabase database."""
+    import psycopg2
+    from psycopg2.extras import RealDictCursor
+
+    cutoff = (
+        datetime.now(timezone.utc) - timedelta(days=lookback_days)
+    ).replace(microsecond=0).isoformat()
+
+    sql = """
     SELECT ts, open, high, low, close, volume
     FROM candles_5m
-    WHERE symbol = ? AND ts >= ?
+    WHERE symbol = %s AND ts >= %s
     ORDER BY ts
     """
-    df = pd.read_sql_query(q, conn, params=(symbol, cutoff))
-    if df.empty:
-        return df
+    try:
+        conn = psycopg2.connect(
+            db_url,
+            cursor_factory=RealDictCursor,
+            connect_timeout=10,
+        )
+        try:
+            with conn.cursor() as cur:
+                cur.execute(sql, (symbol, cutoff))
+                rows = cur.fetchall()
+                if not rows:
+                    return pd.DataFrame()
+                cols = [desc[0] for desc in cur.description]
+        finally:
+            conn.close()
+    except Exception as exc:
+        raise RuntimeError(f"Failed to load candles for {symbol}: {exc}") from exc
+
+    df = pd.DataFrame([dict(r) for r in rows], columns=cols)
     df["ts"] = pd.to_datetime(df["ts"], utc=True)
     df = df.set_index("ts")
     return df
@@ -79,6 +115,8 @@ def _to_daily_weekly(df_5m: pd.DataFrame, exchange_tz: str) -> tuple[pd.DataFram
 
 
 def _compute_latest_signal(daily: pd.DataFrame, weekly: pd.DataFrame) -> tuple[str | None, float | None, str]:
+    from .indicators import calculate_cmo, ema, fractal_chaos_bands, sma
+
     weekly = fractal_chaos_bands(weekly, FRACTAL_LEFT_WINDOW, FRACTAL_RIGHT_WINDOW)
 
     daily["cmo"] = calculate_cmo(daily, "close", CMO_PERIOD)
@@ -136,11 +174,17 @@ def _compute_latest_signal(daily: pd.DataFrame, weekly: pd.DataFrame) -> tuple[s
 
 
 def compute_symbol_signal(db_path: str, symbol: str, lookback_days: int, exchange_tz: str) -> dict[str, Any]:
-    conn = sqlite3.connect(db_path, timeout=30)
+    """
+    Compute the latest signal for a symbol.
+
+    `db_path` is accepted for interface compatibility but ignored — data is
+    always loaded from the Postgres/Supabase DATABASE_URL environment variable.
+    """
     try:
-        df_5m = _load_candles(conn, symbol, lookback_days)
-    finally:
-        conn.close()
+        db_url = _get_db_url(db_path)
+        df_5m = _load_candles(db_url, symbol, lookback_days)
+    except Exception as exc:
+        return _empty(symbol, f"db_error:{exc}")
 
     if df_5m.empty:
         return _empty(symbol, "no_5m_candles")

@@ -56,6 +56,7 @@ def _fetch_symbol_blocking(symbol: str, lookback_days: int) -> FetchResult:
             interval="5m",
             auto_adjust=True,
             prepost=False,
+            timeout=10,
         )
         bars = _normalize_ohlcv(hist)
         return FetchResult(symbol=symbol, bars=bars, error=None)

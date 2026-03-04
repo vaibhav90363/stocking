@@ -83,9 +83,9 @@ def cmd_live(sc, args):
         "STOCKING_COMPUTE_WORKERS":      str(sc.compute_workers),
         "STOCKING_ORDER_QTY":            str(sc.order_qty),
         "STOCKING_LOG_DIR":              str(sc.log_dir),
-        "STOCKING_EXCHANGE_TZ":          sc.timezone,
-        "STOCKING_MARKET_OPEN":          sc.market_open,
-        "STOCKING_MARKET_CLOSE":         sc.market_close,
+        "STOCKING_EXCHANGE_TZ":          str(sc.timezone),
+        "STOCKING_MARKET_OPEN":          str(sc.market_open),
+        "STOCKING_MARKET_CLOSE":         str(sc.market_close),
     })
     
     # Let Supabase db_url pass through to child processes if it exists
@@ -200,16 +200,6 @@ def cmd_dashboard(sc, args):
         "--strategy-dir", str(sc.strategy_dir),
     ], env=env, cwd=str(ROOT))
     sys.exit(result.returncode)
-
-
-def cmd_all(sc, args):
-    """Run backtest then start live engine."""
-    print(f"  Running backtest first, then starting live engine …\n")
-    cmd_backtest(sc, args)   # this sys.exit()s — so we use Popen approach
-    # Note: backtest runs as subprocess above; if successful, fall through to live
-    # (In practice user will be prompted after backtest completes)
-
-
 # ── Helpers ──────────────────────────────────────────────────────────────────
 
 def _run_cli(cli_args: list[str], env: dict) -> None:

@@ -22,8 +22,9 @@ def retry_on_disconnect(max_retries=3):
         @wraps(func)
         def wrapper(self, *args, **kwargs):
             import psycopg2
+            import time
             last_err = None
-            for _ in range(max_retries):
+            for attempt in range(max_retries):
                 try:
                     self._ensure_connection()
                     return func(self, *args, **kwargs)
@@ -36,6 +37,9 @@ def retry_on_disconnect(max_retries=3):
                         except Exception:
                             pass
                     self.conn = None
+                    # Exponential backoff: 0.5s, 1s, 2s between retries
+                    if attempt < max_retries - 1:
+                        time.sleep(0.5 * (2 ** attempt))
             raise last_err
         return wrapper
     return decorator
@@ -95,12 +99,13 @@ CREATE TABLE IF NOT EXISTS trade_activity_log (
 );
 
 CREATE TABLE IF NOT EXISTS pnl_snapshots (
-    ts TEXT PRIMARY KEY,
+    ts TEXT,
     suffix TEXT NOT NULL,
     realized_pnl REAL NOT NULL,
     unrealized_pnl REAL NOT NULL,
     total_pnl REAL NOT NULL,
-    open_positions INTEGER NOT NULL
+    open_positions INTEGER NOT NULL,
+    PRIMARY KEY(ts, suffix)
 );
 
 CREATE TABLE IF NOT EXISTS engine_state (
@@ -119,20 +124,6 @@ CREATE TABLE IF NOT EXISTS symbol_state (
 CREATE TABLE IF NOT EXISTS run_metrics (
     id SERIAL PRIMARY KEY,
     suffix TEXT NOT NULL,
-    run_started_at TEXT NOT NULL,
-    run_ended_at TEXT,
-    status TEXT NOT NULL,
-    symbols_total INTEGER NOT NULL,
-    symbols_fetched INTEGER NOT NULL,
-    symbols_computed INTEGER NOT NULL,
-    fetch_seconds REAL NOT NULL,
-    compute_seconds REAL NOT NULL,
-    persist_seconds REAL NOT NULL,
-    duration_seconds REAL,
-    error TEXT
-);
-CREATE TABLE IF NOT EXISTS run_metrics (
-    id SERIAL PRIMARY KEY,
     run_started_at TEXT NOT NULL,
     run_ended_at TEXT,
     status TEXT NOT NULL,
@@ -219,6 +210,16 @@ class TradingRepository:
         if self.conn and not self.conn.closed:
             self.conn.close()
 
+    def keepalive_ping(self) -> None:
+        """Send a lightweight SELECT 1 to keep the Postgres connection alive.
+        Call this during long idle phases (e.g. between fetch batches) to prevent
+        Supabase's PgBouncer from closing the connection due to inactivity.
+        """
+        try:
+            self._ensure_connection()
+        except Exception:
+            pass  # _ensure_connection already reconnects; silent failure is OK here
+
     @retry_on_disconnect()
     def init_db(self) -> None:
         with self.conn.cursor() as cur:
@@ -285,11 +286,13 @@ class TradingRepository:
         now = utc_now_iso()
         cleaned = sorted({s.strip().upper() for s in symbols if s and s.strip()})
         rows = [(s, 1 if selected else 0, 1 if active else 0, now, now) for s in cleaned]
+        from psycopg2.extras import execute_values
         with self.conn.cursor() as cur:
-            cur.executemany(
+            execute_values(
+                cur,
                 """
                 INSERT INTO universe(symbol, is_selected, is_active, created_at, updated_at)
-                VALUES(%s, %s, %s, %s, %s)
+                VALUES %s
                 ON CONFLICT(symbol) DO UPDATE SET
                     is_selected=EXCLUDED.is_selected,
                     is_active=EXCLUDED.is_active,
@@ -353,11 +356,13 @@ class TradingRepository:
                     float(row.get("volume", 0.0)),
                 )
             )
+        from psycopg2.extras import execute_values
         with self.conn.cursor() as cur:
-            cur.executemany(
+            execute_values(
+                cur,
                 """
                 INSERT INTO candles_5m(symbol, ts, open, high, low, close, volume)
-                VALUES(%s, %s, %s, %s, %s, %s, %s)
+                VALUES %s
                 ON CONFLICT(symbol, ts) DO UPDATE SET
                     open=EXCLUDED.open,
                     high=EXCLUDED.high,
@@ -397,6 +402,7 @@ class TradingRepository:
                 """,
                 (symbol, asof_ts, now),
             )
+        self.conn.commit()
 
     @retry_on_disconnect()
     def get_open_positions(self) -> dict[str, dict]:
@@ -501,8 +507,10 @@ class TradingRepository:
     @retry_on_disconnect()
     def update_position_prices(self, prices: dict[str, tuple[float, str]]) -> None:
         rows = [(price, ts, sym) for sym, (price, ts) in prices.items()]
+        from psycopg2.extras import execute_batch
         with self.conn.cursor() as cur:
-            cur.executemany(
+            execute_batch(
+                cur,
                 """
                 UPDATE positions_ledger
                 SET last_price=%s, last_updated_at=%s
@@ -536,8 +544,7 @@ class TradingRepository:
                 """
                 INSERT INTO pnl_snapshots(ts, suffix, realized_pnl, unrealized_pnl, total_pnl, open_positions)
                 VALUES(%s, %s, %s, %s, %s, %s)
-                ON CONFLICT(ts) DO UPDATE SET
-                    suffix=EXCLUDED.suffix,
+                ON CONFLICT(ts, suffix) DO UPDATE SET
                     realized_pnl=EXCLUDED.realized_pnl,
                     unrealized_pnl=EXCLUDED.unrealized_pnl,
                     total_pnl=EXCLUDED.total_pnl,

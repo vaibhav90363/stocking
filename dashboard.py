@@ -126,7 +126,7 @@ with st.sidebar:
 
     st.markdown(f"""
 <div style="background:{banner_color};border-radius:8px;padding:10px 14px;margin-bottom:10px">
-  <div style="font-size:1.1rem;font-weight:700;color:#f1f5f9">{banner_icon} {banner_title}</div>
+  <div style="font-size:1.1rem;font-weight:700;color:#f1f5f9;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;">{banner_icon} {banner_title}</div>
   <div style="font-size:0.78rem;color:#94a3b8;margin-top:4px">
     Market: <b>{mkt_hours}</b> {mkt_tz}<br>
     Last run: <code>{last_run}</code><br>
@@ -217,13 +217,17 @@ open_pos_map = repo.get_open_positions()
 n_open       = len(open_pos_map)
 
 pnl_snap = repo.read_df(
-    f"SELECT realized_pnl, unrealized_pnl, total_pnl FROM pnl_snapshots WHERE suffix='{cfg.ticker_suffix}' ORDER BY ts DESC LIMIT 1"
+    "SELECT realized_pnl, unrealized_pnl, total_pnl FROM pnl_snapshots WHERE suffix=%s ORDER BY ts DESC LIMIT 1",
+    (cfg.ticker_suffix,)
 )
 realized   = float(pnl_snap["realized_pnl"].iloc[0])   if not pnl_snap.empty else 0.0
 unrealized = float(pnl_snap["unrealized_pnl"].iloc[0]) if not pnl_snap.empty else 0.0
 total_pnl  = float(pnl_snap["total_pnl"].iloc[0])      if not pnl_snap.empty else 0.0
 
-latest_run = repo.read_df(f"SELECT * FROM run_metrics WHERE suffix='{cfg.ticker_suffix}' ORDER BY id DESC LIMIT 1")
+latest_run = repo.read_df(
+    "SELECT * FROM run_metrics WHERE suffix=%s ORDER BY id DESC LIMIT 1",
+    (cfg.ticker_suffix,)
+)
 last_cycle_status = str(latest_run["status"].iloc[0]) if not latest_run.empty else "—"
 last_duration     = float(latest_run["duration_seconds"].iloc[0]) if not latest_run.empty else 0.0
 fetched_last      = int(latest_run["symbols_fetched"].iloc[0]) if not latest_run.empty else 0
@@ -609,7 +613,7 @@ with tab_system:
     st.markdown('<p class="section-header">Full Strategy Configuration</p>', unsafe_allow_html=True)
 
     strategy_params = {
-        "Exchange Timezone": "Asia/Kolkata (default) / per .env",
+        "Exchange Timezone": cfg.exchange_tz,
         "Ticker Suffix": cfg.ticker_suffix,
         "Fetch Lookback": f"{cfg.fetch_lookback_days} days (5m bars)",
         "Compute Lookback": f"{cfg.compute_lookback_days} days (daily warmup)",

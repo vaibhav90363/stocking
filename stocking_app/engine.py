@@ -87,7 +87,7 @@ class CycleStats:
 class ScalableEngine:
     def __init__(self, cfg: AppConfig):
         self.cfg = cfg
-        self.repo = TradingRepository(cfg.database_url or cfg.db_path)
+        self.repo = TradingRepository(cfg.database_url or cfg.db_path, suffix=cfg.ticker_suffix)
         self.repo.init_db()
         self._running = True
         self.executor = ProcessPoolExecutor(max_workers=max(1, cfg.compute_workers))
@@ -103,6 +103,16 @@ class ScalableEngine:
         self.log.info(f"  Concurrency : fetch={cfg.max_fetch_concurrency}  compute={cfg.compute_workers}")
         self.log.info("═" * 60)
 
+        # ── Startup guard: fail-fast if DATABASE_URL is missing ─────────────
+        if not cfg.database_url:
+            self.log.error(
+                "ENGINE STARTUP FAILED: DATABASE_URL environment variable is not set.\n"
+                "Set it before starting the engine:\n"
+                "  export DATABASE_URL=postgresql://user:pass@host:5432/db\n"
+                "Or add it to your .env file."
+            )
+            raise RuntimeError("DATABASE_URL is required but not set. Engine cannot start.")
+
         self.pid_file = Path(cfg.db_path).parent / "engine.pid"
         self.pid_file.write_text(str(os.getpid()))
 
@@ -111,9 +121,10 @@ class ScalableEngine:
 
     def close(self) -> None:
         self.executor.shutdown(wait=True, cancel_futures=True)
+        self.log.info("Engine shut down cleanly.")
         self.repo.close()
         self.pid_file.unlink(missing_ok=True)
-        self.log.info("Engine shut down cleanly.")
+
 
     def run_forever(self) -> None:
         def _handle_signal(_sig: int, _frame: Any) -> None:
@@ -124,6 +135,8 @@ class ScalableEngine:
         signal.signal(signal.SIGTERM, _handle_signal)
 
         cycle_num = 0
+        consecutive_zero_fetches = 0  # circuit-breaker counter
+        ZERO_FETCH_WARN_THRESHOLD = 3
         while self._running:
             # ── Market-hours auto-scheduler ─────────────────────────────────
             mkt = get_market_status(
@@ -295,7 +308,7 @@ class ScalableEngine:
                 # Update heartbeat dynamically every 20 symbols
                 if count % 20 == 0 or count == total:
                     self.repo.set_engine_heartbeat(
-                        self.repo.get_engine_heartbeat() | {
+                        (self.repo.get_engine_heartbeat() or {}) | {
                             "state": "fetching",
                             "fetch_progress": f"{count} / {total}",
                             "fetch_count": count,
@@ -303,8 +316,26 @@ class ScalableEngine:
                         }
                     )
         
+        # ── Background DB keepalive during fetch ──────────────────────────────
+        # Supabase/PgBouncer kills idle connections after ~5 minutes.
+        # While yfinance fetches are running (can take 60-90s for 500 symbols),
+        # the main DB connection sits idle. Ping it every 30s to keep it alive.
+        import threading
+        _keepalive_stop = threading.Event()
+
+        def _keepalive_worker():
+            while not _keepalive_stop.wait(timeout=30):
+                self.repo.keepalive_ping()
+
+        _ka_thread = threading.Thread(target=_keepalive_worker, daemon=True, name="db-keepalive")
+        _ka_thread.start()
+
         import asyncio
-        asyncio.run(_run_fetcher())
+        try:
+            asyncio.run(_run_fetcher())
+        finally:
+            _keepalive_stop.set()
+            _ka_thread.join(timeout=2)
 
         fetch_seconds = time.monotonic() - fetch_start
 
@@ -319,7 +350,7 @@ class ScalableEngine:
         self.log.info(f"  [2/3] COMPUTE — {len(symbols_to_compute)} symbols pending")
         
         self.repo.set_engine_heartbeat(
-            self.repo.get_engine_heartbeat() | {
+            (self.repo.get_engine_heartbeat() or {}) | {
                 "state": "computing",
                 "compute_progress": f"0 / {len(symbols_to_compute)}",
                 "compute_count": 0,
@@ -335,7 +366,7 @@ class ScalableEngine:
                 str(self.cfg.db_path),
                 symbol,
                 self.cfg.compute_lookback_days,
-                "Asia/Kolkata",
+                self.cfg.exchange_tz,
             ): symbol
             for symbol in symbols_to_compute
         }
@@ -365,7 +396,7 @@ class ScalableEngine:
             # Broadcast live compute progress
             if computed_count % 10 == 0 or computed_count == total_to_compute:
                 self.repo.set_engine_heartbeat(
-                    self.repo.get_engine_heartbeat() | {
+                    (self.repo.get_engine_heartbeat() or {}) | {
                         "state": "computing",
                         "compute_progress": f"{computed_count} / {total_to_compute}",
                         "compute_count": computed_count,
