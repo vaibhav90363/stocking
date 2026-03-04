@@ -473,7 +473,7 @@ class TradingRepository:
         if not pairs:
             return
         now = utc_now_iso()
-        rows = [(sym, ts, now) for sym, ts in pairs]
+        rows = [(sym, None, ts, now) for sym, ts in pairs]
         from psycopg2.extras import execute_values
         with self.conn.cursor() as cur:
             execute_values(
