@@ -90,7 +90,11 @@ class ScalableEngine:
         self.repo = TradingRepository(cfg.database_url or cfg.db_path, suffix=cfg.ticker_suffix)
         self.repo.init_db()
         self._running = True
-        self.executor = ProcessPoolExecutor(max_workers=max(1, cfg.compute_workers))
+        
+        # Cap workers to available physical CPU cores to prevent thrashing
+        system_cores = os.cpu_count() or 1
+        target_workers = max(1, cfg.compute_workers)
+        self.executor = ProcessPoolExecutor(max_workers=min(target_workers, system_cores))
 
         # Logger writes to <db_path_dir>/logs/engine.log and the Supabase db
         log_dir = Path(cfg.db_path).parent / "logs"
@@ -360,16 +364,31 @@ class ScalableEngine:
 
         compute_start = time.monotonic()
         compute_payloads: list[dict[str, Any]] = []
-        futures = {
-            self.executor.submit(
+        
+        # Pre-load all required historical data via ONE vectorized query
+        # This replaces N separate DB connections/queries inside the workers.
+        self.log.debug(f"Pre-loading historical candles for {len(symbols_to_compute)} symbols...")
+        historical_data = self.repo.get_all_candles_for_symbols(symbols_to_compute, self.cfg.compute_lookback_days)
+        
+        futures = {}
+        for symbol in symbols_to_compute:
+            # Slice the master DataFrame for this specific symbol
+            if not historical_data.empty and symbol in historical_data['symbol'].values:
+                df_symbol = historical_data[historical_data['symbol'] == symbol].copy()
+                # Restore the TS index expected by the strategy
+                df_symbol = df_symbol.set_index('ts')
+            else:
+                import pandas as pd
+                df_symbol = pd.DataFrame()
+
+            # Submit the pure mathematical function to the executor (No I/O)
+            fut = self.executor.submit(
                 compute_symbol_signal,
-                str(self.cfg.db_path),
                 symbol,
-                self.cfg.compute_lookback_days,
+                df_symbol,
                 self.cfg.exchange_tz,
-            ): symbol
-            for symbol in symbols_to_compute
-        }
+            )
+            futures[fut] = symbol
 
         compute_errors = 0
         computed_count = 0
