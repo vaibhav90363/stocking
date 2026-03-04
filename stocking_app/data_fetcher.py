@@ -47,97 +47,126 @@ def _normalize_ohlcv(data: pd.DataFrame) -> pd.DataFrame:
 
 
 def _fetch_batch_blocking(batch: list[str], lookback_days: int) -> list[FetchResult]:
+    """Fetch a batch of symbols from Yahoo Finance with retry + backoff on rate-limits."""
+    import random
+    import time
+
     if not batch:
         return []
 
     # Map engine symbols back to Yahoo-compatible symbols (e.g., remove .US suffix)
     yahoo_to_engine = {}
     yahoo_symbols = []
-    
+
     for sym in batch:
         y_sym = sym[:-3] if sym.endswith('.US') else sym
         yahoo_symbols.append(y_sym)
         yahoo_to_engine[y_sym] = sym
 
-    results = []
-    try:
-        data = yf.download(
-            tickers=" ".join(yahoo_symbols),
-            period=f"{lookback_days}d",
-            interval="5m",
-            auto_adjust=True,
-            prepost=False,
-            group_by="ticker",
-            threads=False,   # Disable yfinance internal threading — we control concurrency via asyncio
-            progress=False,  # Suppress tqdm stdout I/O
-            timeout=30,
-        )
-        
-        # If only 1 symbol was successfully fetched, yfinance returns a flat structure
-        # If multiple, it returns a MultiIndex column structure
-        is_multi = isinstance(data.columns, pd.MultiIndex)
-        
-        for y_sym in yahoo_symbols:
-            engine_sym = yahoo_to_engine[y_sym]
-            
-            try:
-                if is_multi:
-                    if y_sym in data.columns.get_level_values('Ticker'):
-                        df = data[y_sym].copy()
-                    else:
-                        results.append(FetchResult(symbol=engine_sym, bars=pd.DataFrame(), error="Not found in Yahoo batch"))
-                        continue
-                else:
-                    # Single flat lookup
-                    if len(yahoo_symbols) == 1:
-                        df = data.copy()
-                    else:
-                        # Should not happen typically, but fallback
-                        df = pd.DataFrame()
+    # Add random jitter before each batch to reduce burst collisions with Yahoo's rate-limiter.
+    # Spread: 0.5–2.5s per batch semaphore slot.
+    time.sleep(random.uniform(0.5, 2.5))
 
-                df = df.dropna(how='all')
-                bars = _normalize_ohlcv(df)
-                
-                if bars.empty:
-                    results.append(FetchResult(symbol=engine_sym, bars=bars, error="No 5m candles returned"))
-                else:
-                    results.append(FetchResult(symbol=engine_sym, bars=bars, error=None))
-                    
-            except Exception as e:
-                results.append(FetchResult(symbol=engine_sym, bars=pd.DataFrame(), error=f"Parse scalar error: {e}"))
-                
-    except Exception as exc:  # noqa: BLE001
-        for sym in batch:
-            results.append(FetchResult(symbol=sym, bars=pd.DataFrame(), error=f"Batch API error: {exc}"))
+    MAX_RETRIES = 3
+    BACKOFF_BASE = 5  # seconds; doubled each retry: 5s → 10s → 20s
 
-    return results
+    last_exc: Exception | None = None
+    for attempt in range(MAX_RETRIES):
+        try:
+            data = yf.download(
+                tickers=" ".join(yahoo_symbols),
+                period=f"{lookback_days}d",
+                interval="5m",
+                auto_adjust=True,
+                prepost=False,
+                group_by="ticker",
+                threads=False,   # Disable yfinance internal threading — we control concurrency via asyncio
+                progress=False,  # Suppress tqdm stdout I/O
+                timeout=30,
+            )
+
+            # If only 1 symbol was successfully fetched, yfinance returns a flat structure
+            # If multiple, it returns a MultiIndex column structure
+            is_multi = isinstance(data.columns, pd.MultiIndex)
+
+            results = []
+            for y_sym in yahoo_symbols:
+                engine_sym = yahoo_to_engine[y_sym]
+                try:
+                    if is_multi:
+                        if y_sym in data.columns.get_level_values('Ticker'):
+                            df = data[y_sym].copy()
+                        else:
+                            results.append(FetchResult(symbol=engine_sym, bars=pd.DataFrame(), error="Not found in Yahoo batch"))
+                            continue
+                    else:
+                        # Single flat lookup
+                        if len(yahoo_symbols) == 1:
+                            df = data.copy()
+                        else:
+                            # Should not happen typically, but fallback
+                            df = pd.DataFrame()
+
+                    df = df.dropna(how='all')
+                    bars = _normalize_ohlcv(df)
+
+                    if bars.empty:
+                        results.append(FetchResult(symbol=engine_sym, bars=bars, error="No 5m candles returned"))
+                    else:
+                        results.append(FetchResult(symbol=engine_sym, bars=bars, error=None))
+
+                except Exception as e:
+                    results.append(FetchResult(symbol=engine_sym, bars=pd.DataFrame(), error=f"Parse scalar error: {e}"))
+
+            return results
+
+        except Exception as exc:
+            last_exc = exc
+            err_str = str(exc).lower()
+            is_rate_limit = "rate limit" in err_str or "too many requests" in err_str or "429" in err_str
+            if is_rate_limit and attempt < MAX_RETRIES - 1:
+                wait = BACKOFF_BASE * (2 ** attempt) + random.uniform(0, 2)
+                time.sleep(wait)
+            else:
+                break
+
+    # All retries exhausted — mark every symbol in this batch as failed
+    return [
+        FetchResult(symbol=sym, bars=pd.DataFrame(), error=f"Batch API error after {MAX_RETRIES} retries: {last_exc}")
+        for sym in batch
+    ]
+
 
 async def fetch_5m_bars_async_gen(
     symbols: list[str], lookback_days: int, max_concurrency: int = 5
 ) -> AsyncGenerator[FetchResult, None]:
     # We yield results asynchronously as batch loops complete
-    # Chunk the symbols into blocks of 100 to avoid long URL lengths
-    BATCH_SIZE = 50   # Smaller batches = less Yahoo throttling and more reliable results
+    # Chunk the symbols into blocks of 50 to avoid long URL lengths / Yahoo throttling
+    BATCH_SIZE = 50
     batches = [symbols[i:i + BATCH_SIZE] for i in range(0, len(symbols), BATCH_SIZE)]
-    
-    semaphore = asyncio.Semaphore(max(1, max_concurrency))
+
+    # Cap concurrency to 4 to stay well under Yahoo's rate limit.
+    # 16 parallel batches of 50 = 800 simultaneous requests — too aggressive.
+    effective_concurrency = min(max_concurrency, 4)
+    semaphore = asyncio.Semaphore(max(1, effective_concurrency))
 
     async def _wrapped(batch: list[str]) -> list[FetchResult]:
         async with semaphore:
             try:
-                # Add strict 45-second timeout for a 100-symbol batch
+                # Timeout: 45s for the download + up to 3 retries with backoff (max ~37s extra)
+                # = 120s upper bound per batch slot
                 return await asyncio.wait_for(
                     asyncio.to_thread(_fetch_batch_blocking, batch, lookback_days),
-                    timeout=45.0
+                    timeout=120.0
                 )
             except asyncio.TimeoutError:
-                return [FetchResult(symbol=s, bars=pd.DataFrame(), error="Batch fetch timed out after 45s") for s in batch]
+                return [FetchResult(symbol=s, bars=pd.DataFrame(), error="Batch fetch timed out after 120s") for s in batch]
             except Exception as exc:
                 return [FetchResult(symbol=s, bars=pd.DataFrame(), error=f"Batch fetch failed: {exc}") for s in batch]
 
     tasks = [_wrapped(b) for b in batches]
-    
-    # As each 100-symbol batch finishes, yield its individual FetchResults
+
+    # As each 50-symbol batch finishes, yield its individual FetchResults
     for completed_task in asyncio.as_completed(tasks):
         batch_results = await completed_task
         for r in batch_results:

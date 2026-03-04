@@ -106,7 +106,11 @@ def cmd_live(sc, args):
     print(f"\n  Starting engine … (Ctrl-C to stop)\n")
     
     # ── Render Web Service: Health endpoint + Keep-Alive self-ping ─────────────
-    if os.environ.get("RENDER") or os.environ.get("PORT"):
+    # When running --all-strategies, only the primary process (STOCKING_IS_PRIMARY=1)
+    # should bind the port. Non-primary processes skip this entirely to avoid
+    # OSError: [Errno 98] Address already in use.
+    _is_primary = os.environ.get("STOCKING_IS_PRIMARY", "1") != "0"
+    if _is_primary and (os.environ.get("RENDER") or os.environ.get("PORT")):
         import threading
         import json as _json
         from http.server import HTTPServer, BaseHTTPRequestHandler
@@ -253,13 +257,20 @@ def main():
         print("\n  [Runner] Launching all strategies concurrently …")
         strategies_dir = ROOT / "strategies"
         processes = []
-        for d in strategies_dir.iterdir():
+        is_first = True  # Only the first strategy gets the HTTP health port
+        for d in sorted(strategies_dir.iterdir()):  # sorted for determinism
             if d.is_dir() and (d / "strategy.yaml").exists():
                 print(f"  --> Launching {d.name} in mode {args.mode}")
+                child_env = os.environ.copy()
+                if is_first:
+                    child_env["STOCKING_IS_PRIMARY"] = "1"
+                    is_first = False
+                else:
+                    child_env["STOCKING_IS_PRIMARY"] = "0"
                 p = subprocess.Popen([
                     sys.executable, __file__, str(d),
                     "--mode", args.mode,
-                ])
+                ], env=child_env)
                 processes.append(p)
         
         if not processes:
