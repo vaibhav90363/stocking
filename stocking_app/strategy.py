@@ -25,60 +25,6 @@ def _empty(symbol: str, reason: str) -> dict[str, Any]:
     }
 
 
-def _get_db_url(db_path: str) -> str:
-    """
-    Return the Postgres DATABASE_URL from the environment.
-    The `db_path` argument is kept for backward compatibility but is ignored —
-    the actual data lives in Supabase, not in a local SQLite file.
-    """
-    url = os.environ.get("DATABASE_URL", "").strip()
-    if not url:
-        raise RuntimeError(
-            "DATABASE_URL environment variable is not set. "
-            "Strategy compute requires a live Postgres/Supabase connection."
-        )
-    return url
-
-
-def _load_candles(db_url: str, symbol: str, lookback_days: int) -> pd.DataFrame:
-    """Load 5m candles for a symbol from the Postgres/Supabase database."""
-    import psycopg2
-    from psycopg2.extras import RealDictCursor
-
-    cutoff = (
-        datetime.now(timezone.utc) - timedelta(days=lookback_days)
-    ).replace(microsecond=0).isoformat()
-
-    sql = """
-    SELECT ts, open, high, low, close, volume
-    FROM candles_5m
-    WHERE symbol = %s AND ts >= %s
-    ORDER BY ts
-    """
-    try:
-        conn = psycopg2.connect(
-            db_url,
-            cursor_factory=RealDictCursor,
-            connect_timeout=10,
-        )
-        try:
-            with conn.cursor() as cur:
-                cur.execute(sql, (symbol, cutoff))
-                rows = cur.fetchall()
-                if not rows:
-                    return pd.DataFrame()
-                cols = [desc[0] for desc in cur.description]
-        finally:
-            conn.close()
-    except Exception as exc:
-        raise RuntimeError(f"Failed to load candles for {symbol}: {exc}") from exc
-
-    df = pd.DataFrame([dict(r) for r in rows], columns=cols)
-    df["ts"] = pd.to_datetime(df["ts"], utc=True)
-    df = df.set_index("ts")
-    return df
-
-
 def _to_daily_weekly(df_5m: pd.DataFrame, exchange_tz: str) -> tuple[pd.DataFrame, pd.DataFrame]:
     local = df_5m.copy()
     local.index = local.index.tz_convert(exchange_tz)
@@ -173,18 +119,10 @@ def _compute_latest_signal(daily: pd.DataFrame, weekly: pd.DataFrame) -> tuple[s
     return None, None, "no_signal"
 
 
-def compute_symbol_signal(db_path: str, symbol: str, lookback_days: int, exchange_tz: str) -> dict[str, Any]:
+def compute_symbol_signal(symbol: str, df_5m: pd.DataFrame, exchange_tz: str) -> dict[str, Any]:
     """
-    Compute the latest signal for a symbol.
-
-    `db_path` is accepted for interface compatibility but ignored — data is
-    always loaded from the Postgres/Supabase DATABASE_URL environment variable.
+    Compute the latest signal for a symbol given its 5m candle DataFrame.
     """
-    try:
-        db_url = _get_db_url(db_path)
-        df_5m = _load_candles(db_url, symbol, lookback_days)
-    except Exception as exc:
-        return _empty(symbol, f"db_error:{exc}")
 
     if df_5m.empty:
         return _empty(symbol, "no_5m_candles")
