@@ -7,7 +7,7 @@ import os
 import signal
 import threading
 import time
-from concurrent.futures import ProcessPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -93,10 +93,14 @@ class ScalableEngine:
         self.repo.init_db()
         self._running = True
         
-        # Cap workers to available physical CPU cores to prevent thrashing
+        # ── Compute thread pool ─────────────────────────────────────────────
+        # Use threads NOT processes — avoids spawning extra Python interpreters
+        # (~150 MB each). Compute is numpy/pandas heavy which releases the GIL,
+        # so threads get real parallelism without the memory overhead of forks.
+        # On Render's 512 MB free tier this saves ~450 MB across 3 engines.
         system_cores = os.cpu_count() or 1
         target_workers = max(1, cfg.compute_workers)
-        self.executor = ProcessPoolExecutor(max_workers=min(target_workers, system_cores))
+        self.executor = ThreadPoolExecutor(max_workers=min(target_workers, system_cores))
 
         # Logger writes to <db_path_dir>/logs/engine.log and the Supabase db
         log_dir = Path(cfg.db_path).parent / "logs"

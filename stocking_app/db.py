@@ -533,38 +533,59 @@ class TradingRepository:
     @retry_on_disconnect()
     def get_all_candles_for_symbols(self, symbols: list[str], lookback_days: int) -> pd.DataFrame:
         """
-        Pulls candles for multiple symbols at once into a single giant DataFrame.
-        This minimizes separate DB connections and scalar queries.
+        Pulls candles for multiple symbols, capped to the last MAX_BARS_PER_SYMBOL
+        rows per symbol. Loads in chunks of CHUNK_SIZE to avoid materializing
+        millions of rows in a single fetchall() — the primary OOM risk on Render's
+        512 MB free tier.
         """
         import pandas as pd
         from datetime import datetime, timedelta, timezone
-        
+
         if not symbols:
             return pd.DataFrame()
+
+        # Cap per symbol: 30 days × ~75 bars/day = ~2250 bars max.
+        # We keep only the most recent 500 — enough for any weekly/daily signal window
+        # while keeping each chunk's memory footprint predictable.
+        MAX_BARS_PER_SYMBOL = 500
+        CHUNK_SIZE = 100  # symbols per DB round-trip
 
         cutoff = (
             datetime.now(timezone.utc) - timedelta(days=lookback_days)
         ).replace(microsecond=0).isoformat()
-        
-        with self.conn.cursor() as cur:
-            cur.execute(
-                """
-                SELECT symbol, ts, open, high, low, close, volume
-                FROM candles_5m
-                WHERE symbol = ANY(%s) AND ts >= %s
-                ORDER BY ts
-                """,
-                (symbols, cutoff),
-            )
-            rows = cur.fetchall()
-            
-            if not rows:
-                return pd.DataFrame()
-            cols = [desc[0] for desc in cur.description]
 
-        df = pd.DataFrame([dict(r) for r in rows], columns=cols)
-        df["ts"] = pd.to_datetime(df["ts"], utc=True)
-        return df
+        all_chunks: list[pd.DataFrame] = []
+
+        for i in range(0, len(symbols), CHUNK_SIZE):
+            chunk = symbols[i : i + CHUNK_SIZE]
+            with self.conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT symbol, ts, open, high, low, close, volume
+                    FROM (
+                        SELECT symbol, ts, open, high, low, close, volume,
+                               ROW_NUMBER() OVER (PARTITION BY symbol ORDER BY ts DESC) AS rn
+                        FROM candles_5m
+                        WHERE symbol = ANY(%s) AND ts >= %s
+                    ) ranked
+                    WHERE rn <= %s
+                    ORDER BY symbol, ts
+                    """,
+                    (chunk, cutoff, MAX_BARS_PER_SYMBOL),
+                )
+                rows = cur.fetchall()
+
+            if rows:
+                df_chunk = pd.DataFrame([dict(r) for r in rows])
+                df_chunk["ts"] = pd.to_datetime(df_chunk["ts"], utc=True)
+                df_chunk.drop(columns=["rn"], errors="ignore", inplace=True)
+                all_chunks.append(df_chunk)
+
+        if not all_chunks:
+            return pd.DataFrame()
+
+        return pd.concat(all_chunks, ignore_index=True)
+
 
     @retry_on_disconnect()
     def upsert_signal(self, signal: SignalRecord, acted: bool = False) -> None:
