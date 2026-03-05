@@ -92,116 +92,7 @@ def cmd_live(sc, args):
     if "DATABASE_URL" in os.environ:
         env["DATABASE_URL"] = os.environ["DATABASE_URL"]
 
-    # ── Render Web Service: Health endpoint + Keep-Alive self-ping ─────────────
-    # IMPORTANT: Start this FIRST, before any blocking CLI setup calls.
-    # Render's deploy health probe fires as soon as the process starts —
-    # if it doesn't get a 200 within the timeout the deploy is marked failed.
-    # Previously this was started AFTER init-db/import-universe (60-120s delay).
-    #
-    # When running --all-strategies, only the primary process (STOCKING_IS_PRIMARY=1)
-    # should bind the port. Non-primary processes skip this entirely to avoid
-    # OSError: [Errno 98] Address already in use.
-    _is_primary = os.environ.get("STOCKING_IS_PRIMARY", "1") != "0"
-    if _is_primary and (os.environ.get("RENDER") or os.environ.get("PORT")):
-        import threading
-        import json as _json
-        from http.server import HTTPServer, BaseHTTPRequestHandler
-        from datetime import datetime as _dt, timezone as _tz
-
-        _engine_start_time = _dt.now(_tz.utc).isoformat()
-        _setup_done = False  # flipped to True once CLI setup finishes
-
-        class HealthCheckHandler(BaseHTTPRequestHandler):
-            def do_GET(self):
-                payload = _json.dumps({
-                    "status":  "starting" if not _setup_done else "running",
-                    "service": "stocking-engine",
-                    "started": _engine_start_time,
-                    "ts":      _dt.now(_tz.utc).isoformat(),
-                }).encode()
-                self.send_response(200)
-                self.send_header("Content-Type", "application/json")
-                self.send_header("Content-Length", str(len(payload)))
-                self.end_headers()
-                self.wfile.write(payload)
-
-            def do_HEAD(self):
-                self.send_response(200)
-                self.send_header("Content-Type", "application/json")
-                self.end_headers()
-
-            def log_message(self, fmt, *args):
-                pass  # suppress access logs
-
-        port = int(os.environ.get("PORT", 8080))
-        httpd = HTTPServer(("0.0.0.0", port), HealthCheckHandler)
-        print(f"  [Render] Health endpoint listening on port {port}")
-        threading.Thread(target=httpd.serve_forever, daemon=True).start()
-
-        # ── Self-ping keep-alive ────────────────────────────────────────────
-        # Render free instances spin down after ~15 min of inactivity.
-        # We always want AT LEAST ONE ping target — so we build a priority list:
-        #
-        #   Layer 1 (best):  RENDER_EXTERNAL_URL  — set explicitly in render.yaml
-        #   Layer 2 (good):  Constructed from RENDER_SERVICE_NAME (Render always sets this)
-        #   Layer 3 (local): http://localhost:<PORT>  — always works on the same machine
-
-        _ping_interval = 8 * 60  # 8 minutes — well inside Render's 15-min timeout
-        _ping_urls: list[str] = []
-
-        _ext_url = os.environ.get("RENDER_EXTERNAL_URL", "").strip()
-        if _ext_url:
-            _ping_urls.append(_ext_url)
-
-        _svc_name = os.environ.get("RENDER_SERVICE_NAME", "").strip()
-        if _svc_name and not _ext_url:
-            _constructed_url = f"https://{_svc_name}.onrender.com"
-            _ping_urls.append(_constructed_url)
-
-        # Always add localhost as the final fallback — guaranteed reachable
-        _ping_urls.append(f"http://localhost:{port}")
-
-        import urllib.request as _urllib
-
-        def _keep_alive_loop():
-            import time as _time
-            while True:
-                _time.sleep(_ping_interval)
-                for _url in _ping_urls:
-                    try:
-                        _urllib.urlopen(_url, timeout=10)
-                        print(f"  [keep-alive] Pinged {_url} ✓")
-                        break
-                    except Exception as _e:
-                        print(f"  [keep-alive] {_url} failed: {_e} — trying next …")
-
-        _ka = threading.Thread(target=_keep_alive_loop, daemon=True, name="keep-alive")
-        _ka.start()
-
-        _primary_url = _ping_urls[0] if _ping_urls else f"http://localhost:{port}"
-        if _ext_url:
-            print(f"  [Render] Keep-alive → {_primary_url}  (every 8 min, +{len(_ping_urls)-1} fallbacks)")
-        elif _svc_name:
-            print(f"  [Render] Keep-alive → {_primary_url}  (constructed from RENDER_SERVICE_NAME)")
-        else:
-            print(f"  [Render] Keep-alive → localhost:{port}  (RENDER_EXTERNAL_URL not set — using local fallback)")
-
-    # ── DB init + universe import (blocking, but health probe is already up) ───
-    _run_cli(["init-db"], env)
-    sym_col = _detect_symbol_column(sc.universe_csv)
-    _run_cli([
-        "import-universe",
-        "--csv", str(sc.universe_csv),
-        "--symbol-column", sym_col,
-        "--append-suffix", sc.suffix,
-    ], env)
-    _run_cli(["set-engine", "--enabled", "true"], env)
-
-    # Mark setup complete so health check reports 'running' instead of 'starting'
-    try:
-        _setup_done = True  # type: ignore[assignment]  # only defined when health server is up
-    except NameError:
-        pass
+    # ── (Health endpoint moved to parent watchdog in main) ──
 
     print(f"\n  Starting engine … (Ctrl-C to stop)\n")
 
@@ -307,8 +198,81 @@ def main():
         # ── Per-engine fetch-start stagger ─────────────────────────────────
         # Assign each engine a different delay so they don't all burst Yahoo
         # Finance simultaneously from the same IP on each cycle's first fetch.
-        # Order: 0s → 30s → 60s based on sorted directory index.
-        FETCH_DELAYS = [0, 30, 60]
+        # Order: 0s → 90s → 180s based on sorted directory index.
+        FETCH_DELAYS = [0, 90, 180]
+
+        # ── Render Web Service: Health endpoint + Keep-Alive self-ping ─────────────
+        # Start this in the parent watchdog process BEFORE spawning children so
+        # Render sees the port open immediately and doesn't timeout during slow child DB inits.
+        if os.environ.get("RENDER") or os.environ.get("PORT"):
+            import threading
+            import json as _json
+            from http.server import HTTPServer, BaseHTTPRequestHandler
+            from datetime import datetime as _dt, timezone as _tz
+
+            _engine_start_time = _dt.now(_tz.utc).isoformat()
+
+            class HealthCheckHandler(BaseHTTPRequestHandler):
+                def do_GET(self):
+                    payload = _json.dumps({
+                        "status":  "running",
+                        "service": "stocking-engine-watchdog",
+                        "started": _engine_start_time,
+                        "ts":      _dt.now(_tz.utc).isoformat(),
+                    }).encode()
+                    self.send_response(200)
+                    self.send_header("Content-Type", "application/json")
+                    self.send_header("Content-Length", str(len(payload)))
+                    self.end_headers()
+                    self.wfile.write(payload)
+
+                def do_HEAD(self):
+                    self.send_response(200)
+                    self.send_header("Content-Type", "application/json")
+                    self.end_headers()
+
+                def log_message(self, fmt, *args):
+                    pass
+
+            port = int(os.environ.get("PORT", 8080))
+            httpd = HTTPServer(("0.0.0.0", port), HealthCheckHandler)
+            print(f"  [Render] Health endpoint listening on port {port}")
+            threading.Thread(target=httpd.serve_forever, daemon=True).start()
+
+            _ping_interval = 8 * 60
+            _ping_urls = []
+            _ext_url = os.environ.get("RENDER_EXTERNAL_URL", "").strip()
+            if _ext_url:
+                _ping_urls.append(_ext_url)
+            _svc_name = os.environ.get("RENDER_SERVICE_NAME", "").strip()
+            if _svc_name and not _ext_url:
+                _ping_urls.append(f"https://{_svc_name}.onrender.com")
+            _ping_urls.append(f"http://localhost:{port}")
+
+            import urllib.request as _urllib
+
+            def _keep_alive_loop():
+                import time as _time
+                while True:
+                    _time.sleep(_ping_interval)
+                    for _url in _ping_urls:
+                        try:
+                            _urllib.urlopen(_url, timeout=10)
+                            print(f"  [keep-alive] Pinged {_url} ✓")
+                            break
+                        except Exception as _e:
+                            print(f"  [keep-alive] {_url} failed: {_e} — trying next …")
+
+            _ka = threading.Thread(target=_keep_alive_loop, daemon=True, name="keep-alive")
+            _ka.start()
+
+            _primary_url = _ping_urls[0] if _ping_urls else f"http://localhost:{port}"
+            if _ext_url:
+                print(f"  [Render] Keep-alive → {_primary_url}  (every 8 min, +{len(_ping_urls)-1} fallbacks)")
+            elif _svc_name:
+                print(f"  [Render] Keep-alive → {_primary_url}  (constructed from RENDER_SERVICE_NAME)")
+            else:
+                print(f"  [Render] Keep-alive → localhost:{port}  (RENDER_EXTERNAL_URL not set — using local fallback)")
 
         # ── Build process specs ─────────────────────────────────────────────
         # Each spec holds everything needed to (re)spawn the process.

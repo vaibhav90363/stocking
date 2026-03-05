@@ -16,8 +16,8 @@ engine:
   cycle_seconds: 300
   fetch_lookback_days: 3
   compute_lookback_days: 365
-  fetch_concurrency: 4
-  compute_workers: 4
+  fetch_concurrency: 1
+  compute_workers: 1
   order_qty: 10
 
 parameters:
