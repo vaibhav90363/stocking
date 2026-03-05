@@ -36,14 +36,9 @@ if "strategy" in st.query_params:
     strat_id = st.query_params["strategy"]
     strategy_path = ROOT / "strategies" / strat_id
     if strategy_path.exists():
-        sys.argv = ["streamlit", "run", "dashboard.py", "--strategy-dir", str(strategy_path)]
-        dash_path = str(ROOT / "dashboard.py")
-        
-        # Tell the child dashboard NOT to run set_page_config() since the hub already did
+        from dashboard import run_dashboard
         st.session_state["_hub_hosted"] = True
-        
-        import runpy
-        runpy.run_path(dash_path, run_name="__main__")
+        run_dashboard(str(strategy_path))
         st.stop()
     else:
         avail = [d.name for d in (ROOT / "strategies").iterdir() if d.is_dir() and (d / "strategy.yaml").exists()]
