@@ -322,6 +322,18 @@ class TradingRepository:
                 END IF;
             END $$;
             """,
+            # signals UNIQUE constraint — needed for ON CONFLICT(symbol, ts, signal_type)
+            """
+            DO $$ BEGIN
+                IF NOT EXISTS (
+                    SELECT 1 FROM pg_constraint
+                    WHERE conname = 'signals_symbol_ts_signal_type_key'
+                    AND conrelid = 'signals'::regclass
+                ) THEN
+                    ALTER TABLE signals ADD CONSTRAINT signals_symbol_ts_signal_type_key UNIQUE (symbol, ts, signal_type);
+                END IF;
+            END $$;
+            """,
         ]
         for _sql in _migrations:
             try:

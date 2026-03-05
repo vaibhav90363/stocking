@@ -63,10 +63,12 @@ def _fetch_batch_blocking(
         return []
 
     # ── Staggered jitter ──────────────────────────────────────────────────────
-    # Each batch slot starts at a unique offset: batch 0 → 0-1s, batch 1 → 1.5-2.5s,
-    # batch 2 → 3-4s, etc.  This spreads bursts over time instead of having all
-    # concurrent workers fire at the same moment.
-    stagger_sleep = batch_index * 1.5 + random.uniform(0.0, 1.0)
+    # To prevent all concurrent workers from hitting Yahoo at exactly the same time,
+    # we stagger the initial batches. For later batches, we just use a small jitter.
+    if batch_index < 2:
+        stagger_sleep = batch_index * 1.5 + random.uniform(0.0, 1.0)
+    else:
+        stagger_sleep = random.uniform(1.0, 2.0)
     time.sleep(stagger_sleep)
 
     # Map engine symbols → Yahoo-compatible symbols (strip .US suffix)
@@ -202,7 +204,10 @@ def _fetch_daily_batch_blocking(
     if not batch:
         return []
 
-    stagger_sleep = batch_index * 0.5 + random.uniform(0.0, 0.3)
+    if batch_index < 5:
+        stagger_sleep = batch_index * 0.5 + random.uniform(0.0, 0.3)
+    else:
+        stagger_sleep = random.uniform(0.5, 1.0)
     time.sleep(stagger_sleep)
 
     yahoo_to_engine: dict[str, str] = {}
