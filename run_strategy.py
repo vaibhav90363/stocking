@@ -87,25 +87,17 @@ def cmd_live(sc, args):
         "STOCKING_MARKET_OPEN":          str(sc.market_open),
         "STOCKING_MARKET_CLOSE":         str(sc.market_close),
     })
-    
+
     # Let Supabase db_url pass through to child processes if it exists
     if "DATABASE_URL" in os.environ:
         env["DATABASE_URL"] = os.environ["DATABASE_URL"]
 
-    # Init DB + import universe
-    _run_cli(["init-db"], env)
-    sym_col = _detect_symbol_column(sc.universe_csv)
-    _run_cli([
-        "import-universe",
-        "--csv", str(sc.universe_csv),
-        "--symbol-column", sym_col,
-        "--append-suffix", sc.suffix,
-    ], env)
-    _run_cli(["set-engine", "--enabled", "true"], env)
-
-    print(f"\n  Starting engine … (Ctrl-C to stop)\n")
-    
     # ── Render Web Service: Health endpoint + Keep-Alive self-ping ─────────────
+    # IMPORTANT: Start this FIRST, before any blocking CLI setup calls.
+    # Render's deploy health probe fires as soon as the process starts —
+    # if it doesn't get a 200 within the timeout the deploy is marked failed.
+    # Previously this was started AFTER init-db/import-universe (60-120s delay).
+    #
     # When running --all-strategies, only the primary process (STOCKING_IS_PRIMARY=1)
     # should bind the port. Non-primary processes skip this entirely to avoid
     # OSError: [Errno 98] Address already in use.
@@ -117,11 +109,12 @@ def cmd_live(sc, args):
         from datetime import datetime as _dt, timezone as _tz
 
         _engine_start_time = _dt.now(_tz.utc).isoformat()
+        _setup_done = False  # flipped to True once CLI setup finishes
 
         class HealthCheckHandler(BaseHTTPRequestHandler):
             def do_GET(self):
                 payload = _json.dumps({
-                    "status":  "running",
+                    "status":  "starting" if not _setup_done else "running",
                     "service": "stocking-engine",
                     "started": _engine_start_time,
                     "ts":      _dt.now(_tz.utc).isoformat(),
@@ -136,6 +129,7 @@ def cmd_live(sc, args):
                 self.send_response(200)
                 self.send_header("Content-Type", "application/json")
                 self.end_headers()
+
             def log_message(self, fmt, *args):
                 pass  # suppress access logs
 
@@ -150,13 +144,9 @@ def cmd_live(sc, args):
         #
         #   Layer 1 (best):  RENDER_EXTERNAL_URL  — set explicitly in render.yaml
         #   Layer 2 (good):  Constructed from RENDER_SERVICE_NAME (Render always sets this)
-        #   Layer 3 (local): http://localhost:<PORT>  — always works on the same machine,
-        #                    keeps the HTTP server's socket active even without an external URL
-        #
-        # All candidate URLs are tried in order; failures are logged but don't crash.
+        #   Layer 3 (local): http://localhost:<PORT>  — always works on the same machine
 
         _ping_interval = 8 * 60  # 8 minutes — well inside Render's 15-min timeout
-
         _ping_urls: list[str] = []
 
         _ext_url = os.environ.get("RENDER_EXTERNAL_URL", "").strip()
@@ -165,7 +155,6 @@ def cmd_live(sc, args):
 
         _svc_name = os.environ.get("RENDER_SERVICE_NAME", "").strip()
         if _svc_name and not _ext_url:
-            # Render external URLs follow the pattern: https://<service-name>.onrender.com
             _constructed_url = f"https://{_svc_name}.onrender.com"
             _ping_urls.append(_constructed_url)
 
@@ -182,7 +171,7 @@ def cmd_live(sc, args):
                     try:
                         _urllib.urlopen(_url, timeout=10)
                         print(f"  [keep-alive] Pinged {_url} ✓")
-                        break  # Success — no need to try fallbacks
+                        break
                     except Exception as _e:
                         print(f"  [keep-alive] {_url} failed: {_e} — trying next …")
 
@@ -197,6 +186,24 @@ def cmd_live(sc, args):
         else:
             print(f"  [Render] Keep-alive → localhost:{port}  (RENDER_EXTERNAL_URL not set — using local fallback)")
 
+    # ── DB init + universe import (blocking, but health probe is already up) ───
+    _run_cli(["init-db"], env)
+    sym_col = _detect_symbol_column(sc.universe_csv)
+    _run_cli([
+        "import-universe",
+        "--csv", str(sc.universe_csv),
+        "--symbol-column", sym_col,
+        "--append-suffix", sc.suffix,
+    ], env)
+    _run_cli(["set-engine", "--enabled", "true"], env)
+
+    # Mark setup complete so health check reports 'running' instead of 'starting'
+    try:
+        _setup_done = True  # type: ignore[assignment]  # only defined when health server is up
+    except NameError:
+        pass
+
+    print(f"\n  Starting engine … (Ctrl-C to stop)\n")
 
     result = subprocess.run(
         [sys.executable, "-m", "stocking_app.cli", "run-engine"],
