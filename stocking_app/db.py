@@ -234,7 +234,7 @@ class TradingRepository:
         self.conn = None
         # BUG-02 fix: per-instance lock serialises all DB calls. A threading.Lock
         # is ~56 bytes — negligible on the 512 MB budget.
-        self._lock: threading.Lock = threading.Lock()
+        self._lock: threading.Lock = threading.RLock()
         self._ensure_connection()
 
     def _ensure_connection(self) -> None:

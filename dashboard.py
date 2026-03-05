@@ -22,26 +22,25 @@ if not st.session_state.get("_hub_hosted", False):
         initial_sidebar_state="expanded",
     )
 
-# ── Custom CSS ─────────────────────────────────────────────────────────────────
-st.markdown("""
-<style>
-[data-testid="stMetricValue"] { font-size: 1.4rem; font-weight: 700; }
-[data-testid="stMetricLabel"] { font-size: 0.75rem; color: #888; }
-.status-running { color: #4ade80; font-weight: 700; }
-.status-paused  { color: #facc15; font-weight: 700; }
-.status-error   { color: #f87171; font-weight: 700; }
-div[data-testid="stDataFrameContainer"] { border-radius: 8px; }
-.section-header { font-size: 1.1rem; font-weight: 600; color: #e2e8f0;
-                   border-left: 3px solid #6366f1; padding-left: 10px;
-                   margin: 1rem 0 0.5rem 0; }
-</style>
-""", unsafe_allow_html=True)
-
 # ── Load config & repo ─────────────────────────────────────────────────────────
 import sys
 import argparse
 from stocking_app.strategy_loader import load_strategy
 def run_dashboard(strategy_name_or_path=None):
+    # ── Custom CSS ─────────────────────────────────────────────────────────────────
+    st.markdown("""
+    <style>
+    [data-testid="stMetricValue"] { font-size: 1.4rem; font-weight: 700; }
+    [data-testid="stMetricLabel"] { font-size: 0.75rem; color: #888; }
+    .status-running { color: #4ade80; font-weight: 700; }
+    .status-paused  { color: #facc15; font-weight: 700; }
+    .status-error   { color: #f87171; font-weight: 700; }
+    div[data-testid="stDataFrameContainer"] { border-radius: 8px; }
+    .section-header { font-size: 1.1rem; font-weight: 600; color: #e2e8f0;
+                       border-left: 3px solid #6366f1; padding-left: 10px;
+                       margin: 1rem 0 0.5rem 0; }
+    </style>
+    """, unsafe_allow_html=True)
     global_cfg = load_config()
     database_url = global_cfg.database_url
     if strategy_name_or_path:
