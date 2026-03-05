@@ -38,6 +38,10 @@ if "strategy" in st.query_params:
     if strategy_path.exists():
         sys.argv = ["streamlit", "run", "dashboard.py", "--strategy-dir", str(strategy_path)]
         dash_path = str(ROOT / "dashboard.py")
+        
+        # Tell the child dashboard NOT to run set_page_config() since the hub already did
+        st.session_state["_hub_hosted"] = True
+        
         import runpy
         runpy.run_path(dash_path, run_name="__main__")
         st.stop()

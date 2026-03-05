@@ -14,12 +14,13 @@ from stocking_app.config import load_config
 from stocking_app.db import TradingRepository
 
 # ── Page Config ───────────────────────────────────────────────────────────────
-st.set_page_config(
-    page_title="Stocking Dashboard",
-    layout="wide",
-    page_icon="📈",
-    initial_sidebar_state="expanded",
-)
+if not st.session_state.get("_hub_hosted", False):
+    st.set_page_config(
+        page_title="Stocking Dashboard",
+        layout="wide",
+        page_icon="📈",
+        initial_sidebar_state="expanded",
+    )
 
 # ── Custom CSS ─────────────────────────────────────────────────────────────────
 st.markdown("""
