@@ -146,29 +146,57 @@ def cmd_live(sc, args):
 
         # ── Self-ping keep-alive ────────────────────────────────────────────
         # Render free instances spin down after ~15 min of inactivity.
-        # Ping our own URL every 8 minutes to stay alive during market-closed
-        # periods (nights, weekends) when the engine is paused but must persist.
-        _self_url = os.environ.get("RENDER_EXTERNAL_URL", "").strip()
-        if _self_url:
-            import urllib.request as _urllib
+        # We always want AT LEAST ONE ping target — so we build a priority list:
+        #
+        #   Layer 1 (best):  RENDER_EXTERNAL_URL  — set explicitly in render.yaml
+        #   Layer 2 (good):  Constructed from RENDER_SERVICE_NAME (Render always sets this)
+        #   Layer 3 (local): http://localhost:<PORT>  — always works on the same machine,
+        #                    keeps the HTTP server's socket active even without an external URL
+        #
+        # All candidate URLs are tried in order; failures are logged but don't crash.
 
-            _PING_INTERVAL = 8 * 60  # 8 minutes
+        _ping_interval = 8 * 60  # 8 minutes — well inside Render's 15-min timeout
 
-            def _keep_alive_loop():
-                import time as _time
-                while True:
-                    _time.sleep(_PING_INTERVAL)
+        _ping_urls: list[str] = []
+
+        _ext_url = os.environ.get("RENDER_EXTERNAL_URL", "").strip()
+        if _ext_url:
+            _ping_urls.append(_ext_url)
+
+        _svc_name = os.environ.get("RENDER_SERVICE_NAME", "").strip()
+        if _svc_name and not _ext_url:
+            # Render external URLs follow the pattern: https://<service-name>.onrender.com
+            _constructed_url = f"https://{_svc_name}.onrender.com"
+            _ping_urls.append(_constructed_url)
+
+        # Always add localhost as the final fallback — guaranteed reachable
+        _ping_urls.append(f"http://localhost:{port}")
+
+        import urllib.request as _urllib
+
+        def _keep_alive_loop():
+            import time as _time
+            while True:
+                _time.sleep(_ping_interval)
+                for _url in _ping_urls:
                     try:
-                        _urllib.urlopen(_self_url, timeout=10)
-                        print(f"  [keep-alive] Pinged {_self_url} ✓")
+                        _urllib.urlopen(_url, timeout=10)
+                        print(f"  [keep-alive] Pinged {_url} ✓")
+                        break  # Success — no need to try fallbacks
                     except Exception as _e:
-                        print(f"  [keep-alive] Ping failed: {_e}")
+                        print(f"  [keep-alive] {_url} failed: {_e} — trying next …")
 
-            _ka = threading.Thread(target=_keep_alive_loop, daemon=True, name="keep-alive")
-            _ka.start()
-            print(f"  [Render] Keep-alive thread started — will self-ping every 8 min")
+        _ka = threading.Thread(target=_keep_alive_loop, daemon=True, name="keep-alive")
+        _ka.start()
+
+        _primary_url = _ping_urls[0] if _ping_urls else f"http://localhost:{port}"
+        if _ext_url:
+            print(f"  [Render] Keep-alive → {_primary_url}  (every 8 min, +{len(_ping_urls)-1} fallbacks)")
+        elif _svc_name:
+            print(f"  [Render] Keep-alive → {_primary_url}  (constructed from RENDER_SERVICE_NAME)")
         else:
-            print("  [Render] RENDER_EXTERNAL_URL not set — keep-alive disabled")
+            print(f"  [Render] Keep-alive → localhost:{port}  (RENDER_EXTERNAL_URL not set — using local fallback)")
+
 
     result = subprocess.run(
         [sys.executable, "-m", "stocking_app.cli", "run-engine"],

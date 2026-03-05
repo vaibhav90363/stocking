@@ -14,3 +14,9 @@ services:
         sync: false
       - key: PYTHONUNBUFFERED
         value: "true"
+      # Render injects these automatically — listed here so they propagate
+      # through subprocess.Popen env copies into child engine processes.
+      - key: RENDER_EXTERNAL_URL
+        sync: false
+      - key: RENDER_SERVICE_NAME
+        sync: false
