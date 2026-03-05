@@ -267,6 +267,19 @@ class TradingRepository:
                 END IF;
             END $$;
             """,
+            # symbol_state PRIMARY KEY — needed for ON CONFLICT(symbol)
+            # Databases created before this constraint existed will get it now.
+            """
+            DO $$ BEGIN
+                IF NOT EXISTS (
+                    SELECT 1 FROM pg_constraint
+                    WHERE conname = 'symbol_state_pkey'
+                    AND conrelid = 'symbol_state'::regclass
+                ) THEN
+                    ALTER TABLE symbol_state ADD PRIMARY KEY (symbol);
+                END IF;
+            END $$;
+            """,
         ]
         for _sql in _migrations:
             try:
