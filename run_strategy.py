@@ -201,78 +201,78 @@ def main():
         # Order: 0s → 90s → 180s based on sorted directory index.
         FETCH_DELAYS = [0, 90, 180]
 
-        # ── Render Web Service: Health endpoint + Keep-Alive self-ping ─────────────
+        # ── Web Service: Health endpoint + Keep-Alive self-ping ─────────────
         # Start this in the parent watchdog process BEFORE spawning children so
-        # Render sees the port open immediately and doesn't timeout during slow child DB inits.
-        if os.environ.get("RENDER") or os.environ.get("PORT"):
-            import threading
-            import json as _json
-            from http.server import HTTPServer, BaseHTTPRequestHandler
-            from datetime import datetime as _dt, timezone as _tz
+        # the host sees the port open immediately and doesn't timeout during slow child DB inits.
+        import threading
+        import json as _json
+        from http.server import HTTPServer, BaseHTTPRequestHandler
+        from datetime import datetime as _dt, timezone as _tz
 
-            _engine_start_time = _dt.now(_tz.utc).isoformat()
+        _engine_start_time = _dt.now(_tz.utc).isoformat()
 
-            class HealthCheckHandler(BaseHTTPRequestHandler):
-                def do_GET(self):
-                    payload = _json.dumps({
-                        "status":  "running",
-                        "service": "stocking-engine-watchdog",
-                        "started": _engine_start_time,
-                        "ts":      _dt.now(_tz.utc).isoformat(),
-                    }).encode()
-                    self.send_response(200)
-                    self.send_header("Content-Type", "application/json")
-                    self.send_header("Content-Length", str(len(payload)))
-                    self.end_headers()
-                    self.wfile.write(payload)
+        class HealthCheckHandler(BaseHTTPRequestHandler):
+            def do_GET(self):
+                payload = _json.dumps({
+                    "status":  "running",
+                    "service": "stocking-engine-watchdog",
+                    "started": _engine_start_time,
+                    "ts":      _dt.now(_tz.utc).isoformat(),
+                }).encode()
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(payload)))
+                self.end_headers()
+                self.wfile.write(payload)
 
-                def do_HEAD(self):
-                    self.send_response(200)
-                    self.send_header("Content-Type", "application/json")
-                    self.end_headers()
+            def do_HEAD(self):
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.end_headers()
 
-                def log_message(self, fmt, *args):
-                    pass
+            def log_message(self, fmt, *args):
+                pass
 
-            port = int(os.environ.get("PORT", 8080))
+        port = int(os.environ.get("PORT", 10000))
+        try:
             httpd = HTTPServer(("0.0.0.0", port), HealthCheckHandler)
-            print(f"  [Render] Health endpoint listening on port {port}")
+            print(f"  [Watchdog] Health endpoint listening on port {port}")
             threading.Thread(target=httpd.serve_forever, daemon=True).start()
+        except OSError as e:
+            print(f"  [Watchdog] ERROR binding health port {port}: {e}")
 
-            _ping_interval = 8 * 60
-            _ping_urls = []
-            _ext_url = os.environ.get("RENDER_EXTERNAL_URL", "").strip()
-            if _ext_url:
-                _ping_urls.append(_ext_url)
-            _svc_name = os.environ.get("RENDER_SERVICE_NAME", "").strip()
-            if _svc_name and not _ext_url:
-                _ping_urls.append(f"https://{_svc_name}.onrender.com")
-            _ping_urls.append(f"http://localhost:{port}")
+        _ping_interval = 8 * 60
+        _ping_urls = []
+        _ext_url = os.environ.get("RENDER_EXTERNAL_URL", "").strip()
+        if _ext_url:
+            _ping_urls.append(_ext_url)
+        _svc_name = os.environ.get("RENDER_SERVICE_NAME", "").strip()
+        if _svc_name and not _ext_url:
+            _ping_urls.append(f"https://{_svc_name}.onrender.com")
+        _ping_urls.append(f"http://localhost:{port}")
 
-            import urllib.request as _urllib
+        import urllib.request as _urllib
 
-            def _keep_alive_loop():
-                import time as _time
-                while True:
-                    _time.sleep(_ping_interval)
-                    for _url in _ping_urls:
-                        try:
-                            _urllib.urlopen(_url, timeout=10)
-                            print(f"  [keep-alive] Pinged {_url} ✓")
-                            break
-                        except Exception as _e:
-                            print(f"  [keep-alive] {_url} failed: {_e} — trying next …")
+        def _keep_alive_loop():
+            import time as _time
+            while True:
+                _time.sleep(_ping_interval)
+                for _url in _ping_urls:
+                    try:
+                        _urllib.urlopen(_url, timeout=10)
+                        print(f"  [keep-alive] Pinged {_url} ✓")
+                        break
+                    except Exception as _e:
+                        print(f"  [keep-alive] {_url} failed: {_e} — trying next …")
 
-            _ka = threading.Thread(target=_keep_alive_loop, daemon=True, name="keep-alive")
-            _ka.start()
+        _ka = threading.Thread(target=_keep_alive_loop, daemon=True, name="keep-alive")
+        _ka.start()
 
-            _primary_url = _ping_urls[0] if _ping_urls else f"http://localhost:{port}"
-            if _ext_url:
-                print(f"  [Render] Keep-alive → {_primary_url}  (every 8 min, +{len(_ping_urls)-1} fallbacks)")
-            elif _svc_name:
-                print(f"  [Render] Keep-alive → {_primary_url}  (constructed from RENDER_SERVICE_NAME)")
-            else:
-                print(f"  [Render] Keep-alive → localhost:{port}  (RENDER_EXTERNAL_URL not set — using local fallback)")
+        _primary_url = _ping_urls[0] if _ping_urls else f"http://localhost:{port}"
+        if _ext_url or _svc_name:
+            print(f"  [Render] Keep-alive → {_primary_url}  (every 8 min)")
+        else:
+            print(f"  [Watchdog] Keep-alive → {_primary_url}")
 
         # ── Build process specs ─────────────────────────────────────────────
         # Each spec holds everything needed to (re)spawn the process.
