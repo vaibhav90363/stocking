@@ -151,6 +151,21 @@ CREATE TABLE IF NOT EXISTS system_logs (
 CREATE INDEX IF NOT EXISTS idx_candles5m_symbol_ts  ON candles_5m (symbol, ts DESC);
 CREATE INDEX IF NOT EXISTS idx_symbol_state_pending ON symbol_state (symbol, last_candle_ts, last_compute_ts);
 CREATE INDEX IF NOT EXISTS idx_system_logs_suffix   ON system_logs  (suffix, id DESC);
+
+-- Daily candles table — one row per symbol per trading day.
+-- Stores 90 days of history without the memory cost of 5-minute bars
+-- (90 rows/symbol vs ~6750 rows/symbol at 5m resolution).
+CREATE TABLE IF NOT EXISTS candles_1d (
+    symbol TEXT NOT NULL,
+    ts     TEXT NOT NULL,   -- date string: YYYY-MM-DD
+    open   REAL NOT NULL,
+    high   REAL NOT NULL,
+    low    REAL NOT NULL,
+    close  REAL NOT NULL,
+    volume REAL,
+    PRIMARY KEY (symbol, ts)
+);
+CREATE INDEX IF NOT EXISTS idx_candles1d_symbol_ts ON candles_1d (symbol, ts DESC);
 """
 
 
@@ -464,6 +479,48 @@ class TradingRepository:
         return len(rows)
 
     @retry_on_disconnect()
+    def upsert_candles_1d(self, symbol: str, bars: pd.DataFrame) -> int:
+        """Upsert daily (1D) OHLCV bars into candles_1d for long-horizon compute."""
+        if bars.empty:
+            return 0
+        df = bars.reset_index()
+        df["symbol"] = symbol
+        ts_col = pd.to_datetime(df["ts" if "ts" in df.columns else df.columns[0]], utc=True)
+        # Store as date string YYYY-MM-DD for readability and small size
+        df["_ts_str"] = ts_col.dt.strftime("%Y-%m-%dT00:00:00+00:00")
+        if "volume" not in df.columns:
+            df["volume"] = 0.0
+        rows = list(
+            zip(
+                df["symbol"],
+                df["_ts_str"],
+                df["open"].astype(float),
+                df["high"].astype(float),
+                df["low"].astype(float),
+                df["close"].astype(float),
+                df["volume"].astype(float),
+            )
+        )
+        from psycopg2.extras import execute_values
+        with self.conn.cursor() as cur:
+            execute_values(
+                cur,
+                """
+                INSERT INTO candles_1d(symbol, ts, open, high, low, close, volume)
+                VALUES %s
+                ON CONFLICT(symbol, ts) DO UPDATE SET
+                    open=EXCLUDED.open,
+                    high=EXCLUDED.high,
+                    low=EXCLUDED.low,
+                    close=EXCLUDED.close,
+                    volume=EXCLUDED.volume
+                """,
+                rows,
+            )
+        self.conn.commit()
+        return len(rows)
+
+    @retry_on_disconnect()
     def mark_symbol_computed(self, symbol: str, asof_ts: str | None) -> None:
         now = utc_now_iso()
         with self.conn.cursor() as cur:
@@ -529,6 +586,75 @@ class TradingRepository:
             )
             rows = cur.fetchall()
         return [r["symbol"] for r in rows]
+
+    @retry_on_disconnect()
+    def get_combined_bars_for_symbol(
+        self,
+        symbol: str,
+        daily_lookback_days: int = 90,
+        recent_5m_days: int = 3,
+    ) -> pd.DataFrame:
+        """Return a merged DataFrame of daily + recent 5m bars for a single symbol.
+
+        Layout:
+          - candles_1d rows older than `recent_5m_days` days (daily OHLCV)
+          - candles_5m rows from the last `recent_5m_days` days (5-minute OHLCV)
+
+        The combined DataFrame can be passed directly to compute_symbol_signal;
+        strategy.py resamples to daily/weekly internally, and resampling daily bars
+        with resample('1D') returns the same bar unchanged — so no strategy changes needed.
+        """
+        import pandas as pd
+        from datetime import datetime, timedelta, timezone
+
+        now = datetime.now(timezone.utc)
+        daily_cutoff = (now - timedelta(days=daily_lookback_days)).replace(microsecond=0).isoformat()
+        recent_cutoff = (now - timedelta(days=recent_5m_days)).replace(microsecond=0).isoformat()
+
+        with self.conn.cursor() as cur:
+            # Fetch daily bars for the full lookback window (old history)
+            cur.execute(
+                """
+                SELECT ts, open, high, low, close, volume
+                FROM candles_1d
+                WHERE symbol = %s AND ts >= %s AND ts < %s
+                ORDER BY ts
+                """,
+                (symbol, daily_cutoff, recent_cutoff),
+            )
+            daily_rows = cur.fetchall()
+
+            # Fetch 5m bars for the recent window only
+            cur.execute(
+                """
+                SELECT ts, open, high, low, close, volume
+                FROM candles_5m
+                WHERE symbol = %s AND ts >= %s
+                ORDER BY ts
+                """,
+                (symbol, recent_cutoff),
+            )
+            recent_rows = cur.fetchall()
+
+        if not daily_rows and not recent_rows:
+            return pd.DataFrame()
+
+        chunks: list[pd.DataFrame] = []
+        if daily_rows:
+            df_daily = pd.DataFrame([dict(r) for r in daily_rows])
+            df_daily["ts"] = pd.to_datetime(df_daily["ts"], utc=True)
+            df_daily = df_daily.set_index("ts")
+            chunks.append(df_daily)
+
+        if recent_rows:
+            df_5m = pd.DataFrame([dict(r) for r in recent_rows])
+            df_5m["ts"] = pd.to_datetime(df_5m["ts"], utc=True)
+            df_5m = df_5m.set_index("ts")
+            chunks.append(df_5m)
+
+        combined = pd.concat(chunks).sort_index()
+        combined = combined[~combined.index.duplicated(keep="last")]
+        return combined
 
     @retry_on_disconnect()
     def get_all_candles_for_symbols(self, symbols: list[str], lookback_days: int) -> pd.DataFrame:

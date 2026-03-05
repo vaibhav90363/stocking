@@ -25,6 +25,10 @@ class AppConfig:
     # Per-engine fetch stagger: delay this engine's first fetch by N seconds so
     # all 3 engines don't burst Yahoo Finance simultaneously from the same IP.
     fetch_start_delay_seconds: int = 0
+    # Daily-bar lookback: how many calendar days of 1d bars to fetch & store.
+    # Used for long-horizon weekly fractal computation without loading 5m bars
+    # for 90 days (which would OOM Render's 512 MB free tier).
+    daily_lookback_days: int = 90
 
 
 
@@ -67,4 +71,5 @@ def load_config() -> AppConfig:
         market_close=os.getenv("STOCKING_MARKET_CLOSE", def_close),
         auto_schedule=os.getenv("STOCKING_AUTO_SCHEDULE", "1") not in ("0", "false", "False"),
         fetch_start_delay_seconds=int(os.getenv("STOCKING_FETCH_START_DELAY", "0")),
+        daily_lookback_days=int(os.getenv("STOCKING_DAILY_LOOKBACK_DAYS", "90")),
     )

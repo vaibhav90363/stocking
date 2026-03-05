@@ -14,7 +14,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from .config import AppConfig, load_config
-from .data_fetcher import FetchResult, fetch_5m_bars_async_gen
+from .data_fetcher import FetchResult, fetch_5m_bars_async_gen, fetch_daily_bars_async_gen
 from .db import SignalRecord, TradingRepository, utc_now_iso
 from .market_schedule import market_status as get_market_status
 from .strategy import compute_symbol_signal
@@ -389,6 +389,41 @@ class ScalableEngine:
             + (f"  | {len(failed_symbols)} failed: {', '.join(failed_symbols[:5])}" if failed_symbols else "")
         )
 
+        # ── Phase 1b: Daily bars fetch ────────────────────────────────────────
+        # Fetch 90 days of daily bars (one row/symbol/day) for the long-horizon
+        # weekly fractal calculation. These are stored in candles_1d and merged
+        # with the recent 5m bars at compute time — saving ~99% memory vs fetching
+        # 90d of 5m bars.
+        self.log.info(f"  [1b/3] FETCH 1d — {total} symbols  (lookback={self.cfg.daily_lookback_days}d)")
+        daily_fetch_start = time.monotonic()
+        daily_fetched = 0
+        daily_failed = 0
+
+        async def _run_daily_fetcher():
+            nonlocal daily_fetched, daily_failed
+            gen = fetch_daily_bars_async_gen(
+                symbols,
+                lookback_days=self.cfg.daily_lookback_days,
+                max_concurrency=self.cfg.max_fetch_concurrency,
+            )
+            good_daily: list[FetchResult] = []
+            async for result in gen:
+                if result.error or result.bars.empty:
+                    daily_failed += 1
+                else:
+                    good_daily.append(result)
+            for result in good_daily:
+                self.repo.upsert_candles_1d(result.symbol, result.bars)
+                daily_fetched += 1
+
+        asyncio.run(_run_daily_fetcher())
+        daily_fetch_seconds = time.monotonic() - daily_fetch_start
+        self.log.info(
+            f"       ✓ {daily_fetched}/{total} daily fetched  "
+            f"| {daily_fetch_seconds:.1f}s"
+            + (f"  | {daily_failed} failed" if daily_failed else "")
+        )
+
         symbols_to_compute = self.repo.get_symbols_pending_compute(fetched_symbols)
         self.log.info(f"  [2/3] COMPUTE — {len(symbols_to_compute)} symbols pending")
         
@@ -403,24 +438,22 @@ class ScalableEngine:
 
         compute_start = time.monotonic()
         compute_payloads: list[dict[str, Any]] = []
-        
-        # Pre-load all required historical data via ONE vectorized query
-        # This replaces N separate DB connections/queries inside the workers.
-        self.log.debug(f"Pre-loading historical candles for {len(symbols_to_compute)} symbols...")
-        historical_data = self.repo.get_all_candles_for_symbols(symbols_to_compute, self.cfg.compute_lookback_days)
-        
+
+        # ── Per-symbol combined bar fetch then compute ────────────────────────
+        # get_combined_bars_for_symbol returns daily bars (old history) +
+        # 5m bars (last 3 days) merged into one DataFrame. This gives the
+        # strategy 90 days of history for weekly fractal calculation while
+        # keeping memory constant per symbol (not per all-symbols-at-once).
+        self.log.debug(f"Fetching combined bars for {len(symbols_to_compute)} symbols...")
+
         futures = {}
         for symbol in symbols_to_compute:
-            # Slice the master DataFrame for this specific symbol
-            if not historical_data.empty and symbol in historical_data['symbol'].values:
-                df_symbol = historical_data[historical_data['symbol'] == symbol].copy()
-                # Restore the TS index expected by the strategy
-                df_symbol = df_symbol.set_index('ts')
-            else:
-                import pandas as pd
-                df_symbol = pd.DataFrame()
+            df_symbol = self.repo.get_combined_bars_for_symbol(
+                symbol,
+                daily_lookback_days=self.cfg.daily_lookback_days,
+                recent_5m_days=self.cfg.fetch_lookback_days,
+            )
 
-            # Submit the pure mathematical function to the executor (No I/O)
             fut = self.executor.submit(
                 compute_symbol_signal,
                 symbol,

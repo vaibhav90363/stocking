@@ -189,3 +189,114 @@ async def fetch_5m_bars_async_gen(
         batch_results = await completed_task
         for r in batch_results:
             yield r
+
+
+def _fetch_daily_batch_blocking(
+    batch: list[str], lookback_days: int, batch_index: int = 0
+) -> list[FetchResult]:
+    """Fetch daily (1d interval) bars for a batch of symbols.
+
+    Daily bars are tiny (~90 rows/symbol), so we use larger batches and higher
+    concurrency than 5m bars. Same retry/backoff pattern.
+    """
+    if not batch:
+        return []
+
+    stagger_sleep = batch_index * 0.5 + random.uniform(0.0, 0.3)
+    time.sleep(stagger_sleep)
+
+    yahoo_to_engine: dict[str, str] = {}
+    yahoo_symbols: list[str] = []
+    for sym in batch:
+        y_sym = sym[:-3] if sym.endswith(".US") else sym
+        yahoo_symbols.append(y_sym)
+        yahoo_to_engine[y_sym] = sym
+
+    MAX_RETRIES = 3
+    BACKOFF_BASE = 5  # shorter backoff for daily — less rate-limit risk
+
+    last_exc: Exception | None = None
+    for attempt in range(MAX_RETRIES):
+        try:
+            data = yf.download(
+                tickers=" ".join(yahoo_symbols),
+                period=f"{lookback_days}d",
+                interval="1d",
+                auto_adjust=True,
+                prepost=False,
+                group_by="ticker",
+                threads=False,
+                progress=False,
+                timeout=30,
+            )
+
+            is_multi = isinstance(data.columns, pd.MultiIndex)
+            results: list[FetchResult] = []
+            for y_sym in yahoo_symbols:
+                engine_sym = yahoo_to_engine[y_sym]
+                try:
+                    if is_multi:
+                        if y_sym in data.columns.get_level_values("Ticker"):
+                            df = data[y_sym].copy()
+                        else:
+                            results.append(FetchResult(symbol=engine_sym, bars=pd.DataFrame(), error="Not found in Yahoo batch"))
+                            continue
+                    else:
+                        df = data.copy() if len(yahoo_symbols) == 1 else pd.DataFrame()
+
+                    df = df.dropna(how="all")
+                    bars = _normalize_ohlcv(df)
+                    if bars.empty:
+                        results.append(FetchResult(symbol=engine_sym, bars=bars, error="No daily candles returned"))
+                    else:
+                        results.append(FetchResult(symbol=engine_sym, bars=bars, error=None))
+                except Exception as e:
+                    results.append(FetchResult(symbol=engine_sym, bars=pd.DataFrame(), error=f"Parse error: {e}"))
+            return results
+
+        except Exception as exc:
+            last_exc = exc
+            if attempt < MAX_RETRIES - 1:
+                wait = BACKOFF_BASE * (2 ** attempt) + random.uniform(0, 2)
+                time.sleep(wait)
+            else:
+                break
+
+    return [
+        FetchResult(symbol=sym, bars=pd.DataFrame(), error=f"Daily batch API error after {MAX_RETRIES} retries: {last_exc}")
+        for sym in batch
+    ]
+
+
+async def fetch_daily_bars_async_gen(
+    symbols: list[str], lookback_days: int, max_concurrency: int = 5
+) -> AsyncGenerator[FetchResult, None]:
+    """Async generator that fetches daily (1d) bars for all symbols in larger batches.
+
+    Daily bars are ~75× smaller than 5m bars so we use bigger batches (50 symbols)
+    and higher concurrency — Yahoo is far more lenient with daily interval requests.
+    """
+    BATCH_SIZE = 50  # 50 symbols per request is fine for daily interval
+
+    batches = [symbols[i : i + BATCH_SIZE] for i in range(0, len(symbols), BATCH_SIZE)]
+    effective_concurrency = min(max_concurrency, 5)
+    semaphore = asyncio.Semaphore(max(1, effective_concurrency))
+
+    async def _wrapped(batch: list[str], idx: int) -> list[FetchResult]:
+        async with semaphore:
+            try:
+                return await asyncio.wait_for(
+                    asyncio.to_thread(_fetch_daily_batch_blocking, batch, lookback_days, idx),
+                    timeout=60.0,
+                )
+            except asyncio.TimeoutError:
+                return [FetchResult(symbol=s, bars=pd.DataFrame(), error="Daily batch timed out") for s in batch]
+            except Exception as exc:
+                return [FetchResult(symbol=s, bars=pd.DataFrame(), error=f"Daily batch failed: {exc}") for s in batch]
+
+    tasks = [_wrapped(b, i) for i, b in enumerate(batches)]
+    for completed_task in asyncio.as_completed(tasks):
+        batch_results = await completed_task
+        for r in batch_results:
+            yield r
+
