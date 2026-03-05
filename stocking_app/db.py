@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import threading
 import psycopg2
 from psycopg2.extras import RealDictCursor
 from dataclasses import dataclass
@@ -17,31 +18,47 @@ def utc_now_iso() -> str:
 
 
 def retry_on_disconnect(max_retries=3):
-    """Decorator to catch 'server closed the connection unexpectedly' errors and reconnect."""
+    """Decorator to catch 'server closed the connection unexpectedly' errors and reconnect.
+
+    BUG-01 fix: guard against max_retries=0 (last_err stays None) by raising a
+    RuntimeError if we exit the retry loop without ever capturing an exception.
+    BUG-02 fix: acquire the instance-level _lock before calling the wrapped method
+    so that the main thread and worker threads never share the DB connection concurrently.
+    """
     def decorator(func):
         from functools import wraps
         @wraps(func)
         def wrapper(self, *args, **kwargs):
             import psycopg2
             import time
-            last_err = None
-            for attempt in range(max_retries):
-                try:
-                    self._ensure_connection()
-                    return func(self, *args, **kwargs)
-                except (psycopg2.OperationalError, psycopg2.InterfaceError) as e:
-                    last_err = e
-                    # Connection dropped - wipe it so _ensure_connection opens a new one
-                    if self.conn:
-                        try:
-                            self.conn.close()
-                        except Exception:
-                            pass
-                    self.conn = None
-                    # Exponential backoff: 0.5s, 1s, 2s between retries
-                    if attempt < max_retries - 1:
-                        time.sleep(0.5 * (2 ** attempt))
-            raise last_err
+            # BUG-02: serialise all DB access through an instance lock.
+            # On 512 MB / 0.15 CPU (compute_workers=1) this is rarely contended
+            # but protects the heartbeat writes that fire from the main thread
+            # while the single worker thread may still be reading cursor data.
+            with self._lock:
+                last_err = None
+                for attempt in range(max_retries):
+                    try:
+                        self._ensure_connection()
+                        return func(self, *args, **kwargs)
+                    except (psycopg2.OperationalError, psycopg2.InterfaceError) as e:
+                        last_err = e
+                        # Connection dropped — wipe so _ensure_connection reopens
+                        if self.conn:
+                            try:
+                                self.conn.close()
+                            except Exception:
+                                pass
+                        self.conn = None
+                        # Exponential backoff: 0.5s, 1s, 2s
+                        if attempt < max_retries - 1:
+                            time.sleep(0.5 * (2 ** attempt))
+                # BUG-01: last_err is None only when max_retries=0; raise clearly.
+                if last_err is None:
+                    raise RuntimeError(
+                        f"{func.__name__}: retry_on_disconnect called with max_retries=0"
+                    )
+                raise last_err
         return wrapper
     return decorator
 
@@ -179,23 +196,30 @@ class SignalRecord:
 
 
 class TradingRepository:
-    # Class-level cache of connection pools by database URL
+    # BUG-03 fix: class-level lock guards pool creation so two threads cannot
+    # race to build the same ThreadedConnectionPool simultaneously.
+    _pool_lock: threading.Lock = threading.Lock()
     _pools: dict[str, ThreadedConnectionPool] = {}
 
     @classmethod
     def get_pool(cls, db_url: str) -> ThreadedConnectionPool:
         from psycopg2.extras import RealDictCursor
-        if db_url not in cls._pools:
-            cls._pools[db_url] = ThreadedConnectionPool(
-                minconn=1,
-                maxconn=20,     # Safely within Supabase free-tier limits, spread across workers
-                dsn=db_url,
-                cursor_factory=RealDictCursor,
-                keepalives=1,
-                keepalives_idle=60,
-                keepalives_interval=10,
-                keepalives_count=5
-            )
+        # Fast path — pool already exists (no lock needed, dict reads are safe in CPython)
+        if db_url in cls._pools:
+            return cls._pools[db_url]
+        # Slow path — first call for this URL, acquire lock to prevent double-creation
+        with cls._pool_lock:
+            if db_url not in cls._pools:  # double-checked locking
+                cls._pools[db_url] = ThreadedConnectionPool(
+                    minconn=1,
+                    maxconn=20,  # within Supabase free-tier limits
+                    dsn=db_url,
+                    cursor_factory=RealDictCursor,
+                    keepalives=1,
+                    keepalives_idle=60,
+                    keepalives_interval=10,
+                    keepalives_count=5,
+                )
         return cls._pools[db_url]
 
     def __init__(self, db_path_or_url: str | Path, suffix: str = ".NS"):
@@ -208,6 +232,9 @@ class TradingRepository:
 
         self.suffix = suffix
         self.conn = None
+        # BUG-02 fix: per-instance lock serialises all DB calls. A threading.Lock
+        # is ~56 bytes — negligible on the 512 MB budget.
+        self._lock: threading.Lock = threading.Lock()
         self._ensure_connection()
 
     def _ensure_connection(self) -> None:
@@ -431,8 +458,12 @@ class TradingRepository:
         # This is ~50x faster for large DataFrames and uses far less transient memory.
         df = bars.reset_index()
         df["symbol"] = symbol
-        # Convert DatetimeTzDtype index to ISO string — vectorized via strftime
-        ts_col = pd.to_datetime(df["ts" if "ts" in df.columns else df.columns[0]], utc=True)
+        # BUG-11 fix: explicitly look for known timestamp column names from yfinance
+        # ('Datetime', 'Date', 'ts') before falling back to df.columns[0], which
+        # could silently pick the wrong column if the DataFrame shape is unexpected.
+        _ts_candidates = ["ts", "Datetime", "Date", "datetime", "date"]
+        _ts_name = next((c for c in _ts_candidates if c in df.columns), df.columns[0])
+        ts_col = pd.to_datetime(df[_ts_name], utc=True)
         df["_ts_str"] = ts_col.dt.strftime("%Y-%m-%dT%H:%M:%S+00:00")
         if "volume" not in df.columns:
             df["volume"] = 0.0
@@ -594,67 +625,110 @@ class TradingRepository:
         daily_lookback_days: int = 90,
         recent_5m_days: int = 3,
     ) -> pd.DataFrame:
-        """Return a merged DataFrame of daily + recent 5m bars for a single symbol.
+        """Return a merged DataFrame of daily + recent 5m bars for a single symbol."""
+        result = self.get_combined_bars_for_symbols(
+            [symbol],
+            daily_lookback_days=daily_lookback_days,
+            recent_5m_days=recent_5m_days,
+        )
+        return result.get(symbol, pd.DataFrame())
 
-        Layout:
-          - candles_1d rows older than `recent_5m_days` days (daily OHLCV)
-          - candles_5m rows from the last `recent_5m_days` days (5-minute OHLCV)
+    @retry_on_disconnect()
+    def get_combined_bars_for_symbols(
+        self,
+        symbols: list[str],
+        daily_lookback_days: int = 90,
+        recent_5m_days: int = 3,
+    ) -> "dict[str, pd.DataFrame]":
+        """BUG-10 fix: Bulk-load daily + 5m bars for ALL symbols in 2 DB round-trips.
 
-        The combined DataFrame can be passed directly to compute_symbol_signal;
-        strategy.py resamples to daily/weekly internally, and resampling daily bars
-        with resample('1D') returns the same bar unchanged — so no strategy changes needed.
+        Previously the engine made N individual get_combined_bars_for_symbol() calls
+        (one per symbol) before any compute thread could start, adding 1.5-7.5s of
+        serial DB wait for 100-500 symbols. This replaces those N calls with:
+          - 1 query for all candles_1d rows across all symbols
+          - 1 query for all candles_5m rows across all symbols
+
+        BUG-20 fix: daily_cutoff is normalized to midnight UTC so string comparison
+        with stored ts (YYYY-MM-DDT00:00:00+00:00) is correct and the boundary day
+        is not silently excluded.
+
+        Returns a dict {symbol: DataFrame} ready for immediate dispatch to compute threads.
+        Symbols with no data map to an empty DataFrame.
         """
-        import pandas as pd
+        from collections import defaultdict
         from datetime import datetime, timedelta, timezone
 
+        if not symbols:
+            return {}
+
         now = datetime.now(timezone.utc)
-        daily_cutoff = (now - timedelta(days=daily_lookback_days)).replace(microsecond=0).isoformat()
+        # BUG-20: normalize to midnight so string compare with stored 00:00 ts is correct
+        daily_cutoff = (now - timedelta(days=daily_lookback_days)).replace(
+            hour=0, minute=0, second=0, microsecond=0
+        ).isoformat()
         recent_cutoff = (now - timedelta(days=recent_5m_days)).replace(microsecond=0).isoformat()
 
         with self.conn.cursor() as cur:
-            # Fetch daily bars for the full lookback window (old history)
+            # Round-trip 1: all daily bars for all symbols
             cur.execute(
                 """
-                SELECT ts, open, high, low, close, volume
+                SELECT symbol, ts, open, high, low, close, volume
                 FROM candles_1d
-                WHERE symbol = %s AND ts >= %s AND ts < %s
-                ORDER BY ts
+                WHERE symbol = ANY(%s) AND ts >= %s AND ts < %s
+                ORDER BY symbol, ts
                 """,
-                (symbol, daily_cutoff, recent_cutoff),
+                (symbols, daily_cutoff, recent_cutoff),
             )
             daily_rows = cur.fetchall()
 
-            # Fetch 5m bars for the recent window only
+            # Round-trip 2: all recent 5m bars for all symbols
             cur.execute(
                 """
-                SELECT ts, open, high, low, close, volume
+                SELECT symbol, ts, open, high, low, close, volume
                 FROM candles_5m
-                WHERE symbol = %s AND ts >= %s
-                ORDER BY ts
+                WHERE symbol = ANY(%s) AND ts >= %s
+                ORDER BY symbol, ts
                 """,
-                (symbol, recent_cutoff),
+                (symbols, recent_cutoff),
             )
             recent_rows = cur.fetchall()
 
-        if not daily_rows and not recent_rows:
-            return pd.DataFrame()
+        # Group rows by symbol in Python
+        daily_by_sym: dict = defaultdict(list)
+        for r in daily_rows:
+            daily_by_sym[r["symbol"]].append(dict(r))
 
-        chunks: list[pd.DataFrame] = []
-        if daily_rows:
-            df_daily = pd.DataFrame([dict(r) for r in daily_rows])
-            df_daily["ts"] = pd.to_datetime(df_daily["ts"], utc=True)
-            df_daily = df_daily.set_index("ts")
-            chunks.append(df_daily)
+        recent_by_sym: dict = defaultdict(list)
+        for r in recent_rows:
+            recent_by_sym[r["symbol"]].append(dict(r))
 
-        if recent_rows:
-            df_5m = pd.DataFrame([dict(r) for r in recent_rows])
-            df_5m["ts"] = pd.to_datetime(df_5m["ts"], utc=True)
-            df_5m = df_5m.set_index("ts")
-            chunks.append(df_5m)
+        result: dict = {}
+        all_syms = set(daily_by_sym) | set(recent_by_sym)
 
-        combined = pd.concat(chunks).sort_index()
-        combined = combined[~combined.index.duplicated(keep="last")]
-        return combined
+        for sym in all_syms:
+            chunks = []
+            if daily_by_sym[sym]:
+                df_d = pd.DataFrame(daily_by_sym[sym]).drop(columns=["symbol"], errors="ignore")
+                df_d["ts"] = pd.to_datetime(df_d["ts"], utc=True)
+                df_d = df_d.set_index("ts")
+                chunks.append(df_d)
+            if recent_by_sym[sym]:
+                df_r = pd.DataFrame(recent_by_sym[sym]).drop(columns=["symbol"], errors="ignore")
+                df_r["ts"] = pd.to_datetime(df_r["ts"], utc=True)
+                df_r = df_r.set_index("ts")
+                chunks.append(df_r)
+            if chunks:
+                combined = pd.concat(chunks).sort_index()
+                combined = combined[~combined.index.duplicated(keep="last")]
+                result[sym] = combined
+
+        # Symbols with no data at all
+        for sym in symbols:
+            if sym not in result:
+                result[sym] = pd.DataFrame()
+
+        return result
+
 
     @retry_on_disconnect()
     def get_all_candles_for_symbols(self, symbols: list[str], lookback_days: int) -> pd.DataFrame:
@@ -761,9 +835,13 @@ class TradingRepository:
                 """,
                 (symbol, qty, price, ts, reason, now),
             )
+        # BUG-05 fix: commit immediately so the position is durable before
+        # returning. Previously committed by the end-of-loop commit() — a crash
+        # between execute_buy and that commit would silently lose the position.
+        self.conn.commit()
 
     @retry_on_disconnect()
-    def execute_sell(self, symbol: str, price: float, ts: str, reason: str) -> float | None:
+    def execute_sell(self, symbol: str, price: float, ts: str, reason: str) -> "float | None":
         with self.conn.cursor() as cur:
             cur.execute("SELECT symbol, qty, avg_price FROM positions_ledger WHERE symbol=%s", (symbol,))
             row = cur.fetchone()
@@ -783,6 +861,8 @@ class TradingRepository:
                 """,
                 (symbol, qty, price, ts, pnl, reason, now),
             )
+        # BUG-05 fix: commit immediately so the closed position is durable.
+        self.conn.commit()
         return pnl
 
     @retry_on_disconnect()
@@ -901,6 +981,11 @@ class TradingRepository:
 
     @retry_on_disconnect()
     def insert_log(self, level: str, message: str) -> None:
+        # BUG-19 fix: commit immediately so log entries survive a crash between
+        # heartbeat commits. The overhead is one extra round-trip per log line;
+        # since logs are infrequent (only ERROR/WARNING in production) this is
+        # acceptable on the 0.15 CPU budget. INFO-level logs can be buffered
+        # by the caller if needed, but the DB handler always commits.
         now = utc_now_iso()
         with self.conn.cursor() as cur:
             cur.execute(
@@ -910,9 +995,7 @@ class TradingRepository:
                 """,
                 (now, level, self.suffix, message),
             )
-        # NOTE: No commit here — logs piggyback on the next natural commit (heartbeat,
-        # candle upsert, etc.) to avoid ~15 extra round-trips per cycle. In the rare case
-        # of a crash before commit the log entry is lost, which is acceptable.
+        self.conn.commit()
 
     @retry_on_disconnect()
     def get_recent_logs(self, limit: int = 200) -> pd.DataFrame:

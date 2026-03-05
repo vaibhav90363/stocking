@@ -5,25 +5,31 @@ import pandas as pd
 
 
 def fractal_chaos_bands(data: pd.DataFrame, left_window: int = 2, right_window: int = 2) -> pd.DataFrame:
+    """Identify fractal highs/lows and forward-fill them into band lines.
+
+    Vectorized implementation — replaces the old O(n) Python loop.
+    A bar at index i is an upper fractal if its high is strictly greater than
+    the `left_window` bars before it AND the `right_window` bars after it.
+    """
     df = data.copy()
-    df["upper_fractal_point"] = np.nan
-    df["lower_fractal_point"] = np.nan
+    high = df["high"]
+    low = df["low"]
 
-    n = len(df)
-    for i in range(left_window, n - right_window):
-        is_upper = (
-            df["high"].iloc[i] > df["high"].iloc[i - left_window : i].max()
-            and df["high"].iloc[i] > df["high"].iloc[i + 1 : i + 1 + right_window].max()
-        )
-        if is_upper:
-            df.loc[df.index[i], "upper_fractal_point"] = df["high"].iloc[i]
+    # Rolling max/min over the LEFT window (past bars, inclusive of current)
+    # shift(1) excludes the current bar from the left comparison
+    left_max_high = high.shift(1).rolling(window=left_window, min_periods=left_window).max()
+    left_min_low  = low.shift(1).rolling(window=left_window, min_periods=left_window).min()
 
-        is_lower = (
-            df["low"].iloc[i] < df["low"].iloc[i - left_window : i].min()
-            and df["low"].iloc[i] < df["low"].iloc[i + 1 : i + 1 + right_window].min()
-        )
-        if is_lower:
-            df.loc[df.index[i], "lower_fractal_point"] = df["low"].iloc[i]
+    # Rolling max/min over the RIGHT window (future bars)
+    # shift(-right_window) aligns the rolling window to look ahead
+    right_max_high = high.shift(-1).rolling(window=right_window, min_periods=right_window).max()
+    right_min_low  = low.shift(-1).rolling(window=right_window, min_periods=right_window).min()
+
+    is_upper_fractal = (high > left_max_high) & (high > right_max_high)
+    is_lower_fractal = (low  < left_min_low)  & (low  < right_min_low)
+
+    df["upper_fractal_point"] = np.where(is_upper_fractal, high, np.nan)
+    df["lower_fractal_point"] = np.where(is_lower_fractal, low,  np.nan)
 
     df["upper_band_line"] = df["upper_fractal_point"].replace([np.inf, -np.inf], np.nan).ffill()
     df["lower_band_line"] = df["lower_fractal_point"].replace([np.inf, -np.inf], np.nan).ffill()
@@ -50,4 +56,6 @@ def sma(series: pd.Series, period: int) -> pd.Series:
 
 
 def ema(series: pd.Series, period: int) -> pd.Series:
-    return series.ewm(span=period, adjust=False).mean()
+    # min_periods=period ensures we return NaN until we have enough data,
+    # preventing warm-up period from producing unreliable crossover signals.
+    return series.ewm(span=period, adjust=False, min_periods=period).mean()

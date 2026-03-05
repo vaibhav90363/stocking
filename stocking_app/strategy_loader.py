@@ -59,7 +59,7 @@ class StrategyConfig:
             db_path=self.db_path,
             database_url=database_url,
             cycle_seconds=self.cycle_seconds,
-            disabled_poll_seconds=5,
+            disabled_poll_seconds=60,  # match STOCKING_DISABLED_POLL_SECONDS env default
             fetch_lookback_days=self.fetch_lookback_days,
             compute_lookback_days=self.compute_lookback_days,
             max_fetch_concurrency=self.fetch_concurrency,
@@ -161,30 +161,59 @@ def _parse_yaml(path: Path) -> dict:
 
 def _minimal_yaml(text: str) -> dict:
     """
-    Parse simple YAML (no lists-of-objects, no anchors) sufficient for strategy.yaml.
-    Handles nested dicts via indentation and scalar values.
+    Parse simple YAML (no anchors) sufficient for strategy.yaml.
+    Handles nested dicts via indentation, scalar values, and block lists.
+
+    BUG-18 fix: lines starting with '- ' are now collected as list items
+    and attached to the most recent parent key, so list-valued YAML fields
+    (e.g. 'symbols:' followed by '  - AAPL') are not silently dropped.
     """
     result: dict = {}
     stack: list[tuple[int, dict]] = [(0, result)]
+    last_key: str | None = None
+    last_parent: dict | None = None
 
     for raw_line in text.splitlines():
         line = raw_line.rstrip()
         if not line or line.lstrip().startswith("#"):
             continue
-        # Detect indentation level
         indent = len(line) - len(line.lstrip())
         stripped = line.strip()
+
+        # BUG-18: handle list items ( "  - value" lines )
+        if stripped.startswith("- "):
+            item_val = stripped[2:].strip().strip('"').strip("'")
+            # Try numeric conversion for list items too
+            if item_val.lower() in ("true", "yes"):
+                item: Any = True
+            elif item_val.lower() in ("false", "no"):
+                item = False
+            elif item_val.replace("-", "").replace(".", "").isnumeric():
+                item = float(item_val) if "." in item_val else int(item_val)
+            else:
+                item = item_val
+            # Attach to the most recent key in the current scope
+            if last_key and last_parent is not None:
+                existing = last_parent.get(last_key)
+                if isinstance(existing, list):
+                    existing.append(item)
+                else:
+                    last_parent[last_key] = [item]
+            continue
+
         if ":" not in stripped:
             continue
         key, _, val = stripped.partition(":")
         key = key.strip()
         val = val.strip().strip('"').strip("'")
 
-        # Pop stack to current indent level (strictly greater so parent stays)
+        # Pop stack to current indent level
         while len(stack) > 1 and stack[-1][0] > indent:
             stack.pop()
 
         parent_dict = stack[-1][1]
+        last_parent = parent_dict
+        last_key = key
 
         if not val or val.startswith(">"):
             # Nested block

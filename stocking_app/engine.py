@@ -156,8 +156,15 @@ class ScalableEngine:
             time.sleep(self.cfg.fetch_start_delay_seconds)
 
         cycle_num = 0
-        consecutive_zero_fetches = 0  # circuit-breaker counter
-        ZERO_FETCH_WARN_THRESHOLD = 3
+        consecutive_zero_fetches = 0   # BUG-09: circuit-breaker counter
+        ZERO_FETCH_WARN_THRESHOLD = 3  # warn after 3 all-failed cycles in a row
+        ZERO_FETCH_SLEEP_EXTRA = 60    # extra sleep when Yahoo appears down
+        # BUG-07: track symbols that consistently return empty bars (de-listed / bad ticker).
+        # After DEAD_SYMBOL_THRESHOLD empty fetches in a row the symbol is skipped in all
+        # subsequent cycles. Pure in-RAM set — no DB writes, negligible memory at 100-500 syms.
+        _empty_fetch_counts: dict[str, int] = {}
+        _dead_symbols: set[str] = set()
+        DEAD_SYMBOL_THRESHOLD = 5
         while self._running:
             # ── Market-hours auto-scheduler ─────────────────────────────────
             mkt = get_market_status(
@@ -320,13 +327,19 @@ class ScalableEngine:
 
         fetch_start = time.monotonic()
 
+        # BUG-07 fix: skip symbols that have consistently returned empty bars.
+        # _dead_symbols / _empty_fetch_counts are maintained across cycles in run_forever.
+        live_symbols = [s for s in symbols if s not in _dead_symbols]
+        if len(live_symbols) < len(symbols):
+            self.log.debug(f"  Skipping {len(symbols)-len(live_symbols)} dead/de-listed symbols.")
+
         fetched_symbols: list[str] = []
         failed_symbols: list[str] = []
         state = {"total_bars": 0}
 
         async def _run_fetcher():
             gen = fetch_5m_bars_async_gen(
-                symbols,
+                live_symbols,
                 lookback_days=self.cfg.fetch_lookback_days,
                 max_concurrency=self.cfg.max_fetch_concurrency,
             )
@@ -359,6 +372,18 @@ class ScalableEngine:
                 self.repo.upsert_candles(result.symbol, result.bars)
                 fetched_symbols.append(result.symbol)
                 state["total_bars"] += len(result.bars)
+                # BUG-07: successful fetch resets the dead-symbol counter
+                _empty_fetch_counts.pop(result.symbol, None)
+
+            # BUG-07: increment counters for symbols that returned nothing
+            for sym in failed_symbols:
+                _empty_fetch_counts[sym] = _empty_fetch_counts.get(sym, 0) + 1
+                if _empty_fetch_counts[sym] >= DEAD_SYMBOL_THRESHOLD and sym not in _dead_symbols:
+                    _dead_symbols.add(sym)
+                    self.log.warning(
+                        f"  ⚠ {sym}: empty fetch for {DEAD_SYMBOL_THRESHOLD} consecutive cycles. "
+                        f"Treating as de-listed — skipping in future cycles."
+                    )
         
         # ── Background DB keepalive during fetch ──────────────────────────────
         # Supabase/PgBouncer kills idle connections after ~5 minutes.
@@ -370,7 +395,8 @@ class ScalableEngine:
             while not _keepalive_stop.wait(timeout=30):
                 self.repo.keepalive_ping()
 
-        import asyncio
+        # BUG-15 fix: asyncio is already imported at module level (line 3).
+        # Removed duplicate `import asyncio` that was inside this function.
         _ka_thread = threading.Thread(target=_keepalive_worker, daemon=True, name="db-keepalive")
         _ka_thread.start()
 
@@ -382,6 +408,20 @@ class ScalableEngine:
 
         fetch_seconds = time.monotonic() - fetch_start
 
+        # BUG-09: circuit-breaker — if Yahoo Finance returns nothing at all
+        # for several cycles in a row, log a warning and sleep extra to avoid
+        # hammering Supabase with useless heartbeat writes during an outage.
+        if not fetched_symbols:
+            consecutive_zero_fetches += 1
+            if consecutive_zero_fetches >= ZERO_FETCH_WARN_THRESHOLD:
+                self.log.warning(
+                    f"  ⚠ Zero symbols fetched for {consecutive_zero_fetches} consecutive cycles. "
+                    f"Yahoo Finance may be down or rate-limiting. "
+                    f"Sleeping extra {ZERO_FETCH_SLEEP_EXTRA}s before retry."
+                )
+                time.sleep(ZERO_FETCH_SLEEP_EXTRA)
+        else:
+            consecutive_zero_fetches = 0  # reset on any success
         self.log.info(
             f"       ✓ {len(fetched_symbols)}/{total} fetched  "
             f"({state['total_bars']:,} bars)  "
@@ -399,8 +439,12 @@ class ScalableEngine:
         daily_fetched = 0
         daily_failed = 0
 
-        async def _run_daily_fetcher():
+        # BUG-08 fix: merge both fetch coroutines into a single asyncio.run() call.
+        # Previously two event loops were created and torn down per cycle (~6ms overhead
+        # each on 0.15 CPU). Now one loop handles both the 5m and daily fetch phases.
+        async def _run_all_fetches():
             nonlocal daily_fetched, daily_failed
+            await _run_fetcher()
             gen = fetch_daily_bars_async_gen(
                 symbols,
                 lookback_days=self.cfg.daily_lookback_days,
@@ -416,7 +460,7 @@ class ScalableEngine:
                 self.repo.upsert_candles_1d(result.symbol, result.bars)
                 daily_fetched += 1
 
-        asyncio.run(_run_daily_fetcher())
+        asyncio.run(_run_all_fetches())
         daily_fetch_seconds = time.monotonic() - daily_fetch_start
         self.log.info(
             f"       ✓ {daily_fetched}/{total} daily fetched  "
@@ -439,20 +483,23 @@ class ScalableEngine:
         compute_start = time.monotonic()
         compute_payloads: list[dict[str, Any]] = []
 
-        # ── Per-symbol combined bar fetch then compute ────────────────────────
-        # get_combined_bars_for_symbol returns daily bars (old history) +
-        # 5m bars (last 3 days) merged into one DataFrame. This gives the
-        # strategy 90 days of history for weekly fractal calculation while
-        # keeping memory constant per symbol (not per all-symbols-at-once).
-        self.log.debug(f"Fetching combined bars for {len(symbols_to_compute)} symbols...")
+        # BUG-10 fix: bulk-load all symbol candle data in 2 DB round-trips
+        # instead of N individual calls (one per symbol). At 100 symbols this
+        # saves ~1.5s; at 500 symbols ~7.5s of serial DB idle time before any
+        # compute thread can start.
+        self.log.debug(f"Bulk-loading candles for {len(symbols_to_compute)} symbols in 2 queries ...")
+        all_bars = self.repo.get_combined_bars_for_symbols(
+            symbols_to_compute,
+            daily_lookback_days=self.cfg.daily_lookback_days,
+            recent_5m_days=self.cfg.fetch_lookback_days,
+        )
 
         futures = {}
         for symbol in symbols_to_compute:
-            df_symbol = self.repo.get_combined_bars_for_symbol(
-                symbol,
-                daily_lookback_days=self.cfg.daily_lookback_days,
-                recent_5m_days=self.cfg.fetch_lookback_days,
-            )
+            df_symbol = all_bars.get(symbol)
+            if df_symbol is None:
+                import pandas as _pd
+                df_symbol = _pd.DataFrame()
 
             fut = self.executor.submit(
                 compute_symbol_signal,
@@ -461,6 +508,8 @@ class ScalableEngine:
                 self.cfg.exchange_tz,
             )
             futures[fut] = symbol
+
+
 
         compute_errors = 0
         computed_count = 0
@@ -509,12 +558,15 @@ class ScalableEngine:
             + (f"  | {compute_errors} errors" if compute_errors else "")
         )
 
-        # Log each signal found
+        # Log each signal found — BUG-21 fix: guard against None price before :.4f format
         for p in buys:
-            self.log.info(f"       🟢 BUY   {p['symbol']:<16}  @ {p.get('signal_price') or p.get('last_price'):.4f}  [{p.get('signal_reason','')}]")
+            _price = p.get("signal_price") or p.get("last_price")
+            _price_str = f"{_price:.4f}" if _price is not None else "N/A"
+            self.log.info(f"       🟢 BUY   {p['symbol']:<16}  @ {_price_str}  [{p.get('signal_reason','')}]")
         for p in sells:
-            self.log.info(f"       🔴 SELL  {p['symbol']:<16}  @ {p.get('signal_price') or p.get('last_price'):.4f}  [{p.get('signal_reason','')}]")
-
+            _price = p.get("signal_price") or p.get("last_price")
+            _price_str = f"{_price:.4f}" if _price is not None else "N/A"
+            self.log.info(f"       🔴 SELL  {p['symbol']:<16}  @ {_price_str}  [{p.get('signal_reason','')}]")
         self.log.info(f"  [3/3] PERSIST")
         persist_start = time.monotonic()
         open_positions = self.repo.get_open_positions()

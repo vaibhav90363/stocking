@@ -98,7 +98,7 @@ def next_event(tz: str, open_time: str, close_time: str) -> tuple[str, int]:
         from datetime import timedelta as td
         candidate = today + td(days=days_ahead)
 
-    return "opens", 0
+    return "opens", 86400  # BUG-17 fix: fallback to 24h sleep, never 0 (immediate wake)
 
 
 def fmt_duration(seconds: int) -> str:
