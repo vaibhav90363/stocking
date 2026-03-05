@@ -140,6 +140,17 @@ class ScalableEngine:
         signal.signal(signal.SIGINT, _handle_signal)
         signal.signal(signal.SIGTERM, _handle_signal)
 
+        # ── Per-engine fetch-start stagger ──────────────────────────────────
+        # When multiple engines start together (--all-strategies), each gets a
+        # different delay so their first yfinance bursts don't overlap and hit
+        # Yahoo's rate limiter from the same IP at the same moment.
+        if self.cfg.fetch_start_delay_seconds > 0:
+            self.log.info(
+                f"  [fetch-delay] Staggering fetch start by "
+                f"{self.cfg.fetch_start_delay_seconds}s to avoid rate-limit burst …"
+            )
+            time.sleep(self.cfg.fetch_start_delay_seconds)
+
         cycle_num = 0
         consecutive_zero_fetches = 0  # circuit-breaker counter
         ZERO_FETCH_WARN_THRESHOLD = 3
@@ -177,7 +188,21 @@ class ScalableEngine:
                     "cycle_seconds": self.cfg.cycle_seconds,
                     **mkt,
                 })
-                time.sleep(self.cfg.disabled_poll_seconds)
+                # ── Smart sleep when market is closed ────────────────────────
+                # Rather than polling every 60s for 15+ hours (generating ~900
+                # no-op DB pings per overnight closure), sleep for up to half
+                # the time until next open — but never more than 10 minutes so
+                # the heartbeat stays fresh and a manual enable is noticed quickly.
+                secs_to_next = mkt.get("next_event_secs", 0)
+                if secs_to_next > 0 and not mkt["market_open"]:
+                    smart_sleep = max(
+                        self.cfg.disabled_poll_seconds,  # floor: always ≥ poll interval
+                        min(secs_to_next // 2, 600),     # cap at 10 min so heartbeat stays alive
+                    )
+                else:
+                    smart_sleep = self.cfg.disabled_poll_seconds
+                self.log.debug(f"   sleeping {smart_sleep}s until next check")
+                time.sleep(smart_sleep)
                 continue
 
             cycle_num += 1

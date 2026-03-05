@@ -22,6 +22,9 @@ class AppConfig:
     market_open:  str = "09:15"
     market_close: str = "15:30"
     auto_schedule: bool = True   # False = manual Start/Stop only
+    # Per-engine fetch stagger: delay this engine's first fetch by N seconds so
+    # all 3 engines don't burst Yahoo Finance simultaneously from the same IP.
+    fetch_start_delay_seconds: int = 0
 
 
 
@@ -65,4 +68,5 @@ def load_config() -> AppConfig:
         market_open=os.getenv("STOCKING_MARKET_OPEN", def_open),
         market_close=os.getenv("STOCKING_MARKET_CLOSE", def_close),
         auto_schedule=os.getenv("STOCKING_AUTO_SCHEDULE", "1") not in ("0", "false", "False"),
+        fetch_start_delay_seconds=int(os.getenv("STOCKING_FETCH_START_DELAY", "0")),
     )

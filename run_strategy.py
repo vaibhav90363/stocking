@@ -254,37 +254,79 @@ def main():
     args = parser.parse_args()
 
     if args.all_strategies:
+        import time as _time
+
         print("\n  [Runner] Launching all strategies concurrently …")
         strategies_dir = ROOT / "strategies"
-        processes = []
-        is_first = True  # Only the first strategy gets the HTTP health port
-        for d in sorted(strategies_dir.iterdir()):  # sorted for determinism
-            if d.is_dir() and (d / "strategy.yaml").exists():
-                print(f"  --> Launching {d.name} in mode {args.mode}")
-                child_env = os.environ.copy()
-                if is_first:
-                    child_env["STOCKING_IS_PRIMARY"] = "1"
-                    is_first = False
-                else:
-                    child_env["STOCKING_IS_PRIMARY"] = "0"
-                p = subprocess.Popen([
-                    sys.executable, __file__, str(d),
-                    "--mode", args.mode,
-                ], env=child_env)
-                processes.append(p)
-        
-        if not processes:
+
+        # Collect all strategy directories (sorted for determinism)
+        strategy_dirs = sorted(
+            d for d in strategies_dir.iterdir()
+            if d.is_dir() and (d / "strategy.yaml").exists()
+        )
+
+        if not strategy_dirs:
             print("  No strategies found.")
             sys.exit(1)
-            
-        print(f"  Started {len(processes)} engines in the background. Waiting for them...")
+
+        # ── Per-engine fetch-start stagger ─────────────────────────────────
+        # Assign each engine a different delay so they don't all burst Yahoo
+        # Finance simultaneously from the same IP on each cycle's first fetch.
+        # Order: 0s → 30s → 60s based on sorted directory index.
+        FETCH_DELAYS = [0, 30, 60]
+
+        # ── Build process specs ─────────────────────────────────────────────
+        # Each spec holds everything needed to (re)spawn the process.
+        specs = []
+        for idx, d in enumerate(strategy_dirs):
+            print(f"  --> Launching {d.name} in mode {args.mode}")
+            child_env = os.environ.copy()
+            child_env["STOCKING_IS_PRIMARY"] = "1" if idx == 0 else "0"
+            child_env["STOCKING_FETCH_START_DELAY"] = str(FETCH_DELAYS[min(idx, len(FETCH_DELAYS) - 1)])
+            specs.append({
+                "name": d.name,
+                "cmd": [sys.executable, __file__, str(d), "--mode", args.mode],
+                "env": child_env,
+            })
+
+        def _spawn(spec: dict) -> subprocess.Popen:
+            return subprocess.Popen(spec["cmd"], env=spec["env"])
+
+        # ── Start all processes ─────────────────────────────────────────────
+        procs = {spec["name"]: {"proc": _spawn(spec), "spec": spec, "restarts": 0, "backoff": 1}
+                 for spec in specs}
+
+        print(f"  Started {len(procs)} engines in the background. Watching for crashes …")
+
+        # ── Watchdog loop ───────────────────────────────────────────────────
+        # Polls every 5 seconds. If a child exits unexpectedly (non-zero or
+        # even zero when it shouldn't), it is restarted with exponential
+        # backoff (1s → 2s → 4s … capped at 60s) so a persistent crash
+        # doesn't spin-restart the whole Render service.
         try:
-            for p in processes:
-                p.wait()
+            while True:
+                _time.sleep(5)
+                for name, state in procs.items():
+                    p = state["proc"]
+                    rc = p.poll()
+                    if rc is None:
+                        continue  # still running — all good
+
+                    state["restarts"] += 1
+                    backoff = min(state["backoff"], 60)
+                    print(
+                        f"  [watchdog] {name} exited (code={rc}). "
+                        f"Restart #{state['restarts']} in {backoff}s …"
+                    )
+                    _time.sleep(backoff)
+                    state["proc"] = _spawn(state["spec"])
+                    state["backoff"] = min(backoff * 2, 60)
+
         except KeyboardInterrupt:
-            print("\n  Shutting down all engines...")
-            for p in processes:
-                p.terminate()
+            print("\n  Shutting down all engines …")
+            for state in procs.values():
+                state["proc"].terminate()
+
         sys.exit(0)
 
     if not args.strategy_dir:
