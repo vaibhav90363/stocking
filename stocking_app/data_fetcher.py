@@ -134,9 +134,12 @@ def _fetch_batch_blocking(
             err_str = str(exc).lower()
             is_rate_limit = "rate limit" in err_str or "too many requests" in err_str or "429" in err_str
             if attempt < MAX_RETRIES - 1:
-                # Always back off — not just on rate-limit errors — since any transient
-                # failure benefits from a pause before retry.
-                wait = BACKOFF_BASE * (2 ** attempt) + random.uniform(0, 3)
+                # Rate limit: use much longer backoff so Yahoo can cool down (LSE/NSE
+                # share the same IP and hit 429 often when all engines run together).
+                if is_rate_limit:
+                    wait = 30 + (attempt * 25) + random.uniform(0, 15)  # 30–35s, 55–70s, 80–95s
+                else:
+                    wait = BACKOFF_BASE * (2 ** attempt) + random.uniform(0, 3)
                 time.sleep(wait)
             else:
                 break
@@ -261,8 +264,13 @@ def _fetch_daily_batch_blocking(
 
         except Exception as exc:
             last_exc = exc
+            err_str = str(exc).lower()
+            is_rate_limit = "rate limit" in err_str or "too many requests" in err_str or "429" in err_str
             if attempt < MAX_RETRIES - 1:
-                wait = BACKOFF_BASE * (2 ** attempt) + random.uniform(0, 2)
+                if is_rate_limit:
+                    wait = 25 + (attempt * 20) + random.uniform(0, 10)  # 25–35s, 45–55s, 65–75s
+                else:
+                    wait = BACKOFF_BASE * (2 ** attempt) + random.uniform(0, 2)
                 time.sleep(wait)
             else:
                 break

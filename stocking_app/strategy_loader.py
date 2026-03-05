@@ -35,6 +35,7 @@ class StrategyConfig:
     # engine
     cycle_seconds: int
     fetch_lookback_days: int
+    daily_lookback_days: int
     compute_lookback_days: int
     fetch_concurrency: int
     compute_workers: int
@@ -61,6 +62,7 @@ class StrategyConfig:
             cycle_seconds=self.cycle_seconds,
             disabled_poll_seconds=60,  # match STOCKING_DISABLED_POLL_SECONDS env default
             fetch_lookback_days=self.fetch_lookback_days,
+            daily_lookback_days=self.daily_lookback_days,
             compute_lookback_days=self.compute_lookback_days,
             max_fetch_concurrency=self.fetch_concurrency,
             compute_workers=self.compute_workers,
@@ -111,7 +113,8 @@ def load_strategy(strategy_dir: str | Path) -> StrategyConfig:
         market_close      = exc.get("market_close", "15:30"),
 
         cycle_seconds         = int(eng.get("cycle_seconds", 300)),
-        fetch_lookback_days   = int(eng.get("fetch_lookback_days", 10)),
+        fetch_lookback_days   = int(eng.get("fetch_lookback_days", 2)),
+        daily_lookback_days   = int(eng.get("daily_lookback_days", 60)),
         compute_lookback_days = int(eng.get("compute_lookback_days", 365)),
         fetch_concurrency     = int(eng.get("fetch_concurrency", 16)),
         compute_workers       = int(eng.get("compute_workers", 4)),

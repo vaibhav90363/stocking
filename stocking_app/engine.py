@@ -430,42 +430,48 @@ class ScalableEngine:
             + (f"  | {len(failed_symbols)} failed: {', '.join(failed_sample)}" if failed_symbols else "")
         )
 
-        # ── Phase 1b: Daily bars fetch ────────────────────────────────────────
-        # Fetch 90 days of daily bars (one row/symbol/day) for the long-horizon
-        # weekly fractal calculation. These are stored in candles_1d and merged
-        # with the recent 5m bars at compute time — saving ~99% memory vs fetching
-        # 90d of 5m bars.
-        self.log.info(f"  [1b/3] FETCH 1d — {total} symbols  (lookback={self.cfg.daily_lookback_days}d)")
+        # ── Phase 1b: Daily bars fetch (only when needed) ──────────────────────
+        # Fetch daily bars for long-horizon weekly fractal. We only fetch for
+        # symbols that don't already have data through yesterday — so after the
+        # first cycle we skip the full 500-symbol daily fetch on most cycles,
+        # avoiding ~800s and rate limits every 5 minutes.
+        symbols_needing_daily = self.repo.get_symbols_needing_daily_fetch(symbols)
         daily_fetch_start = time.monotonic()
         daily_state = {"fetched": 0, "failed": 0}
 
-        # BUG-08 fix: merge both fetch coroutines into a single asyncio.run() call.
-        # Previously two event loops were created and torn down per cycle (~6ms overhead
-        # each on 0.15 CPU). Now one loop handles both the 5m and daily fetch phases.
-        async def _run_all_fetches():
-            await _run_fetcher()
-            gen = fetch_daily_bars_async_gen(
-                symbols,
-                lookback_days=self.cfg.daily_lookback_days,
-                max_concurrency=self.cfg.max_fetch_concurrency,
+        if not symbols_needing_daily:
+            self.log.info(
+                f"  [1b/3] FETCH 1d — skip (all {total} symbols already have fresh daily data)"
             )
-            good_daily: list[FetchResult] = []
-            async for result in gen:
-                if result.error or result.bars.empty:
-                    daily_state["failed"] += 1
-                else:
-                    good_daily.append(result)
-            for result in good_daily:
-                self.repo.upsert_candles_1d(result.symbol, result.bars)
-                daily_state["fetched"] += 1
+        else:
+            self.log.info(
+                f"  [1b/3] FETCH 1d — {len(symbols_needing_daily)}/{total} symbols  "
+                f"(lookback={self.cfg.daily_lookback_days}d)"
+            )
+            async def _run_daily_fetch():
+                gen = fetch_daily_bars_async_gen(
+                    symbols_needing_daily,
+                    lookback_days=self.cfg.daily_lookback_days,
+                    max_concurrency=self.cfg.max_fetch_concurrency,
+                )
+                good_daily: list[FetchResult] = []
+                async for result in gen:
+                    if result.error or result.bars.empty:
+                        daily_state["failed"] += 1
+                    else:
+                        good_daily.append(result)
+                for result in good_daily:
+                    self.repo.upsert_candles_1d(result.symbol, result.bars)
+                    daily_state["fetched"] += 1
 
-        asyncio.run(_run_all_fetches())
+            asyncio.run(_run_daily_fetch())
         daily_fetch_seconds = time.monotonic() - daily_fetch_start
-        self.log.info(
-            f"       ✓ {daily_state['fetched']}/{total} daily fetched  "
-            f"| {daily_fetch_seconds:.1f}s"
-            + (f"  | {daily_state['failed']} failed" if daily_state["failed"] else "")
-        )
+        if symbols_needing_daily:
+            self.log.info(
+                f"       ✓ {daily_state['fetched']}/{len(symbols_needing_daily)} daily fetched  "
+                f"| {daily_fetch_seconds:.1f}s"
+                + (f"  | {daily_state['failed']} failed" if daily_state["failed"] else "")
+            )
 
         symbols_to_compute = self.repo.get_symbols_pending_compute(fetched_symbols)
         self.log.info(f"  [2/3] COMPUTE — {len(symbols_to_compute)} symbols pending")
@@ -495,7 +501,8 @@ class ScalableEngine:
 
         futures = {}
         for symbol in symbols_to_compute:
-            df_symbol = all_bars.get(symbol)
+            # Pop to free memory from the dictionary as we submit to the thread pool
+            df_symbol = all_bars.pop(symbol, None)
             if df_symbol is None:
                 import pandas as _pd
                 df_symbol = _pd.DataFrame()

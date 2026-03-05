@@ -594,6 +594,33 @@ class TradingRepository:
         return {r["symbol"]: dict(r) for r in rows}
 
     @retry_on_disconnect()
+    def get_symbols_needing_daily_fetch(self, symbols: list[str]) -> list[str]:
+        """Return symbols that do not have daily data through yesterday (UTC).
+
+        Used to skip the full daily fetch phase when we already have fresh
+        candles_1d (e.g. after the first cycle). Fetch daily at most once per
+        day per symbol instead of every cycle.
+        """
+        if not symbols:
+            return []
+        from datetime import timedelta
+        yesterday = (datetime.now(timezone.utc) - timedelta(days=1)).replace(
+            hour=0, minute=0, second=0, microsecond=0
+        ).strftime("%Y-%m-%d") + "T00:00:00+00:00"
+        with self.conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT DISTINCT symbol
+                FROM candles_1d
+                WHERE symbol = ANY(%s) AND ts >= %s
+                """,
+                (symbols, yesterday),
+            )
+            rows = cur.fetchall()
+        have_fresh = {r["symbol"] for r in rows}
+        return [s for s in symbols if s not in have_fresh]
+
+    @retry_on_disconnect()
     def get_symbols_pending_compute(self, symbols: list[str]) -> list[str]:
         if not symbols:
             return []
@@ -649,59 +676,64 @@ class TradingRepository:
         ).isoformat()
         recent_cutoff = (now - timedelta(days=recent_5m_days)).replace(microsecond=0).isoformat()
 
-        with self.conn.cursor() as cur:
-            # Round-trip 1: all daily bars for all symbols
-            cur.execute(
-                """
-                SELECT symbol, ts, open, high, low, close, volume
-                FROM candles_1d
-                WHERE symbol = ANY(%s) AND ts >= %s AND ts < %s
-                ORDER BY symbol, ts
-                """,
-                (symbols, daily_cutoff, recent_cutoff),
-            )
-            daily_rows = cur.fetchall()
-
-            # Round-trip 2: all recent 5m bars for all symbols
-            cur.execute(
-                """
-                SELECT symbol, ts, open, high, low, close, volume
-                FROM candles_5m
-                WHERE symbol = ANY(%s) AND ts >= %s
-                ORDER BY symbol, ts
-                """,
-                (symbols, recent_cutoff),
-            )
-            recent_rows = cur.fetchall()
-
-        # Group rows by symbol in Python
-        daily_by_sym: dict = defaultdict(list)
-        for r in daily_rows:
-            daily_by_sym[r["symbol"]].append(dict(r))
-
-        recent_by_sym: dict = defaultdict(list)
-        for r in recent_rows:
-            recent_by_sym[r["symbol"]].append(dict(r))
-
         result: dict = {}
-        all_syms = set(daily_by_sym) | set(recent_by_sym)
+        CHUNK_SIZE = 50
 
-        for sym in all_syms:
-            chunks = []
-            if daily_by_sym[sym]:
-                df_d = pd.DataFrame(daily_by_sym[sym]).drop(columns=["symbol"], errors="ignore")
-                df_d["ts"] = pd.to_datetime(df_d["ts"], utc=True)
-                df_d = df_d.set_index("ts")
-                chunks.append(df_d)
-            if recent_by_sym[sym]:
-                df_r = pd.DataFrame(recent_by_sym[sym]).drop(columns=["symbol"], errors="ignore")
-                df_r["ts"] = pd.to_datetime(df_r["ts"], utc=True)
-                df_r = df_r.set_index("ts")
-                chunks.append(df_r)
-            if chunks:
-                combined = pd.concat(chunks).sort_index()
-                combined = combined[~combined.index.duplicated(keep="last")]
-                result[sym] = combined
+        for i in range(0, len(symbols), CHUNK_SIZE):
+            chunk_symbols = symbols[i : i + CHUNK_SIZE]
+
+            with self.conn.cursor() as cur:
+                # Round-trip 1: daily bars for chunk
+                cur.execute(
+                    """
+                    SELECT symbol, ts, open, high, low, close, volume
+                    FROM candles_1d
+                    WHERE symbol = ANY(%s) AND ts >= %s AND ts < %s
+                    ORDER BY symbol, ts
+                    """,
+                    (chunk_symbols, daily_cutoff, recent_cutoff),
+                )
+                daily_rows = cur.fetchall()
+
+                # Round-trip 2: recent 5m bars for chunk
+                cur.execute(
+                    """
+                    SELECT symbol, ts, open, high, low, close, volume
+                    FROM candles_5m
+                    WHERE symbol = ANY(%s) AND ts >= %s
+                    ORDER BY symbol, ts
+                    """,
+                    (chunk_symbols, recent_cutoff),
+                )
+                recent_rows = cur.fetchall()
+
+            # Group rows by symbol in Python
+            daily_by_sym: dict = defaultdict(list)
+            for r in daily_rows:
+                daily_by_sym[r["symbol"]].append(dict(r))
+
+            recent_by_sym: dict = defaultdict(list)
+            for r in recent_rows:
+                recent_by_sym[r["symbol"]].append(dict(r))
+
+            all_syms = set(daily_by_sym) | set(recent_by_sym)
+
+            for sym in all_syms:
+                chunks = []
+                if daily_by_sym[sym]:
+                    df_d = pd.DataFrame(daily_by_sym[sym]).drop(columns=["symbol"], errors="ignore")
+                    df_d["ts"] = pd.to_datetime(df_d["ts"], utc=True)
+                    df_d = df_d.set_index("ts")
+                    chunks.append(df_d)
+                if recent_by_sym[sym]:
+                    df_r = pd.DataFrame(recent_by_sym[sym]).drop(columns=["symbol"], errors="ignore")
+                    df_r["ts"] = pd.to_datetime(df_r["ts"], utc=True)
+                    df_r = df_r.set_index("ts")
+                    chunks.append(df_r)
+                if chunks:
+                    combined = pd.concat(chunks).sort_index()
+                    combined = combined[~combined.index.duplicated(keep="last")]
+                    result[sym] = combined
 
         # Symbols with no data at all
         for sym in symbols:

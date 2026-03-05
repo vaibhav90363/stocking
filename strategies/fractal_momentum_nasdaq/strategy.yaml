@@ -11,7 +11,8 @@ exchange:
 
 engine:
   cycle_seconds: 300
-  fetch_lookback_days: 3
+  fetch_lookback_days: 2
+  daily_lookback_days: 60
   compute_lookback_days: 30
   fetch_concurrency: 1
   compute_workers: 1

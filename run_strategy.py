@@ -78,6 +78,7 @@ def cmd_live(sc, args):
         "STOCKING_TICKER_SUFFIX":        sc.suffix,
         "STOCKING_CYCLE_SECONDS":        str(sc.cycle_seconds),
         "STOCKING_FETCH_LOOKBACK_DAYS":  str(sc.fetch_lookback_days),
+        "STOCKING_DAILY_LOOKBACK_DAYS":  str(sc.daily_lookback_days),
         "STOCKING_COMPUTE_LOOKBACK_DAYS":str(sc.compute_lookback_days),
         "STOCKING_FETCH_CONCURRENCY":    str(sc.fetch_concurrency),
         "STOCKING_COMPUTE_WORKERS":      str(sc.compute_workers),
