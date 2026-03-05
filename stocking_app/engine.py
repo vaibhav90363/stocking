@@ -11,7 +11,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import Any
 
 from .config import AppConfig, load_config
 from .data_fetcher import FetchResult, fetch_5m_bars_async_gen, fetch_daily_bars_async_gen
@@ -126,6 +126,14 @@ class ScalableEngine:
         self.pid_file = Path(cfg.db_path).parent / "engine.pid"
         self.pid_file.write_text(str(os.getpid()))
 
+        # State tracking for rate-limiting and dead symbols
+        self.consecutive_zero_fetches = 0
+        self.ZERO_FETCH_WARN_THRESHOLD = 3
+        self.ZERO_FETCH_SLEEP_EXTRA = 60
+        self._empty_fetch_counts: dict[str, int] = {}
+        self._dead_symbols: set[str] = set()
+        self.DEAD_SYMBOL_THRESHOLD = 5
+
     def stop(self) -> None:
         self._running = False
 
@@ -156,15 +164,6 @@ class ScalableEngine:
             time.sleep(self.cfg.fetch_start_delay_seconds)
 
         cycle_num = 0
-        consecutive_zero_fetches = 0   # BUG-09: circuit-breaker counter
-        ZERO_FETCH_WARN_THRESHOLD = 3  # warn after 3 all-failed cycles in a row
-        ZERO_FETCH_SLEEP_EXTRA = 60    # extra sleep when Yahoo appears down
-        # BUG-07: track symbols that consistently return empty bars (de-listed / bad ticker).
-        # After DEAD_SYMBOL_THRESHOLD empty fetches in a row the symbol is skipped in all
-        # subsequent cycles. Pure in-RAM set — no DB writes, negligible memory at 100-500 syms.
-        _empty_fetch_counts: dict[str, int] = {}
-        _dead_symbols: set[str] = set()
-        DEAD_SYMBOL_THRESHOLD = 5
         while self._running:
             # ── Market-hours auto-scheduler ─────────────────────────────────
             mkt = get_market_status(
@@ -328,8 +327,8 @@ class ScalableEngine:
         fetch_start = time.monotonic()
 
         # BUG-07 fix: skip symbols that have consistently returned empty bars.
-        # _dead_symbols / _empty_fetch_counts are maintained across cycles in run_forever.
-        live_symbols = [s for s in symbols if s not in _dead_symbols]
+        # _dead_symbols / _empty_fetch_counts are maintained across cycles.
+        live_symbols = [s for s in symbols if s not in self._dead_symbols]
         if len(live_symbols) < len(symbols):
             self.log.debug(f"  Skipping {len(symbols)-len(live_symbols)} dead/de-listed symbols.")
 
@@ -373,15 +372,15 @@ class ScalableEngine:
                 fetched_symbols.append(result.symbol)
                 state["total_bars"] += len(result.bars)
                 # BUG-07: successful fetch resets the dead-symbol counter
-                _empty_fetch_counts.pop(result.symbol, None)
+                self._empty_fetch_counts.pop(result.symbol, None)
 
             # BUG-07: increment counters for symbols that returned nothing
             for sym in failed_symbols:
-                _empty_fetch_counts[sym] = _empty_fetch_counts.get(sym, 0) + 1
-                if _empty_fetch_counts[sym] >= DEAD_SYMBOL_THRESHOLD and sym not in _dead_symbols:
-                    _dead_symbols.add(sym)
+                self._empty_fetch_counts[sym] = self._empty_fetch_counts.get(sym, 0) + 1
+                if self._empty_fetch_counts[sym] >= self.DEAD_SYMBOL_THRESHOLD and sym not in self._dead_symbols:
+                    self._dead_symbols.add(sym)
                     self.log.warning(
-                        f"  ⚠ {sym}: empty fetch for {DEAD_SYMBOL_THRESHOLD} consecutive cycles. "
+                        f"  ⚠ {sym}: empty fetch for {self.DEAD_SYMBOL_THRESHOLD} consecutive cycles. "
                         f"Treating as de-listed — skipping in future cycles."
                     )
         
@@ -412,21 +411,23 @@ class ScalableEngine:
         # for several cycles in a row, log a warning and sleep extra to avoid
         # hammering Supabase with useless heartbeat writes during an outage.
         if not fetched_symbols:
-            consecutive_zero_fetches += 1
-            if consecutive_zero_fetches >= ZERO_FETCH_WARN_THRESHOLD:
+            self.consecutive_zero_fetches += 1
+            if self.consecutive_zero_fetches >= self.ZERO_FETCH_WARN_THRESHOLD:
                 self.log.warning(
-                    f"  ⚠ Zero symbols fetched for {consecutive_zero_fetches} consecutive cycles. "
+                    f"  ⚠ Zero symbols fetched for {self.consecutive_zero_fetches} consecutive cycles. "
                     f"Yahoo Finance may be down or rate-limiting. "
-                    f"Sleeping extra {ZERO_FETCH_SLEEP_EXTRA}s before retry."
+                    f"Sleeping extra {self.ZERO_FETCH_SLEEP_EXTRA}s before retry."
                 )
-                time.sleep(ZERO_FETCH_SLEEP_EXTRA)
+                time.sleep(self.ZERO_FETCH_SLEEP_EXTRA)
         else:
-            consecutive_zero_fetches = 0  # reset on any success
+            self.consecutive_zero_fetches = 0  # reset on any success
+            
+        failed_sample = [failed_symbols[i] for i in range(min(5, len(failed_symbols)))]
         self.log.info(
             f"       ✓ {len(fetched_symbols)}/{total} fetched  "
             f"({state['total_bars']:,} bars)  "
             f"| {fetch_seconds:.1f}s"
-            + (f"  | {len(failed_symbols)} failed: {', '.join(failed_symbols[:5])}" if failed_symbols else "")
+            + (f"  | {len(failed_symbols)} failed: {', '.join(failed_sample)}" if failed_symbols else "")
         )
 
         # ── Phase 1b: Daily bars fetch ────────────────────────────────────────
@@ -436,14 +437,12 @@ class ScalableEngine:
         # 90d of 5m bars.
         self.log.info(f"  [1b/3] FETCH 1d — {total} symbols  (lookback={self.cfg.daily_lookback_days}d)")
         daily_fetch_start = time.monotonic()
-        daily_fetched = 0
-        daily_failed = 0
+        daily_state = {"fetched": 0, "failed": 0}
 
         # BUG-08 fix: merge both fetch coroutines into a single asyncio.run() call.
         # Previously two event loops were created and torn down per cycle (~6ms overhead
         # each on 0.15 CPU). Now one loop handles both the 5m and daily fetch phases.
         async def _run_all_fetches():
-            nonlocal daily_fetched, daily_failed
             await _run_fetcher()
             gen = fetch_daily_bars_async_gen(
                 symbols,
@@ -453,19 +452,19 @@ class ScalableEngine:
             good_daily: list[FetchResult] = []
             async for result in gen:
                 if result.error or result.bars.empty:
-                    daily_failed += 1
+                    daily_state["failed"] += 1
                 else:
                     good_daily.append(result)
             for result in good_daily:
                 self.repo.upsert_candles_1d(result.symbol, result.bars)
-                daily_fetched += 1
+                daily_state["fetched"] += 1
 
         asyncio.run(_run_all_fetches())
         daily_fetch_seconds = time.monotonic() - daily_fetch_start
         self.log.info(
-            f"       ✓ {daily_fetched}/{total} daily fetched  "
+            f"       ✓ {daily_state['fetched']}/{total} daily fetched  "
             f"| {daily_fetch_seconds:.1f}s"
-            + (f"  | {daily_failed} failed" if daily_failed else "")
+            + (f"  | {daily_state['failed']} failed" if daily_state["failed"] else "")
         )
 
         symbols_to_compute = self.repo.get_symbols_pending_compute(fetched_symbols)

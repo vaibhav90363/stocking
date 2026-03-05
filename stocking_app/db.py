@@ -552,22 +552,6 @@ class TradingRepository:
         return len(rows)
 
     @retry_on_disconnect()
-    def mark_symbol_computed(self, symbol: str, asof_ts: str | None) -> None:
-        now = utc_now_iso()
-        with self.conn.cursor() as cur:
-            cur.execute(
-                """
-                INSERT INTO symbol_state(symbol, last_candle_ts, last_compute_ts, updated_at)
-                VALUES(%s, NULL, %s, %s)
-                ON CONFLICT(symbol) DO UPDATE SET
-                    last_compute_ts=EXCLUDED.last_compute_ts,
-                    updated_at=EXCLUDED.updated_at
-                """,
-                (symbol, asof_ts, now),
-            )
-        self.conn.commit()
-
-    @retry_on_disconnect()
     def batch_mark_symbols_computed(self, pairs: list[tuple[str, str | None]]) -> None:
         """Batch-upsert last_compute_ts for many symbols in a single round-trip.
         Replaces N individual mark_symbol_computed() calls in the persist loop."""
@@ -617,21 +601,6 @@ class TradingRepository:
             )
             rows = cur.fetchall()
         return [r["symbol"] for r in rows]
-
-    @retry_on_disconnect()
-    def get_combined_bars_for_symbol(
-        self,
-        symbol: str,
-        daily_lookback_days: int = 90,
-        recent_5m_days: int = 3,
-    ) -> pd.DataFrame:
-        """Return a merged DataFrame of daily + recent 5m bars for a single symbol."""
-        result = self.get_combined_bars_for_symbols(
-            [symbol],
-            daily_lookback_days=daily_lookback_days,
-            recent_5m_days=recent_5m_days,
-        )
-        return result.get(symbol, pd.DataFrame())
 
     @retry_on_disconnect()
     def get_combined_bars_for_symbols(

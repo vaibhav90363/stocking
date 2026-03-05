@@ -78,7 +78,7 @@ def cmd_status(repo: TradingRepository) -> None:
     print(f"heartbeat: {heartbeat}")
 
 
-def cmd_run_once(cfg_pathless: None = None) -> None:
+def cmd_run_once() -> None:
     from .engine import ScalableEngine
 
     cfg = load_config()
