@@ -52,7 +52,6 @@ class StrategyConfig:
 
     # backtest settings
     daily_lookback: str
-    intraday_days: int
     backtest_days: int
 
     def to_app_config(self, database_url: str = "") -> AppConfig:
@@ -128,7 +127,6 @@ def load_strategy(strategy_dir: str | Path) -> StrategyConfig:
         parameters    = raw.get("parameters", {}),
 
         daily_lookback= str(bt.get("daily_lookback", "2y")),
-        intraday_days = int(bt.get("intraday_days", 60)),
         backtest_days = int(bt.get("backtest_days", 30)),
     )
 

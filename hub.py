@@ -370,7 +370,6 @@ with tab_strategies:
                             suffix            = sc.suffix,
                             exchange_tz       = sc.timezone,
                             daily_lookback    = sc.daily_lookback,
-                            intraday_days     = sc.intraday_days,
                             backtest_days     = sc.backtest_days,
                             capital_per_trade = float(sc.parameters.get("capital_per_trade", 100_000)),
                             fetch_concurrency = sc.fetch_concurrency,

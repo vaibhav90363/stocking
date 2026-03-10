@@ -559,6 +559,12 @@ class ScalableEngine:
 
             acted = False
             if signal == "BUY" and symbol not in open_positions:
+                # RE-ENTRY GUARD: Check if we already bought this symbol today.
+                # 'asof_ts' for 1D polling is the start of the daily candle (YYYY-MM-DDT00:00:00+00:00)
+                if asof_ts and self.repo.has_acted_buy_today(symbol, asof_ts):
+                    self.log.info(f"       ⚠️  RE-ENTRY GUARD: Already bought {symbol} today. Skipping.")
+                    continue
+                
                 self.repo.execute_buy(symbol, qty=self.cfg.order_qty, price=price, ts=asof_ts or utc_now_iso(), reason=reason)
                 acted = True
                 actions_taken.append(f"BOUGHT {symbol} × {self.cfg.order_qty} @ {price:.4f}")
