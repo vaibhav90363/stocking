@@ -31,5 +31,4 @@ parameters:
 
 backtest:
   daily_lookback: "2y"
-  intraday_days: 60
   backtest_days: 30

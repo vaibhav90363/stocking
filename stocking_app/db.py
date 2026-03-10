@@ -72,17 +72,6 @@ CREATE TABLE IF NOT EXISTS universe (
     updated_at TEXT NOT NULL
 );
 
-CREATE TABLE IF NOT EXISTS candles_5m (
-    symbol TEXT NOT NULL,
-    ts TEXT NOT NULL,
-    open REAL NOT NULL,
-    high REAL NOT NULL,
-    low REAL NOT NULL,
-    close REAL NOT NULL,
-    volume REAL,
-    PRIMARY KEY (symbol, ts)
-);
-
 CREATE TABLE IF NOT EXISTS signals (
     id SERIAL PRIMARY KEY,
     symbol TEXT NOT NULL,
@@ -165,7 +154,6 @@ CREATE TABLE IF NOT EXISTS system_logs (
 
 -- Performance indexes: added to speed up vectorized candle preload and pending-compute queries.
 -- CREATE INDEX IF NOT EXISTS is idempotent — safe to run on an existing database.
-CREATE INDEX IF NOT EXISTS idx_candles5m_symbol_ts  ON candles_5m (symbol, ts DESC);
 CREATE INDEX IF NOT EXISTS idx_symbol_state_pending ON symbol_state (symbol, last_candle_ts, last_compute_ts);
 CREATE INDEX IF NOT EXISTS idx_system_logs_suffix   ON system_logs  (suffix, id DESC);
 
@@ -462,64 +450,6 @@ class TradingRepository:
             "active": int(row["active"] or 0),
         }
 
-    @retry_on_disconnect()
-    def upsert_candles(self, symbol: str, bars: pd.DataFrame) -> int:
-        if bars.empty:
-            return 0
-        # Vectorized row construction — column-wise ops instead of Python iterrows()
-        # This is ~50x faster for large DataFrames and uses far less transient memory.
-        df = bars.reset_index()
-        df["symbol"] = symbol
-        # BUG-11 fix: explicitly look for known timestamp column names from yfinance
-        # ('Datetime', 'Date', 'ts') before falling back to df.columns[0], which
-        # could silently pick the wrong column if the DataFrame shape is unexpected.
-        _ts_candidates = ["ts", "Datetime", "Date", "datetime", "date"]
-        _ts_name = next((c for c in _ts_candidates if c in df.columns), df.columns[0])
-        ts_col = pd.to_datetime(df[_ts_name], utc=True)
-        df["_ts_str"] = ts_col.dt.strftime("%Y-%m-%dT%H:%M:%S+00:00")
-        if "volume" not in df.columns:
-            df["volume"] = 0.0
-        rows = list(
-            zip(
-                df["symbol"],
-                df["_ts_str"],
-                df["open"].astype(float),
-                df["high"].astype(float),
-                df["low"].astype(float),
-                df["close"].astype(float),
-                df["volume"].astype(float),
-            )
-        )
-        from psycopg2.extras import execute_values
-        with self.conn.cursor() as cur:
-            execute_values(
-                cur,
-                """
-                INSERT INTO candles_5m(symbol, ts, open, high, low, close, volume)
-                VALUES %s
-                ON CONFLICT(symbol, ts) DO UPDATE SET
-                    open=EXCLUDED.open,
-                    high=EXCLUDED.high,
-                    low=EXCLUDED.low,
-                    close=EXCLUDED.close,
-                    volume=EXCLUDED.volume
-                """,
-                rows,
-            )
-            max_ts = df["_ts_str"].max()
-            now = utc_now_iso()
-            cur.execute(
-                """
-                INSERT INTO symbol_state(symbol, last_candle_ts, last_compute_ts, updated_at)
-                VALUES(%s, %s, NULL, %s)
-                ON CONFLICT(symbol) DO UPDATE SET
-                    last_candle_ts=EXCLUDED.last_candle_ts,
-                    updated_at=EXCLUDED.updated_at
-                """,
-                (symbol, max_ts, now),
-            )
-        self.conn.commit()
-        return len(rows)
 
     @retry_on_disconnect()
     def upsert_candles_1d(self, symbol: str, bars: pd.DataFrame) -> int:
@@ -556,9 +486,20 @@ class TradingRepository:
                     high=EXCLUDED.high,
                     low=EXCLUDED.low,
                     close=EXCLUDED.close,
-                    volume=EXCLUDED.volume
                 """,
                 rows,
+            )
+            max_ts = df["_ts_str"].max()
+            now = utc_now_iso()
+            cur.execute(
+                """
+                INSERT INTO symbol_state(symbol, last_candle_ts, last_compute_ts, updated_at)
+                VALUES(%s, %s, NULL, %s)
+                ON CONFLICT(symbol) DO UPDATE SET
+                    last_candle_ts=EXCLUDED.last_candle_ts,
+                    updated_at=EXCLUDED.updated_at
+                """,
+                (symbol, max_ts, now),
             )
         self.conn.commit()
         return len(rows)
@@ -646,22 +587,11 @@ class TradingRepository:
         self,
         symbols: list[str],
         daily_lookback_days: int = 90,
-        recent_5m_days: int = 3,
     ) -> "dict[str, pd.DataFrame]":
-        """BUG-10 fix: Bulk-load daily + 5m bars for ALL symbols in 2 DB round-trips.
-
-        Previously the engine made N individual get_combined_bars_for_symbol() calls
-        (one per symbol) before any compute thread could start, adding 1.5-7.5s of
-        serial DB wait for 100-500 symbols. This replaces those N calls with:
-          - 1 query for all candles_1d rows across all symbols
-          - 1 query for all candles_5m rows across all symbols
-
-        BUG-20 fix: daily_cutoff is normalized to midnight UTC so string comparison
-        with stored ts (YYYY-MM-DDT00:00:00+00:00) is correct and the boundary day
-        is not silently excluded.
-
-        Returns a dict {symbol: DataFrame} ready for immediate dispatch to compute threads.
-        Symbols with no data map to an empty DataFrame.
+        """
+        Loads daily bars for ALL symbols. This replaces the complex hybrid daily + 5m
+        logic with a pure 1D fetch, since Yahoo Finance 1D data natively updates
+        the current day's candle dynamically every 5 minutes.
         """
         from collections import defaultdict
         from datetime import datetime, timedelta, timezone
@@ -670,11 +600,9 @@ class TradingRepository:
             return {}
 
         now = datetime.now(timezone.utc)
-        # BUG-20: normalize to midnight so string compare with stored 00:00 ts is correct
         daily_cutoff = (now - timedelta(days=daily_lookback_days)).replace(
             hour=0, minute=0, second=0, microsecond=0
         ).isoformat()
-        recent_cutoff = (now - timedelta(days=recent_5m_days)).replace(microsecond=0).isoformat()
 
         result: dict = {}
         CHUNK_SIZE = 50
@@ -683,57 +611,31 @@ class TradingRepository:
             chunk_symbols = symbols[i : i + CHUNK_SIZE]
 
             with self.conn.cursor() as cur:
-                # Round-trip 1: daily bars for chunk
                 cur.execute(
                     """
                     SELECT symbol, ts, open, high, low, close, volume
                     FROM candles_1d
-                    WHERE symbol = ANY(%s) AND ts >= %s AND ts < %s
-                    ORDER BY symbol, ts
-                    """,
-                    (chunk_symbols, daily_cutoff, recent_cutoff),
-                )
-                daily_rows = cur.fetchall()
-
-                # Round-trip 2: recent 5m bars for chunk
-                cur.execute(
-                    """
-                    SELECT symbol, ts, open, high, low, close, volume
-                    FROM candles_5m
                     WHERE symbol = ANY(%s) AND ts >= %s
                     ORDER BY symbol, ts
                     """,
-                    (chunk_symbols, recent_cutoff),
+                    (chunk_symbols, daily_cutoff),
                 )
-                recent_rows = cur.fetchall()
+                daily_rows = cur.fetchall()
 
             # Group rows by symbol in Python
             daily_by_sym: dict = defaultdict(list)
             for r in daily_rows:
                 daily_by_sym[r["symbol"]].append(dict(r))
 
-            recent_by_sym: dict = defaultdict(list)
-            for r in recent_rows:
-                recent_by_sym[r["symbol"]].append(dict(r))
-
-            all_syms = set(daily_by_sym) | set(recent_by_sym)
-
-            for sym in all_syms:
-                chunks = []
-                if daily_by_sym[sym]:
-                    df_d = pd.DataFrame(daily_by_sym[sym]).drop(columns=["symbol"], errors="ignore")
-                    df_d["ts"] = pd.to_datetime(df_d["ts"], utc=True)
-                    df_d = df_d.set_index("ts")
-                    chunks.append(df_d)
-                if recent_by_sym[sym]:
-                    df_r = pd.DataFrame(recent_by_sym[sym]).drop(columns=["symbol"], errors="ignore")
-                    df_r["ts"] = pd.to_datetime(df_r["ts"], utc=True)
-                    df_r = df_r.set_index("ts")
-                    chunks.append(df_r)
-                if chunks:
-                    combined = pd.concat(chunks).sort_index()
-                    combined = combined[~combined.index.duplicated(keep="last")]
-                    result[sym] = combined
+            for sym in set(daily_by_sym):
+                df_d = pd.DataFrame(daily_by_sym[sym]).drop(columns=["symbol"], errors="ignore")
+                df_d["ts"] = pd.to_datetime(df_d["ts"], utc=True)
+                df_d = df_d.set_index("ts")
+                
+                # Sort and drop any exact duplicates just in case
+                combined = df_d.sort_index()
+                combined = combined[~combined.index.duplicated(keep="last")]
+                result[sym] = combined
 
         # Symbols with no data at all
         for sym in symbols:
@@ -759,46 +661,6 @@ class TradingRepository:
 
         # Cap per symbol: 30 days × ~75 bars/day = ~2250 bars max.
         # We keep only the most recent 500 — enough for any weekly/daily signal window
-        # while keeping each chunk's memory footprint predictable.
-        MAX_BARS_PER_SYMBOL = 500
-        CHUNK_SIZE = 100  # symbols per DB round-trip
-
-        cutoff = (
-            datetime.now(timezone.utc) - timedelta(days=lookback_days)
-        ).replace(microsecond=0).isoformat()
-
-        all_chunks: list[pd.DataFrame] = []
-
-        for i in range(0, len(symbols), CHUNK_SIZE):
-            chunk = symbols[i : i + CHUNK_SIZE]
-            with self.conn.cursor() as cur:
-                cur.execute(
-                    """
-                    SELECT symbol, ts, open, high, low, close, volume
-                    FROM (
-                        SELECT symbol, ts, open, high, low, close, volume,
-                               ROW_NUMBER() OVER (PARTITION BY symbol ORDER BY ts DESC) AS rn
-                        FROM candles_5m
-                        WHERE symbol = ANY(%s) AND ts >= %s
-                    ) ranked
-                    WHERE rn <= %s
-                    ORDER BY symbol, ts
-                    """,
-                    (chunk, cutoff, MAX_BARS_PER_SYMBOL),
-                )
-                rows = cur.fetchall()
-
-            if rows:
-                df_chunk = pd.DataFrame([dict(r) for r in rows])
-                df_chunk["ts"] = pd.to_datetime(df_chunk["ts"], utc=True)
-                df_chunk.drop(columns=["rn"], errors="ignore", inplace=True)
-                all_chunks.append(df_chunk)
-
-        if not all_chunks:
-            return pd.DataFrame()
-
-        return pd.concat(all_chunks, ignore_index=True)
-
 
     @retry_on_disconnect()
     def upsert_signal(self, signal: SignalRecord, acted: bool = False) -> None:

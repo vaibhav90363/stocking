@@ -37,7 +37,6 @@ from stocking_app.indicators import calculate_cmo, ema, fractal_chaos_bands, sma
 
 # ── Defaults (overridden by CLI) ───────────────────────────────────────────
 DAILY_LOOKBACK     = "2y"
-INTRADAY_DAYS      = 60
 BACKTEST_DAYS      = 30
 FETCH_CONCURRENCY  = 16
 EXCHANGE_TZ        = "Asia/Kolkata"
@@ -74,19 +73,9 @@ CREATE TABLE IF NOT EXISTS daily_bars (
     PRIMARY KEY (symbol, ts)
 );
 
-CREATE TABLE IF NOT EXISTS candles_5m (
-    symbol   TEXT NOT NULL,
-    ts       TEXT NOT NULL,
-    open     REAL NOT NULL,
-    high     REAL NOT NULL,
-    low      REAL NOT NULL,
-    close    REAL NOT NULL,
-    volume   REAL,
-    PRIMARY KEY (symbol, ts)
-);
+
 
 CREATE INDEX IF NOT EXISTS idx_daily_sym_ts ON daily_bars(symbol, ts);
-CREATE INDEX IF NOT EXISTS idx_5m_sym_ts    ON candles_5m(symbol, ts);
 """
 
 
@@ -123,8 +112,8 @@ def _normalize_ohlcv(data: pd.DataFrame) -> pd.DataFrame:
     return data
 
 
-def _fetch_one_symbol(symbol: str) -> tuple[pd.DataFrame, pd.DataFrame, str | None]:
-    """Return (daily_df, intraday_5m_df, error)."""
+def _fetch_one_symbol(symbol: str) -> tuple[pd.DataFrame, str | None]:
+    """Return (daily_df, error)."""
     try:
         # Yahoo Finance expects US stocks without suffixes (e.g. AAPL instead of AAPL.US)
         yahoo_symbol = symbol[:-3] if symbol.endswith('.US') else symbol
@@ -136,25 +125,20 @@ def _fetch_one_symbol(symbol: str) -> tuple[pd.DataFrame, pd.DataFrame, str | No
                                    auto_adjust=True, prepost=False)
         daily = _normalize_ohlcv(daily_raw)
 
-        # 5m — 60 days
-        intra_raw = ticker.history(period=f"{INTRADAY_DAYS}d", interval="5m",
-                                   auto_adjust=True, prepost=False)
-        intra = _normalize_ohlcv(intra_raw)
-
-        return daily, intra, None
+        return daily, None
     except Exception as exc:
-        return pd.DataFrame(), pd.DataFrame(), str(exc)
+        return pd.DataFrame(), str(exc)
 
 
 async def _fetch_all_async(
     symbols: list[str],
-) -> list[tuple[str, pd.DataFrame, pd.DataFrame, str | None]]:
+) -> list[tuple[str, pd.DataFrame, str | None]]:
     sem = asyncio.Semaphore(FETCH_CONCURRENCY)
 
     async def _wrapped(sym: str):
         async with sem:
-            daily, intra, err = await asyncio.to_thread(_fetch_one_symbol, sym)
-            return sym, daily, intra, err
+            daily, err = await asyncio.to_thread(_fetch_one_symbol, sym)
+            return sym, daily, err
 
     return await asyncio.gather(*[_wrapped(s) for s in symbols])
 
@@ -164,34 +148,13 @@ def _store_daily(conn: sqlite3.Connection, symbol: str, df: pd.DataFrame) -> int
         return 0
     rows = []
     for ts, row in df.iterrows():
-        ts_iso = pd.Timestamp(ts).tz_convert("UTC").date().isoformat()
+        ts_iso = pd.Timestamp(ts).tz_convert(EXCHANGE_TZ).date().isoformat()
         rows.append((symbol, ts_iso,
                      float(row["open"]), float(row["high"]),
                      float(row["low"]),  float(row["close"]),
                      float(row.get("volume", 0.0))))
     conn.executemany(
         """INSERT INTO daily_bars(symbol,ts,open,high,low,close,volume) VALUES(?,?,?,?,?,?,?)
-           ON CONFLICT(symbol,ts) DO UPDATE SET
-             open=excluded.open,high=excluded.high,low=excluded.low,
-             close=excluded.close,volume=excluded.volume""",
-        rows,
-    )
-    conn.commit()
-    return len(rows)
-
-
-def _store_5m(conn: sqlite3.Connection, symbol: str, df: pd.DataFrame) -> int:
-    if df.empty:
-        return 0
-    rows = []
-    for ts, row in df.iterrows():
-        ts_iso = pd.Timestamp(ts).tz_convert("UTC").isoformat()
-        rows.append((symbol, ts_iso,
-                     float(row["open"]), float(row["high"]),
-                     float(row["low"]),  float(row["close"]),
-                     float(row.get("volume", 0.0))))
-    conn.executemany(
-        """INSERT INTO candles_5m(symbol,ts,open,high,low,close,volume) VALUES(?,?,?,?,?,?,?)
            ON CONFLICT(symbol,ts) DO UPDATE SET
              open=excluded.open,high=excluded.high,low=excluded.low,
              close=excluded.close,volume=excluded.volume""",
@@ -214,16 +177,14 @@ def _read_symbols(csv_path: str) -> list[str]:
 
 def stage1_download(
     symbols: list[str], conn: sqlite3.Connection
-) -> tuple[dict[str, pd.DataFrame], dict[str, pd.DataFrame]]:
+) -> dict[str, pd.DataFrame]:
     """
     Returns:
         daily_all  : symbol → daily OHLCV DataFrame (2 years)
-        intra_all  : symbol → 5m   OHLCV DataFrame (60 days)
     """
     print(f"\n{'─'*60}")
     print(f"  Stage 1 — Downloading {len(symbols)} symbols")
     print(f"  Daily bars  : {DAILY_LOOKBACK} history  (for indicator warmup)")
-    print(f"  5m bars     : last {INTRADAY_DAYS} days (Yahoo Finance cap)")
     print(f"  Backtest    : last {BACKTEST_DAYS} days  (signal window)")
     print(f"  Concurrency : {FETCH_CONCURRENCY}")
     print(f"{'─'*60}\n")
@@ -233,34 +194,28 @@ def stage1_download(
     elapsed = time.monotonic() - t0
 
     daily_all:  dict[str, pd.DataFrame] = {}
-    intra_all:  dict[str, pd.DataFrame] = {}
     failed = []
 
-    for sym, daily, intra, err in results:
+    for sym, daily, err in results:
         if err or daily.empty:
             failed.append(sym)
             continue
         daily_all[sym] = daily
-        intra_all[sym] = intra
         _store_daily(conn, sym, daily)
-        if not intra.empty:
-            _store_5m(conn, sym, intra)
 
     d_bars = sum(len(v) for v in daily_all.values())
-    i_bars = sum(len(v) for v in intra_all.values())
     print(f"  ✓ Fetched {len(daily_all)}/{len(symbols)} symbols in {elapsed:.1f}s")
     print(f"  ✓ Daily bars stored  : {d_bars:,}")
-    print(f"  ✓ 5m bars stored     : {i_bars:,}")
     if failed:
         prefix = ", ".join(failed[:15])
         print(f"  ✗ Failed ({len(failed)}): {prefix}" + (" …" if len(failed) > 15 else ""))
     print()
-    return daily_all, intra_all
+    return daily_all
 
 
 def stage1_load_from_db(
     conn: sqlite3.Connection,
-) -> tuple[dict[str, pd.DataFrame], dict[str, pd.DataFrame]]:
+) -> dict[str, pd.DataFrame]:
     """Load previously cached bars from the backtest DB."""
     print("\n  --skip-download: loading bars from existing DB …")
 
@@ -273,17 +228,8 @@ def stage1_load_from_db(
         df["ts"] = pd.to_datetime(df["ts"], utc=True)
         daily_all[sym] = df.set_index("ts")
 
-    intra_all: dict[str, pd.DataFrame] = {}
-    for (sym,) in conn.execute("SELECT DISTINCT symbol FROM candles_5m").fetchall():
-        df = pd.read_sql_query(
-            "SELECT ts,open,high,low,close,volume FROM candles_5m WHERE symbol=? ORDER BY ts",
-            conn, params=(sym,),
-        )
-        df["ts"] = pd.to_datetime(df["ts"], utc=True)
-        intra_all[sym] = df.set_index("ts")
-
-    print(f"  Loaded {len(daily_all)} symbols (daily) + {len(intra_all)} (5m) from DB\n")
-    return daily_all, intra_all
+    print(f"  Loaded {len(daily_all)} symbols from DB\n")
+    return daily_all
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -292,44 +238,32 @@ def stage1_load_from_db(
 
 def _build_daily_series(
     daily_df: pd.DataFrame,
-    intra_df: pd.DataFrame,
 ) -> pd.DataFrame:
     """
-    Merge daily (2y) + 5m (60d) into a single daily OHLCV series.
-    The 5m bars are resampled to daily and appended/overwrite the tail
-    of the daily history so recent days are filled from higher-resolution data.
+    Prepare daily OHLCV series for computation.
     """
     agg = {"open": "first", "high": "max", "low": "min", "close": "last", "volume": "sum"}
-
-    # Daily baseline (already 1D resolution, UTC index)
     daily = daily_df.copy()
     daily.index = daily.index.tz_convert(EXCHANGE_TZ)
     daily = daily.resample("1D").agg(agg).dropna(subset=["open", "high", "low", "close"])
-
-    if not intra_df.empty:
-        local_5m = intra_df.copy()
-        local_5m.index = local_5m.index.tz_convert(EXCHANGE_TZ)
-        intra_daily = (
-            local_5m.resample("1D").agg(agg)
-            .dropna(subset=["open", "high", "low", "close"])
-        )
-        # Overwrite/append with higher-res 5m-resampled daily rows
-        daily = daily.combine_first(intra_daily)
-        daily.update(intra_daily)          # prefer 5m-derived values for overlap days
-        daily.sort_index(inplace=True)
-
     return daily
 
 
 def _compute_signals_full(
     daily: pd.DataFrame,
+    start_dt: pd.Timestamp,
 ) -> list[tuple[pd.Timestamp, str, float, str]]:
     """
-    Run fractal+CMO indicators on the full daily series and return every crossover
-    event as (date_IST, signal, price, reason).
+    Run fractal+CMO indicators on the full daily series.
+    Filter to timestamps >= start_dt to match user's sim_data slice.
+    Return events as (date_IST, signal, price, reason).
     """
     if daily.empty:
         return []
+
+    # Strip timezone completely before resampling and joining, identical to user_script
+    if daily.index.tz is not None:
+        daily.index = daily.index.tz_localize(None)
 
     weekly = (
         daily.resample("W-MON", label="left", closed="left")
@@ -362,28 +296,40 @@ def _compute_signals_full(
 
     critical = ["close", "w_upper", "ema_cmo", "sma_cmo", "w_ema_cmo", "w_sma_cmo"]
     aligned = aligned.dropna(subset=critical)
-    if len(aligned) < 2:
+
+    # Restore timezone to Asia/Kolkata
+    aligned.index = aligned.index.tz_localize(EXCHANGE_TZ)
+
+    # Note: start_dt is passed timezone-aware, so we use it directly
+    sim_data = aligned[aligned.index >= start_dt]
+    if sim_data.empty:
         return []
 
     events: list[tuple[pd.Timestamp, str, float, str]] = []
 
-    for i in range(1, len(aligned)):
-        prev = aligned.iloc[i - 1]
-        curr = aligned.iloc[i]
-        day  = aligned.index[i]
+    for i in range(len(sim_data)):
+        curr = sim_data.iloc[i]
+        day  = sim_data.index[i]
 
-        # SELL — priority
-        d_sell = curr["ema_cmo"] < curr["sma_cmo"] and prev["ema_cmo"] >= prev["sma_cmo"]
-        w_sell = curr["w_ema_cmo"] < curr["w_sma_cmo"] and prev["w_ema_cmo"] >= prev["w_sma_cmo"]
-        if d_sell or w_sell:
-            events.append((day, "SELL", float(curr["close"]),
-                           "daily_cmo_crossdown" if d_sell else "weekly_cmo_crossdown"))
-            continue
+        if i > 0:
+            prev = sim_data.iloc[i - 1]
 
-        # BUY
-        if prev["close"] <= prev["w_upper"] and curr["close"] > curr["w_upper"]:
-            events.append((day, "BUY", float(curr["w_upper"]),
-                           "daily_close_crossed_weekly_upper_band"))
+            # BUY
+            if prev["close"] <= prev["w_upper"] and curr["close"] > curr["w_upper"]:
+                events.append((day, "BUY", float(curr["w_upper"]),
+                               "daily_close_crossed_weekly_upper_band"))
+
+            # SELL
+            d_sell = curr["ema_cmo"] < curr["sma_cmo"] and prev["ema_cmo"] >= prev["sma_cmo"]
+            w_sell = curr["w_ema_cmo"] < curr["w_sma_cmo"] and prev["w_ema_cmo"] >= prev["w_sma_cmo"]
+            if d_sell or w_sell:
+                events.append((day, "SELL", float(curr["close"]),
+                               "daily_cmo_crossdown" if d_sell else "weekly_cmo_crossdown"))
+
+        elif i == 0:
+            if curr["close"] > curr["w_upper"]:
+                events.append((day, "BUY", float(curr["w_upper"]),
+                               "day1_close_above_weekly_upper_band"))
 
     return events
 
@@ -410,7 +356,6 @@ class Trade:
 
 def stage2_replay(
     daily_all: dict[str, pd.DataFrame],
-    intra_all: dict[str, pd.DataFrame],
 ) -> list[Trade]:
     print(f"{'─'*60}")
     print(f"  Stage 2 — Signal computation & ledger replay")
@@ -421,7 +366,6 @@ def stage2_replay(
         return []
 
     print(f"  Symbols with daily data : {len(daily_all)}")
-    print(f"  Symbols with 5m data    : {len(intra_all)}")
     print(f"  Computing indicators …\n")
 
     # Backtest window filter
@@ -434,14 +378,13 @@ def stage2_replay(
     for i, symbol in enumerate(daily_all, 1):
         daily_series = _build_daily_series(
             daily_all[symbol],
-            intra_all.get(symbol, pd.DataFrame()),
         )
-        events = _compute_signals_full(daily_series)
+        events = _compute_signals_full(daily_series, bt_cutoff_ist)
         if events:
             sym_with_signals += 1
         for (day, sig, price, reason) in events:
-            if day >= bt_cutoff_ist:
-                all_events.append((day, symbol, sig, price, reason))
+            all_events.append((day, symbol, sig, price, reason))
+
         if i % 50 == 0 or i == len(daily_all):
             print(f"  [{i:3d}/{len(daily_all)}] computed … {sym_with_signals} with signals so far")
 
@@ -457,12 +400,16 @@ def stage2_replay(
 
     for (day, symbol, sig, price, reason) in all_events:
         if sig == "SELL" and symbol in positions:
-            pos = positions.pop(symbol)
-            pnl = (price - pos.avg_price) * pos.qty
-            trades.append(Trade(symbol=symbol, side="SELL", qty=pos.qty,
-                                price=price, capital=pos.qty * pos.avg_price,
-                                ts=day, reason=reason, pnl=pnl))
-            sells += 1
+            pos = positions[symbol]
+            # Enforce 1-day hold: the user script uses `elif in_position` to prevent
+            # selling on the EXACT SAME DAY as a buy.
+            if day.date() > pos.opened_at.date():
+                pos = positions.pop(symbol)
+                pnl = (price - pos.avg_price) * pos.qty
+                trades.append(Trade(symbol=symbol, side="SELL", qty=pos.qty,
+                                    price=price, capital=pos.qty * pos.avg_price,
+                                    ts=day, reason=reason, pnl=pnl))
+                sells += 1
 
         elif sig == "BUY" and symbol not in positions:
             qty = max(1, int(CAPITAL_PER_TRADE / price)) if price > 0 else 1
@@ -479,7 +426,7 @@ def stage2_replay(
     # Force-close open positions at last known price
     print(f"\n  Force-closing {len(positions)} open position(s) at last price …")
     for symbol, pos in positions.items():
-        src = intra_all.get(symbol) if symbol in intra_all else daily_all.get(symbol)
+        src = daily_all.get(symbol)
         last_price = float(src["close"].iloc[-1]) if src is not None and not src.empty else pos.avg_price
         last_ts    = now_ist
         pnl        = (last_price - pos.avg_price) * pos.qty
@@ -533,7 +480,7 @@ def stage3_report(trades: list[Trade], total_symbols: int) -> None:
     lines = [
         "=" * 60,
         "  Nifty 500 Fractal Momentum — Backtest Report",
-        f"  Data          : {DAILY_LOOKBACK} daily + {INTRADAY_DAYS}d 5m (warmup)",
+        f"  Data          : {DAILY_LOOKBACK} daily (warmup)",
         f"  Backtest      : last {BACKTEST_DAYS} days",
         f"  Universe      : {total_symbols} symbols",
         f"  Capital/trade : ₹{CAPITAL_PER_TRADE:,.0f}",
@@ -604,7 +551,7 @@ def main() -> None:
     print("\n" + "═" * 60)
     print(f"  Stocking — Fractal Momentum Backtest")
     print(f"  Exchange : {EXCHANGE_TZ}  |  Suffix: {TICKER_SUFFIX}")
-    print(f"  Data: {DAILY_LOOKBACK} daily warmup + {INTRADAY_DAYS}d 5m | Backtest: last {BACKTEST_DAYS}d")
+    print(f"  Data: {DAILY_LOOKBACK} daily warmup | Backtest: last {BACKTEST_DAYS}d")
     print("═" * 60)
 
     symbols = _read_symbols(args.csv)
@@ -614,13 +561,13 @@ def main() -> None:
     print(f"  Backtest DB : {DB_PATH}")
 
     if args.skip_download:
-        daily_all, intra_all = stage1_load_from_db(conn)
+        daily_all = stage1_load_from_db(conn)
     else:
-        daily_all, intra_all = stage1_download(symbols, conn)
+        daily_all = stage1_download(symbols, conn)
 
     conn.close()
 
-    trades = stage2_replay(daily_all, intra_all)
+    trades = stage2_replay(daily_all)
     stage3_report(trades, total_symbols=len(daily_all))
 
 
@@ -638,7 +585,6 @@ def run_backtest_for_strategy(
     suffix: str = ".NS",
     exchange_tz: str = "Asia/Kolkata",
     daily_lookback: str = "2y",
-    intraday_days: int = 60,
     backtest_days: int = 30,
     capital_per_trade: float = 100_000,
     fetch_concurrency: int = 16,
@@ -683,7 +629,6 @@ def run_backtest_for_strategy(
     _emit_status(f"📡 Stage 1 / 3 — Downloading {total} symbols from Yahoo Finance …")
 
     daily_all: dict[str, pd.DataFrame] = {}
-    intra_all: dict[str, pd.DataFrame] = {}
     failed: list[str] = []
     t0 = _time.monotonic()
 
@@ -702,14 +647,13 @@ def run_backtest_for_strategy(
     for chunk_start in range(0, total, CHUNK):
         chunk = raw_symbols[chunk_start: chunk_start + CHUNK]
         results = asyncio.run(_fetch_chunk(chunk))
-        for sym, daily, intra, err in results:
+        for sym, daily, err in results:
             done_count += 1
             if err or daily.empty:
                 failed.append(sym)
             else:
                 daily_all[sym] = daily
-                if not intra.empty:
-                    intra_all[sym] = intra
+            
             elapsed = _time.monotonic() - t0
             rate = done_count / elapsed if elapsed > 0 else 0
             remaining = int((total - done_count) / rate) if rate > 0 else 0
@@ -742,15 +686,8 @@ def run_backtest_for_strategy(
         daily_loc.index = daily_loc.index.tz_convert(exchange_tz)
         agg = {"open": "first", "high": "max", "low": "min", "close": "last", "volume": "sum"}
         daily_loc = daily_loc.resample("1D").agg(agg).dropna(subset=["open","high","low","close"])
-        if symbol in intra_all:
-            intra_loc = intra_all[symbol].copy()
-            intra_loc.index = intra_loc.index.tz_convert(exchange_tz)
-            intra_d = intra_loc.resample("1D").agg(agg).dropna(subset=["open","high","low","close"])
-            daily_loc = daily_loc.combine_first(intra_d)
-            daily_loc.update(intra_d)
-            daily_loc.sort_index(inplace=True)
 
-        all_sym_events = _compute_signals_full(daily_loc)   # full history
+        all_sym_events = _compute_signals_full(daily_loc, bt_cutoff)   # full history
         n_in_window = 0
         for (day, sig, price, reason) in all_sym_events:
             if day >= bt_cutoff:
@@ -808,7 +745,7 @@ def run_backtest_for_strategy(
     # Force-close open positions at last known price
     # FIX: use explicit 'in' check instead of 'or' to avoid DataFrame truth-value error
     for symbol, pos in positions.items():
-        src = intra_all[symbol] if symbol in intra_all else daily_all.get(symbol)
+        src = daily_all.get(symbol)
         last_price = float(src["close"].iloc[-1]) if src is not None and not src.empty else pos.avg_price
         pnl = (last_price - pos.avg_price) * pos.qty
         trades.append(Trade(symbol=symbol, side="SELL_EOB", qty=pos.qty,
@@ -843,7 +780,7 @@ def run_backtest_for_strategy(
         lines = [
             "=" * 60,
             f"  Fractal Momentum Backtest — {suffix} / {exchange_tz}",
-            f"  Data   : {daily_lookback} daily + {intraday_days}d 5m (warmup)",
+            f"  Data   : {daily_lookback} daily (warmup)",
             f"  Window : last {backtest_days} days",
             f"  Universe: {total} symbols  |  Capital/trade: {capital_per_trade:,.0f}",
             "=" * 60, "",

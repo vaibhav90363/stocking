@@ -677,9 +677,9 @@ with tab_health:
         _cfg5   = _lc5()
         _repo5  = _TR5(_cfg5.database_url or _cfg5.db_path)
         _tables = [
-            "universe", "candles_5m", "signals",
+            "universe", "signals",
             "positions_ledger", "trade_activity_log",
-            "pnl_snapshots", "run_metrics",
+            "pnl_snapshots", "run_metrics", "candles_1d",
         ]
         _counts = {}
         for _t in _tables:

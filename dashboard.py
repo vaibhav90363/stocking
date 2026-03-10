@@ -179,7 +179,7 @@ def run_dashboard(strategy_name_or_path=None):
             "DB Path":       str(cfg.db_path),
             "Ticker Suffix": cfg.ticker_suffix,
             "Cycle (s)":     cfg.cycle_seconds,
-            "Fetch Lookback":f"{cfg.fetch_lookback_days}d",
+            "Fetch Lookback":f"{cfg.fetch_lookback_days}d (1D Polling)",
             "Compute Window":f"{cfg.compute_lookback_days}d",
             "Fetch Workers": cfg.max_fetch_concurrency,
             "Compute Workers": cfg.compute_workers,

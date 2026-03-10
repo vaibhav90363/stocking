@@ -21,9 +21,9 @@ def fractal_chaos_bands(data: pd.DataFrame, left_window: int = 2, right_window: 
     left_min_low  = low.shift(1).rolling(window=left_window, min_periods=left_window).min()
 
     # Rolling max/min over the RIGHT window (future bars)
-    # shift(-right_window) aligns the rolling window to look ahead
-    right_max_high = high.shift(-1).rolling(window=right_window, min_periods=right_window).max()
-    right_min_low  = low.shift(-1).rolling(window=right_window, min_periods=right_window).min()
+    # Shift AFTER rolling puts the window exactly ahead of the current bar
+    right_max_high = high.rolling(window=right_window, min_periods=right_window).max().shift(-right_window)
+    right_min_low  = low.rolling(window=right_window, min_periods=right_window).min().shift(-right_window)
 
     is_upper_fractal = (high > left_max_high) & (high > right_max_high)
     is_lower_fractal = (low  < left_min_low)  & (low  < right_min_low)

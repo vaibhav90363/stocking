@@ -25,26 +25,14 @@ def _empty(symbol: str, reason: str) -> dict[str, Any]:
     }
 
 
-def _to_daily_weekly(df_5m: pd.DataFrame, exchange_tz: str) -> tuple[pd.DataFrame, pd.DataFrame]:
-    local = df_5m.copy()
+def _to_weekly(daily: pd.DataFrame, exchange_tz: str) -> pd.DataFrame:
+    local = daily.copy()
+    if local.index.tz is None:
+        local.index = local.index.tz_localize("UTC")
     local.index = local.index.tz_convert(exchange_tz)
 
-    daily = (
-        local.resample("1D")
-        .agg(
-            {
-                "open": "first",
-                "high": "max",
-                "low": "min",
-                "close": "last",
-                "volume": "sum",
-            }
-        )
-        .dropna(subset=["open", "high", "low", "close"])
-    )
-
     weekly = (
-        daily.resample("W-MON", label="left", closed="left")
+        local.resample("W-MON", label="left", closed="left")
         .agg(
             {
                 "open": "first",
@@ -57,7 +45,7 @@ def _to_daily_weekly(df_5m: pd.DataFrame, exchange_tz: str) -> tuple[pd.DataFram
         .dropna(subset=["open", "high", "low", "close"])
     )
 
-    return daily, weekly
+    return weekly
 
 
 def _compute_latest_signal(daily: pd.DataFrame, weekly: pd.DataFrame) -> tuple[str | None, float | None, str]:
@@ -119,26 +107,26 @@ def _compute_latest_signal(daily: pd.DataFrame, weekly: pd.DataFrame) -> tuple[s
     return None, None, "no_signal"
 
 
-def compute_symbol_signal(symbol: str, df_5m: pd.DataFrame, exchange_tz: str) -> dict[str, Any]:
+def compute_symbol_signal(symbol: str, daily: pd.DataFrame, exchange_tz: str) -> dict[str, Any]:
     """
-    Compute the latest signal for a symbol given its 5m candle DataFrame.
+    Compute the latest signal for a symbol given its 1d candle DataFrame.
     """
 
-    if df_5m.empty:
-        return _empty(symbol, "no_5m_candles")
+    if daily.empty:
+        return _empty(symbol, "no_daily_candles")
 
-    last_ts = df_5m.index[-1]
-    last_price = float(df_5m["close"].iloc[-1])
+    last_ts = daily.index[-1]
+    last_price = float(daily["close"].iloc[-1])
 
-    daily, weekly = _to_daily_weekly(df_5m, exchange_tz=exchange_tz)
-    if daily.empty or weekly.empty:
+    weekly = _to_weekly(daily, exchange_tz=exchange_tz)
+    if weekly.empty:
         return {
             "symbol": symbol,
             "asof_ts": last_ts.isoformat(),
             "last_price": last_price,
             "signal": None,
             "signal_price": None,
-            "signal_reason": "insufficient_daily_or_weekly_bars",
+            "signal_reason": "insufficient_weekly_bars",
         }
 
     signal, signal_price, reason = _compute_latest_signal(daily, weekly)

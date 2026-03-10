@@ -66,7 +66,7 @@ exchange:
 
 engine:
   cycle_seconds: 300         # how often the engine runs a full cycle (seconds)
-  fetch_lookback_days: 10    # days of 5m bars to fetch per cycle
+  fetch_lookback_days: 10    # days of 1D bars to fetch per cycle (polling)
   compute_lookback_days: 365 # total lookback window for indicator calculations
   fetch_concurrency: 16      # parallel download threads
   compute_workers: 4         # parallel signal-computation processes
@@ -81,7 +81,6 @@ parameters:
 
 backtest:
   daily_lookback: "2y"       # how much historical daily data to download
-  intraday_days: 60          # days of 5m bars to download for backtest
   backtest_days: 30          # rolling window used to evaluate signals
 ```
 
@@ -119,8 +118,8 @@ Open `stocking_app/strategy.py`. This is where BUY and SELL conditions are compu
 ### Understanding the Signal Function Contract
 
 The engine calls `compute_symbol_signal(db_path, symbol, lookback_days, exchange_tz)` for every symbol each cycle. The function:
-1. Loads 5-minute OHLCV bars from the Postgres DB
-2. Resamples them into daily and weekly DataFrames
+1. Loads daily (1D) OHLCV bars from the Postgres DB
+2. Runs your indicator calculations
 3. Runs your indicator calculations
 4. Returns exactly one of: `"BUY"`, `"SELL"`, or `None`
 
@@ -240,7 +239,7 @@ python run_strategy.py strategies/my_new_strategy_nse --mode backtest --skip-dow
 ```
 
 **What happens internally:**
-1. `backtest_sim.py` downloads daily + 5m OHLCV from Yahoo Finance for every symbol in your `universe.csv`
+1. `backtest_sim.py` downloads historical 1D OHLCV from Yahoo Finance for every symbol in your `universe.csv`
 2. It simulates the strategy signal day-by-day over the `backtest_days` window
 3. Trades are recorded: BUY → SELL pairs with calculated P&L
 4. Results written to `data/backtest/report.txt` and `trades.csv`
@@ -283,8 +282,8 @@ Each cycle runs three phases:
 
 ### Phase 1: FETCH
 - Reads all active symbols from the `universe` table + any open position symbols
-- Downloads 5-minute OHLCV bars from Yahoo Finance (parallel, up to `fetch_concurrency` threads)
-- Upserts every bar into `candles_5m` table (keyed on `symbol + ts`)
+- Downloads dynamically updating 1D OHLCV bars from Yahoo Finance (parallel, up to `fetch_concurrency` threads)
+- Upserts every bar into `daily_bars` table (keyed on `symbol + ts`)
 - Updates `symbol_state.last_candle_ts` for each symbol
 - **Log format:** `[1/3] FETCH — 120 symbols  (lookback=10d)`
 
@@ -319,7 +318,7 @@ This is controlled by `STOCKING_AUTO_SCHEDULE` env var (default: `1` = on).
 | Table | Purpose |
 |---|---|
 | `universe` | All symbols to monitor (`is_active=1`) |
-| `candles_5m` | Raw 5-minute OHLCV bars, keyed on `(symbol, ts)` |
+| `daily_bars` | End-of-day and real-time 1D OHLCV bars, keyed on `(symbol, ts)` |
 | `symbol_state` | Tracks `last_candle_ts` and `last_compute_ts` per symbol |
 | `signals` | Every BUY/SELL signal ever generated, with `acted` flag |
 | `positions_ledger` | Currently open positions with `avg_price`, `qty`, `last_price` |
@@ -346,7 +345,7 @@ Log file location: `strategies/my_new_strategy_nse/data/logs/engine.log`
 ```
 2026-02-28 09:20:01  INFO     ┌─ Cycle #1 started  [2026-02-28T03:50:01+00:00]
 2026-02-28 09:20:01  INFO       [1/3] FETCH  — 50 symbols  (lookback=10d)
-2026-02-28 09:20:14  INFO       ✓ 48/50 fetched  (23,040 bars)  | 13.2s  | 2 failed: SYMBOL1, SYMBOL2
+2026-02-28 09:20:14  INFO       ✓ 48/50 fetched  (48 bars)  | 13.2s  | 2 failed: SYMBOL1, SYMBOL2
 2026-02-28 09:20:14  INFO       [2/3] COMPUTE — 48 symbols pending
 2026-02-28 09:20:18  INFO       ✓ 48 computed  | 4.1s  | BUY signals: 2  SELL signals: 1
 2026-02-28 09:20:18  INFO       🟢 BUY   RELIANCE         @ 1234.5000  [rsi_oversold_crossup]

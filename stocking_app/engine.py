@@ -14,7 +14,7 @@ from pathlib import Path
 from typing import Any
 
 from .config import AppConfig, load_config
-from .data_fetcher import FetchResult, fetch_5m_bars_async_gen, fetch_daily_bars_async_gen
+from .data_fetcher import FetchResult, fetch_daily_bars_async_gen
 from .db import SignalRecord, TradingRepository, utc_now_iso
 from .market_schedule import market_status as get_market_status
 from .strategy import compute_symbol_signal
@@ -204,10 +204,10 @@ class ScalableEngine:
                 # the time until next open — but never more than 10 minutes so
                 # the heartbeat stays fresh and a manual enable is noticed quickly.
                 secs_to_next = mkt.get("next_event_secs", 0)
-                if secs_to_next > 0 and not mkt["market_open"]:
+                if secs_to_next is not None and secs_to_next > 0 and not mkt["market_open"]:
                     smart_sleep = max(
                         self.cfg.disabled_poll_seconds,  # floor: always ≥ poll interval
-                        min(secs_to_next // 2, 600),     # cap at 10 min so heartbeat stays alive
+                        min(int(secs_to_next) // 2, 600),     # cap at 10 min so heartbeat stays alive
                     )
                 else:
                     smart_sleep = self.cfg.disabled_poll_seconds
@@ -337,9 +337,11 @@ class ScalableEngine:
         state = {"total_bars": 0}
 
         async def _run_fetcher():
-            gen = fetch_5m_bars_async_gen(
+            # BUG-FIX: We no longer fetch 5m data. We fetch 1d data every cycle
+            # because Yahoo Finance updates the 1d candle dynamically intraday.
+            gen = fetch_daily_bars_async_gen(
                 live_symbols,
-                lookback_days=self.cfg.fetch_lookback_days,
+                lookback_days=self.cfg.daily_lookback_days,
                 max_concurrency=self.cfg.max_fetch_concurrency,
             )
             count = 0
@@ -368,7 +370,7 @@ class ScalableEngine:
 
             # ── Bulk upsert after all batches have landed ────────────────────
             for result in good_results:
-                self.repo.upsert_candles(result.symbol, result.bars)
+                self.repo.upsert_candles_1d(result.symbol, result.bars)
                 fetched_symbols.append(result.symbol)
                 state["total_bars"] += len(result.bars)
                 # BUG-07: successful fetch resets the dead-symbol counter
@@ -430,49 +432,6 @@ class ScalableEngine:
             + (f"  | {len(failed_symbols)} failed: {', '.join(failed_sample)}" if failed_symbols else "")
         )
 
-        # ── Phase 1b: Daily bars fetch (only when needed) ──────────────────────
-        # Fetch daily bars for long-horizon weekly fractal. We only fetch for
-        # symbols that don't already have data through yesterday — so after the
-        # first cycle we skip the full 500-symbol daily fetch on most cycles,
-        # avoiding ~800s and rate limits every 5 minutes.
-        symbols_needing_daily = self.repo.get_symbols_needing_daily_fetch(symbols)
-        daily_fetch_start = time.monotonic()
-        daily_state = {"fetched": 0, "failed": 0}
-
-        if not symbols_needing_daily:
-            self.log.info(
-                f"  [1b/3] FETCH 1d — skip (all {total} symbols already have fresh daily data)"
-            )
-        else:
-            self.log.info(
-                f"  [1b/3] FETCH 1d — {len(symbols_needing_daily)}/{total} symbols  "
-                f"(lookback={self.cfg.daily_lookback_days}d)"
-            )
-            async def _run_daily_fetch():
-                gen = fetch_daily_bars_async_gen(
-                    symbols_needing_daily,
-                    lookback_days=self.cfg.daily_lookback_days,
-                    max_concurrency=self.cfg.max_fetch_concurrency,
-                )
-                good_daily: list[FetchResult] = []
-                async for result in gen:
-                    if result.error or result.bars.empty:
-                        daily_state["failed"] += 1
-                    else:
-                        good_daily.append(result)
-                for result in good_daily:
-                    self.repo.upsert_candles_1d(result.symbol, result.bars)
-                    daily_state["fetched"] += 1
-
-            asyncio.run(_run_daily_fetch())
-        daily_fetch_seconds = time.monotonic() - daily_fetch_start
-        if symbols_needing_daily:
-            self.log.info(
-                f"       ✓ {daily_state['fetched']}/{len(symbols_needing_daily)} daily fetched  "
-                f"| {daily_fetch_seconds:.1f}s"
-                + (f"  | {daily_state['failed']} failed" if daily_state["failed"] else "")
-            )
-
         symbols_to_compute = self.repo.get_symbols_pending_compute(fetched_symbols)
         self.log.info(f"  [2/3] COMPUTE — {len(symbols_to_compute)} symbols pending")
         
@@ -488,15 +447,14 @@ class ScalableEngine:
         compute_start = time.monotonic()
         compute_payloads: list[dict[str, Any]] = []
 
-        # BUG-10 fix: bulk-load all symbol candle data in 2 DB round-trips
+        # BUG-10 fix: bulk-load all symbol candle data in 1 DB round-trip
         # instead of N individual calls (one per symbol). At 100 symbols this
         # saves ~1.5s; at 500 symbols ~7.5s of serial DB idle time before any
         # compute thread can start.
-        self.log.debug(f"Bulk-loading candles for {len(symbols_to_compute)} symbols in 2 queries ...")
+        self.log.debug(f"Bulk-loading candles for {len(symbols_to_compute)} symbols in 1 query ...")
         all_bars = self.repo.get_combined_bars_for_symbols(
             symbols_to_compute,
             daily_lookback_days=self.cfg.daily_lookback_days,
-            recent_5m_days=self.cfg.fetch_lookback_days,
         )
 
         futures = {}
