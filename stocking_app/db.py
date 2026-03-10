@@ -486,6 +486,7 @@ class TradingRepository:
                     high=EXCLUDED.high,
                     low=EXCLUDED.low,
                     close=EXCLUDED.close,
+                    volume=EXCLUDED.volume
                 """,
                 rows,
             )
