@@ -166,9 +166,9 @@ def _store_daily(conn: sqlite3.Connection, symbol: str, df: pd.DataFrame) -> int
 
 def _read_symbols(csv_path: str) -> list[str]:
     df = pd.read_csv(csv_path)
-    col = next((c for c in df.columns if c.strip().lower() == "symbol"), None)
+    col = next((c for c in df.columns if c.strip().lower() in ("symbol", "ticker")), None)
     if col is None:
-        raise ValueError(f"No 'Symbol' column found. Columns: {list(df.columns)}")
+        raise ValueError(f"No 'Symbol' or 'Ticker' column found. Columns: {list(df.columns)}")
     return sorted({
         s.strip().upper() + ("" if s.strip().upper().endswith(TICKER_SUFFIX) else TICKER_SUFFIX)
         for s in df[col].dropna() if str(s).strip()
