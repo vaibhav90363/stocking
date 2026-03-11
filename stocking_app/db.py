@@ -40,7 +40,7 @@ def retry_on_disconnect(max_retries=3):
                         try:
                             res = func(self, *args, **kwargs)
                             if self.conn and not self.conn.autocommit:
-                                self.conn.commit()
+
                             return res
                         finally:
                             if self.conn:
@@ -268,7 +268,7 @@ class TradingRepository:
     def init_db(self) -> None:
         with self.conn.cursor() as cur:
             cur.execute(SCHEMA_SQL)
-        self.conn.commit()
+
         # ── Idempotent migrations for live databases ────────────────────────
         # These ALTER statements are no-ops if the constraint/index already exists.
         # They fix databases created before the constraint was in SCHEMA_SQL.
@@ -315,7 +315,7 @@ class TradingRepository:
             try:
                 with self.conn.cursor() as cur:
                     cur.execute(_sql)
-                self.conn.commit()
+
             except Exception as _me:
                 self.conn.rollback()
                 # Log but don't crash — the engine can still run without the constraint,
@@ -340,7 +340,7 @@ class TradingRepository:
                 """,
                 (key, "1" if enabled else "0", now),
             )
-        self.conn.commit()
+
 
     @retry_on_disconnect()
     def get_engine_enabled(self) -> bool | None:
@@ -365,7 +365,7 @@ class TradingRepository:
                 """,
                 (key, json.dumps(payload), now),
             )
-        self.conn.commit()
+
 
     @retry_on_disconnect()
     def get_engine_heartbeat(self) -> dict[str, Any] | None:
@@ -399,7 +399,7 @@ class TradingRepository:
                 """,
                 rows,
             )
-        self.conn.commit()
+
         return len(rows)
 
     @retry_on_disconnect()
@@ -490,7 +490,7 @@ class TradingRepository:
                 """,
                 (symbol, max_ts, now),
             )
-        self.conn.commit()
+
         return len(rows)
 
     @retry_on_disconnect()
@@ -514,7 +514,7 @@ class TradingRepository:
                 """,
                 rows,
             )
-        self.conn.commit()
+
 
     @retry_on_disconnect()
     def get_open_positions(self) -> dict[str, dict]:
@@ -715,7 +715,7 @@ class TradingRepository:
         # BUG-05 fix: commit immediately so the position is durable before
         # returning. Previously committed by the end-of-loop commit() — a crash
         # between execute_buy and that commit would silently lose the position.
-        self.conn.commit()
+
 
     @retry_on_disconnect()
     def execute_sell(self, symbol: str, price: float, ts: str, reason: str) -> "float | None":
@@ -739,7 +739,7 @@ class TradingRepository:
                 (symbol, qty, price, ts, pnl, reason, now),
             )
         # BUG-05 fix: commit immediately so the closed position is durable.
-        self.conn.commit()
+
         return pnl
 
     @retry_on_disconnect()
@@ -811,7 +811,7 @@ class TradingRepository:
         }
 
     def commit(self) -> None:
-        self.conn.commit()
+
 
     @retry_on_disconnect()
     def record_run_metrics(self, payload: dict[str, Any]) -> None:
@@ -840,7 +840,7 @@ class TradingRepository:
                     payload.get("error"),
                 ),
             )
-        self.conn.commit()
+
 
     @retry_on_disconnect()
     def read_df(self, sql: str, params: tuple[Any, ...] = ()) -> pd.DataFrame:
@@ -872,7 +872,7 @@ class TradingRepository:
                 """,
                 (now, level, self.suffix, message),
             )
-        self.conn.commit()
+
 
     @retry_on_disconnect()
     def get_recent_logs(self, limit: int = 200) -> pd.DataFrame:

@@ -596,7 +596,6 @@ class ScalableEngine:
 
         snap_ts = utc_now_iso()
         self.repo.snapshot_pnl(ts=snap_ts)
-        self.repo.commit()
         persist_seconds = time.monotonic() - persist_start
 
         if actions_taken:
