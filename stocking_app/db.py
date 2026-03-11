@@ -522,7 +522,6 @@ class TradingRepository:
                 """,
                 rows,
             )
-            max_ts = df["_ts_str"].max()
             now = utc_now_iso()
             cur.execute(
                 """
@@ -532,7 +531,7 @@ class TradingRepository:
                     last_candle_ts=EXCLUDED.last_candle_ts,
                     updated_at=EXCLUDED.updated_at
                 """,
-                (symbol, max_ts, now),
+                (symbol, now, now),
             )
 
         return len(rows)
@@ -544,7 +543,7 @@ class TradingRepository:
         if not pairs:
             return
         now = utc_now_iso()
-        rows = [(sym, None, ts, now) for sym, ts in pairs]
+        rows = [(sym, None, now, now) for sym, ts in pairs]
         from psycopg2.extras import execute_values
         with self.conn.cursor() as cur:
             execute_values(

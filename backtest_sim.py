@@ -615,9 +615,9 @@ def run_backtest_for_strategy(
     # ── 1. Read symbols ──────────────────────────────────────────────────────
     _emit_status(f"📂 Reading universe CSV …")
     sym_df = pd.read_csv(universe_csv)
-    col = next((c for c in sym_df.columns if c.strip().lower() == "symbol"), None)
+    col = next((c for c in sym_df.columns if c.strip().lower() in ("symbol", "ticker")), None)
     if col is None:
-        raise ValueError(f"No 'Symbol' column in {universe_csv}. Found: {list(sym_df.columns)}")
+        raise ValueError(f"No 'Symbol' or 'Ticker' column in {universe_csv}. Found: {list(sym_df.columns)}")
     raw_symbols = sorted({
         s.strip().upper() + ("" if s.strip().upper().endswith(suffix) else suffix)
         for s in sym_df[col].dropna() if str(s).strip()
