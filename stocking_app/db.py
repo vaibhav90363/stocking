@@ -324,6 +324,9 @@ class TradingRepository:
                 _log.getLogger("stocking.engine").warning(
                     f"Migration skipped (non-fatal): {_me}"
                 )
+        if self.conn and not self.conn.autocommit:
+            self.conn.commit()
+            
         if self.get_engine_enabled() is None:
             self.set_engine_enabled(False)
 
