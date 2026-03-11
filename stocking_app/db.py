@@ -24,6 +24,7 @@ def retry_on_disconnect(max_retries=3):
     RuntimeError if we exit the retry loop without ever capturing an exception.
     BUG-02 fix: acquire the instance-level _lock before calling the wrapped method
     so that the main thread and worker threads never share the DB connection concurrently.
+    BUG-03 fix: explicitly getconn and putconn on a per-method basis to prevent PoolError.
     """
     def decorator(func):
         from functools import wraps
@@ -31,33 +32,48 @@ def retry_on_disconnect(max_retries=3):
         def wrapper(self, *args, **kwargs):
             import psycopg2
             import time
-            # BUG-02: serialise all DB access through an instance lock.
-            # On 512 MB / 0.15 CPU (compute_workers=1) this is rarely contended
-            # but protects the heartbeat writes that fire from the main thread
-            # while the single worker thread may still be reading cursor data.
             with self._lock:
                 last_err = None
                 for attempt in range(max_retries):
                     try:
                         self._ensure_connection()
-                        return func(self, *args, **kwargs)
+                        try:
+                            res = func(self, *args, **kwargs)
+                            if self.conn and not self.conn.autocommit:
+                                self.conn.commit()
+                            return res
+                        finally:
+                            if self.conn:
+                                try:
+                                    pool = self.get_pool(self.db_url)
+                                    pool.putconn(self.conn)
+                                except Exception:
+                                    pass
+                                self.conn = None
                     except (psycopg2.OperationalError, psycopg2.InterfaceError) as e:
                         last_err = e
-                        # Connection dropped — wipe so _ensure_connection reopens
                         if self.conn:
                             try:
-                                self.conn.close()
+                                pool = self.get_pool(self.db_url)
+                                pool.putconn(self.conn, close=True)
                             except Exception:
                                 pass
-                        self.conn = None
-                        # Exponential backoff: 0.5s, 1s, 2s
+                            self.conn = None
                         if attempt < max_retries - 1:
                             time.sleep(0.5 * (2 ** attempt))
-                # BUG-01: last_err is None only when max_retries=0; raise clearly.
+                    except Exception as e:
+                        if self.conn:
+                            try:
+                                self.conn.rollback()
+                            except Exception:
+                                pass
+                        raise e
+                        
                 if last_err is None:
                     raise RuntimeError(
                         f"{func.__name__}: retry_on_disconnect called with max_retries=0"
                     )
+
                 raise last_err
         return wrapper
     return decorator
@@ -223,58 +239,30 @@ class TradingRepository:
         # BUG-02 fix: per-instance lock serialises all DB calls. A threading.Lock
         # is ~56 bytes — negligible on the 512 MB budget.
         self._lock: threading.Lock = threading.RLock()
-        self._ensure_connection()
+        # Initialize pool on startup
+        self.get_pool(self.db_url)
 
     def _ensure_connection(self) -> None:
-        """Ensure connection is alive; reconnect if closed/dropped."""
-        try:
-            if self.conn and not self.conn.closed:
-                # Test the connection quickly
-                with self.conn.cursor() as cur:
-                    cur.execute("SELECT 1")
-                return
-        except Exception:
-            pass  # Connection is dead, we need a new one
-
-        if self.conn:
-            try:
-                self.conn.close()
-            except Exception:
-                pass
-
-        # Establish connection with RealDictCursor for dictionaries
-        # Add TCP keepalives to prevent Supabase/firewalls from dropping idle connections
-        try:
-            pool = self.get_pool(self.db_url)
-            self.conn = pool.getconn()
-            self.conn.autocommit = False # keep explicit commits
-        except Exception as e:
-            if "sqlite" not in str(self.db_url).lower():
-                raise e
-            # Fallback if someone mistakenly uses psycopg2 URL but points to sqlite logic 
-            # (though this repo implies all uses are now Postgres)
-            self.conn = psycopg2.connect(self.db_url, cursor_factory=RealDictCursor)
-            self.conn.autocommit = False
-
+        """Secure a connection for the current operation from the pool."""
+        pool = self.get_pool(self.db_url)
+        self.conn = pool.getconn()
+        self.conn.autocommit = False # keep explicit commits
+        
     def close(self) -> None:
-        if self.conn and not self.conn.closed:
-            try:
-                pool = self.get_pool(self.db_url)
-                pool.putconn(self.conn)
-            except Exception:
-                self.conn.close()
-            finally:
-                self.conn = None
+        pass # Connections are returned to pool automatically per-method
 
     def keepalive_ping(self) -> None:
-        """Send a lightweight SELECT 1 to keep the Postgres connection alive.
-        Call this during long idle phases (e.g. between fetch batches) to prevent
-        Supabase's PgBouncer from closing the connection due to inactivity.
-        """
+        """Send a lightweight SELECT 1 to keep the Postgres connection alive."""
         try:
-            self._ensure_connection()
+            pool = self.get_pool(self.db_url)
+            conn = pool.getconn()
+            try:
+                with conn.cursor() as cur:
+                    cur.execute("SELECT 1")
+            finally:
+                pool.putconn(conn)
         except Exception:
-            pass  # _ensure_connection already reconnects; silent failure is OK here
+            pass
 
     @retry_on_disconnect()
     def init_db(self) -> None:
