@@ -88,7 +88,7 @@ def _fetch_daily_batch_blocking(
                 auto_adjust=True,
                 prepost=False,
                 group_by="ticker",
-                threads=False,
+                threads=True,
                 progress=False,
                 timeout=30,
             )
@@ -100,7 +100,7 @@ def _fetch_daily_batch_blocking(
                 try:
                     if is_multi:
                         if y_sym in data.columns.get_level_values("Ticker"):
-                            df = data[y_sym].copy()
+                            df = data.xs(y_sym, level="Ticker", axis=1).copy()
                         else:
                             results.append(FetchResult(symbol=engine_sym, bars=pd.DataFrame(), error="Not found in Yahoo batch"))
                             continue
@@ -147,8 +147,11 @@ async def fetch_daily_bars_async_gen(
     BATCH_SIZE = 50  # 50 symbols per request is fine for daily interval
 
     batches = [symbols[i : i + BATCH_SIZE] for i in range(0, len(symbols), BATCH_SIZE)]
-    effective_concurrency = min(max_concurrency, 5)
-    semaphore = asyncio.Semaphore(max(1, effective_concurrency))
+    # BUG-FIX: yfinance internal threading (threads=True) is NOT thread-safe across
+    # multiple python concurrent threads. It will scramble responses. We MUST
+    # feed batches linearly (concurrency=1) and let yfinance parallelise internally.
+    effective_concurrency = 1
+    semaphore = asyncio.Semaphore(effective_concurrency)
 
     async def _wrapped(batch: list[str], idx: int) -> list[FetchResult]:
         async with semaphore:
