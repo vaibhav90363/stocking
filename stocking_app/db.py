@@ -688,6 +688,19 @@ class TradingRepository:
             )
 
     @retry_on_disconnect()
+    def has_acted_buy_today(self, symbol: str, day_iso: str) -> bool:
+        """
+        Check if a BUY signal has already been acted upon for this symbol on a specific day.
+        'day_iso' should match the 'ts' used in the signals table (e.g. YYYY-MM-DDT00:00:00+00:00).
+        """
+        with self.conn.cursor() as cur:
+            cur.execute(
+                "SELECT 1 FROM signals WHERE symbol=%s AND ts=%s AND signal_type='BUY' AND acted=1 LIMIT 1",
+                (symbol, day_iso)
+            )
+            return cur.fetchone() is not None
+
+    @retry_on_disconnect()
     def execute_buy(self, symbol: str, qty: int, price: float, ts: str, reason: str) -> None:
         now = utc_now_iso()
         with self.conn.cursor() as cur:
