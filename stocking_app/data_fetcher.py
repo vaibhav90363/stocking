@@ -136,10 +136,10 @@ def _fetch_daily_batch_blocking(
     ]
 
 
-async def fetch_daily_bars_async_gen(
+def fetch_daily_bars_gen(
     symbols: list[str], lookback_days: int, max_concurrency: int = 5
-) -> AsyncGenerator[FetchResult, None]:
-    """Async generator that fetches daily (1d) bars for all symbols in larger batches.
+) -> list[FetchResult]:
+    """Generator that fetches daily (1d) bars for all symbols in larger batches.
 
     Daily bars are ~75× smaller than 5m bars so we use bigger batches (50 symbols)
     and higher concurrency — Yahoo is far more lenient with daily interval requests.
@@ -150,24 +150,9 @@ async def fetch_daily_bars_async_gen(
     # BUG-FIX: yfinance internal threading (threads=True) is NOT thread-safe across
     # multiple python concurrent threads. It will scramble responses. We MUST
     # feed batches linearly (concurrency=1) and let yfinance parallelise internally.
-    effective_concurrency = 1
-    semaphore = asyncio.Semaphore(effective_concurrency)
-
-    async def _wrapped(batch: list[str], idx: int) -> list[FetchResult]:
-        async with semaphore:
-            try:
-                return await asyncio.wait_for(
-                    asyncio.to_thread(_fetch_daily_batch_blocking, batch, lookback_days, idx),
-                    timeout=60.0,
-                )
-            except asyncio.TimeoutError:
-                return [FetchResult(symbol=s, bars=pd.DataFrame(), error="Daily batch timed out") for s in batch]
-            except Exception as exc:
-                return [FetchResult(symbol=s, bars=pd.DataFrame(), error=f"Daily batch failed: {exc}") for s in batch]
-
-    tasks = [_wrapped(b, i) for i, b in enumerate(batches)]
-    for completed_task in asyncio.as_completed(tasks):
-        batch_results = await completed_task
-        for r in batch_results:
+    
+    for i, batch in enumerate(batches):
+        results = _fetch_daily_batch_blocking(batch, lookback_days, i)
+        for r in results:
             yield r
 

@@ -16,7 +16,7 @@ from typing import Any
 import pandas as pd
 
 from .config import AppConfig, load_config
-from .data_fetcher import FetchResult, fetch_daily_bars_async_gen
+from .data_fetcher import FetchResult, fetch_daily_bars_gen
 from .db import SignalRecord, TradingRepository, utc_now_iso
 from .market_schedule import market_status as get_market_status
 from .strategy import compute_symbol_signal
@@ -361,21 +361,31 @@ class ScalableEngine:
         failed_symbols: list[str] = []
         state = {"total_bars": 0}
 
-        async def _run_fetcher():
-            # BUG-FIX: We no longer fetch 5m data. We fetch 1d data every cycle
-            # because Yahoo Finance updates the 1d candle dynamically intraday.
-            gen = fetch_daily_bars_async_gen(
+        # ── Background DB keepalive during fetch ──────────────────────────────
+        # Supabase/PgBouncer kills idle connections after ~5 minutes.
+        # While yfinance fetches are running (can take 60-90s for 500 symbols),
+        # the main DB connection sits idle. Ping it every 30s to keep it alive.
+        _keepalive_stop = threading.Event()
+
+        def _keepalive_worker():
+            while not _keepalive_stop.wait(timeout=30):
+                self.repo.keepalive_ping()
+
+        _ka_thread = threading.Thread(target=_keepalive_worker, daemon=True, name="db-keepalive")
+        _ka_thread.start()
+
+        try:
+            # BUG-FIX: We no longer use asyncio. yfinance's internal threading
+            # combined with asyncio.to_thread caused deadlocks on Render.
+            # Use a plain synchronous generator instead.
+            gen = fetch_daily_bars_gen(
                 live_symbols,
                 lookback_days=self.cfg.daily_lookback_days,
                 max_concurrency=self.cfg.max_fetch_concurrency,
             )
             count = 0
-            # ── Buffer all results; do NOT upsert inside the hot async loop ──
-            # Mixing DB writes with in-flight yfinance requests serialises I/O:
-            # each symbol blocks the fetcher while waiting for a DB round-trip.
-            # Collect everything first, then upsert in one sequential pass below.
             good_results: list[FetchResult] = []
-            async for result in gen:
+            for result in gen:
                 count += 1
                 if result.error or result.bars.empty:
                     failed_symbols.append(result.symbol)
@@ -402,33 +412,20 @@ class ScalableEngine:
                 self._empty_fetch_counts.pop(result.symbol, None)
 
             # BUG-07: increment counters for symbols that returned nothing
+            newly_dead: list[str] = []
             for sym in failed_symbols:
                 self._empty_fetch_counts[sym] = self._empty_fetch_counts.get(sym, 0) + 1
                 if self._empty_fetch_counts[sym] >= self.DEAD_SYMBOL_THRESHOLD and sym not in self._dead_symbols:
                     self._dead_symbols.add(sym)
+                    newly_dead.append(sym)
                     self.log.warning(
                         f"  ⚠ {sym}: empty fetch for {self.DEAD_SYMBOL_THRESHOLD} consecutive cycles. "
-                        f"Treating as de-listed — permanently suspending in database and skipping in future cycles."
+                        f"Treating as de-listed — permanently suspending."
                     )
-                    self.repo.mark_symbols_inactive([sym])
-        
-        # ── Background DB keepalive during fetch ──────────────────────────────
-        # Supabase/PgBouncer kills idle connections after ~5 minutes.
-        # While yfinance fetches are running (can take 60-90s for 500 symbols),
-        # the main DB connection sits idle. Ping it every 30s to keep it alive.
-        _keepalive_stop = threading.Event()
 
-        def _keepalive_worker():
-            while not _keepalive_stop.wait(timeout=30):
-                self.repo.keepalive_ping()
-
-        # BUG-15 fix: asyncio is already imported at module level (line 3).
-        # Removed duplicate `import asyncio` that was inside this function.
-        _ka_thread = threading.Thread(target=_keepalive_worker, daemon=True, name="db-keepalive")
-        _ka_thread.start()
-
-        try:
-            asyncio.run(_run_fetcher())
+            # Persist dead symbols to DB so they stay dead across restarts
+            if newly_dead:
+                self.repo.mark_symbols_inactive(newly_dead)
         finally:
             _keepalive_stop.set()
             _ka_thread.join(timeout=2)
