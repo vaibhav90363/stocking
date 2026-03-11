@@ -248,10 +248,11 @@ def run_dashboard(strategy_name_or_path=None):
     st.divider()
 
     # ── Tabs ───────────────────────────────────────────────────────────────────────
-    tab_overview, tab_portfolio, tab_universe, tab_signals, tab_ledger, tab_system, tab_log = st.tabs([
+    tab_overview, tab_portfolio, tab_universe, tab_deepdive, tab_signals, tab_ledger, tab_system, tab_log = st.tabs([
         "📊 Overview",
         "💰 Portfolio",
         "🌐 Universe",
+        "🔬 Deep Dive",
         "🚦 Signals",
         "📒 Ledger",
         "⚙️ System",
@@ -467,7 +468,114 @@ def run_dashboard(strategy_name_or_path=None):
 
 
     # ══════════════════════════════════════════════════════════════════════════════
-    # TAB 4 — SIGNALS
+    # TAB 4 — DEEP DIVE
+    # ══════════════════════════════════════════════════════════════════════════════
+    with tab_deepdive:
+        st.markdown('<p class="section-header">Symbol Deep Dive</p>', unsafe_allow_html=True)
+        st.caption("Select a symbol to view its complete indicator calculations and charts.")
+
+        active_symbols = uni_summary.get("active", 0)
+        
+        if active_symbols == 0:
+            st.info("No active symbols in universe.")
+        else:
+            # Get list of all active symbols
+            active_df = repo.read_df(
+                "SELECT symbol FROM universe WHERE is_active=1 AND symbol LIKE %s ORDER BY symbol",
+                (f"%{cfg.ticker_suffix}",)
+            )
+            
+            if not active_df.empty:
+                symbols_list = active_df["symbol"].tolist()
+                
+                selected_symbol = st.selectbox("Select Symbol", symbols_list)
+                
+                if selected_symbol:
+                    with st.spinner(f"Loading data for {selected_symbol}..."):
+                        # Fetch the raw daily bars
+                        daily_bars_dict = repo.get_combined_bars_for_symbols(
+                            [selected_symbol],
+                            daily_lookback_days=cfg.compute_lookback_days
+                        )
+                        
+                        daily = daily_bars_dict.get(selected_symbol)
+                        
+                        if daily is None or daily.empty:
+                            st.warning(f"No daily bar data found for {selected_symbol}.")
+                        else:
+                            from stocking_app.strategy import compute_all_indicators
+                            import plotly.graph_objects as go
+                            from plotly.subplots import make_subplots
+                            
+                            # Run the shared indicator logic
+                            try:
+                                aligned = compute_all_indicators(daily, cfg.exchange_tz)
+                                
+                                if aligned.empty:
+                                    st.warning(f"Insufficient data to compute indicators for {selected_symbol}.")
+                                else:
+                                    # Plotting
+                                    st.markdown(f"### 📈 {selected_symbol} Charts")
+                                    
+                                    # Create figure with secondary y-axis
+                                    fig = make_subplots(rows=2, cols=1, shared_xaxes=True, 
+                                                        vertical_spacing=0.1, 
+                                                        subplot_titles=('Price & Fractal Band', 'CMO Oscillator'),
+                                                        row_heights=[0.7, 0.3])
+
+                                    # Top Plot: Price & Fractal Band
+                                    # We can use a simple line chart for close price to keep it clean, or candlestick if we have open/high/low/close
+                                    if all(col in aligned.columns for col in ['open', 'high', 'low', 'close']):
+                                        fig.add_trace(go.Candlestick(x=aligned.index,
+                                                        open=aligned['open'],
+                                                        high=aligned['high'],
+                                                        low=aligned['low'],
+                                                        close=aligned['close'],
+                                                        name='Price'
+                                                    ), row=1, col=1)
+                                    else:
+                                        fig.add_trace(go.Scatter(x=aligned.index, y=aligned['close'], mode='lines', name='Close Price', line=dict(color='white')), row=1, col=1)
+                                    
+                                    if 'weekly_upper_band' in aligned.columns:
+                                        fig.add_trace(go.Scatter(x=aligned.index, y=aligned['weekly_upper_band'], mode='lines', name='Weekly Upper Band', line=dict(color='cyan', dash='dash')), row=1, col=1)
+
+                                    # Bottom Plot: CMO, EMA, SMA
+                                    if 'cmo' in aligned.columns:
+                                        fig.add_trace(go.Scatter(x=aligned.index, y=aligned['cmo'], mode='lines', name='CMO', line=dict(color='gray', width=1)), row=2, col=1)
+                                    if 'ema_cmo' in aligned.columns:
+                                        fig.add_trace(go.Scatter(x=aligned.index, y=aligned['ema_cmo'], mode='lines', name='EMA(CMO)', line=dict(color='yellow')), row=2, col=1)
+                                    if 'sma_cmo' in aligned.columns:
+                                        fig.add_trace(go.Scatter(x=aligned.index, y=aligned['sma_cmo'], mode='lines', name='SMA(CMO)', line=dict(color='orange')), row=2, col=1)
+
+                                    # Update layout
+                                    fig.update_layout(height=700, showlegend=True,
+                                                      xaxis_rangeslider_visible=False,
+                                                      margin=dict(l=20, r=20, t=40, b=20),
+                                                      template="plotly_dark")
+                                    
+                                    st.plotly_chart(fig, use_container_width=True)
+                                    
+                                    # Raw Data
+                                    st.markdown("### 🧮 Raw Indicator Data (Latest 20 Days)")
+                                    
+                                    # Format datetime index for display
+                                    display_df = aligned.copy()
+                                    display_df.index = display_df.index.strftime('%Y-%m-%d')
+                                    
+                                    # Order columns nicely
+                                    cols_to_show = ['close', 'weekly_upper_band', 'cmo', 'ema_cmo', 'sma_cmo', 'weekly_ema_cmo', 'weekly_sma_cmo']
+                                    available_cols = [c for c in cols_to_show if c in display_df.columns]
+                                    
+                                    st.dataframe(
+                                        display_df[available_cols].tail(20).style.format("{:.4f}"),
+                                        use_container_width=True
+                                    )
+                                    
+                            except Exception as e:
+                                st.error(f"Error computing indicators: {e}")
+
+    # ══════════════════════════════════════════════════════════════════════════════
+    # TAB 5 — SIGNALS
     # ══════════════════════════════════════════════════════════════════════════════
     with tab_signals:
         st.markdown('<p class="section-header">Signal Summary</p>', unsafe_allow_html=True)

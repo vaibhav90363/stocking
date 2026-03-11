@@ -48,8 +48,13 @@ def _to_weekly(daily: pd.DataFrame, exchange_tz: str) -> pd.DataFrame:
     return weekly
 
 
-def _compute_latest_signal(daily: pd.DataFrame, weekly: pd.DataFrame) -> tuple[str | None, float | None, str]:
+def compute_all_indicators(daily: pd.DataFrame, exchange_tz: str) -> pd.DataFrame:
     from .indicators import calculate_cmo, ema, fractal_chaos_bands, sma
+
+    weekly = _to_weekly(daily, exchange_tz=exchange_tz)
+    
+    if weekly.empty:
+        return pd.DataFrame()
 
     weekly = fractal_chaos_bands(weekly, FRACTAL_LEFT_WINDOW, FRACTAL_RIGHT_WINDOW)
 
@@ -74,6 +79,10 @@ def _compute_latest_signal(daily: pd.DataFrame, weekly: pd.DataFrame) -> tuple[s
     aligned[["weekly_upper_band", "weekly_ema_cmo", "weekly_sma_cmo"]] = aligned[
         ["weekly_upper_band", "weekly_ema_cmo", "weekly_sma_cmo"]
     ].ffill()
+
+    return aligned
+
+def _compute_latest_signal(aligned: pd.DataFrame) -> tuple[str | None, float | None, str]:
 
     critical = [
         "close",
@@ -118,8 +127,9 @@ def compute_symbol_signal(symbol: str, daily: pd.DataFrame, exchange_tz: str) ->
     last_ts = daily.index[-1]
     last_price = float(daily["close"].iloc[-1])
 
-    weekly = _to_weekly(daily, exchange_tz=exchange_tz)
-    if weekly.empty:
+    aligned = compute_all_indicators(daily, exchange_tz)
+    
+    if aligned.empty:
         return {
             "symbol": symbol,
             "asof_ts": last_ts.isoformat(),
@@ -129,7 +139,7 @@ def compute_symbol_signal(symbol: str, daily: pd.DataFrame, exchange_tz: str) ->
             "signal_reason": "insufficient_weekly_bars",
         }
 
-    signal, signal_price, reason = _compute_latest_signal(daily, weekly)
+    signal, signal_price, reason = _compute_latest_signal(aligned)
     return {
         "symbol": symbol,
         "asof_ts": last_ts.isoformat(),

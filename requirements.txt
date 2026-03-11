@@ -9,3 +9,4 @@ requests>=2.31.0
 streamlit-autorefresh>=1.0.1
 lxml>=5.1.0
 html5lib>=1.1
+plotly>=5.0.0
