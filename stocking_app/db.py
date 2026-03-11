@@ -33,6 +33,10 @@ def retry_on_disconnect(max_retries=3):
             import psycopg2
             import time
             with self._lock:
+                is_nested = (getattr(self, 'conn', None) is not None)
+                if is_nested:
+                    return func(self, *args, **kwargs)
+
                 last_err = None
                 for attempt in range(max_retries):
                     try:
