@@ -199,8 +199,8 @@ def main():
         # ── Per-engine fetch-start stagger ─────────────────────────────────
         # Assign each engine a different delay so they don't all burst Yahoo
         # Finance simultaneously from the same IP on each cycle's first fetch.
-        # Order: 0s → 90s → 180s based on sorted directory index.
-        FETCH_DELAYS = [0, 90, 180]
+        # Order: 0s → 30s → 60s based on sorted directory index.
+        FETCH_DELAYS = [0, 30, 60]
 
         # ── Web Service: Health endpoint + Keep-Alive self-ping ─────────────
         # Start this in the parent watchdog process BEFORE spawning children so

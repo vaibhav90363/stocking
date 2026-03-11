@@ -44,14 +44,18 @@ def retry_on_disconnect(max_retries=3):
                         self._ensure_connection()
                         try:
                             res = func(self, *args, **kwargs)
-                            if self.conn and not self.conn.autocommit:
-                                self.conn.commit()
+                            # BUG-FIX: capture conn in a local var BEFORE the
+                            # finally block can race and set self.conn = None.
+                            conn = self.conn
+                            if conn and not conn.autocommit:
+                                conn.commit()
                             return res
                         finally:
-                            if self.conn:
+                            conn = self.conn
+                            if conn:
                                 try:
                                     pool = self.get_pool(self.db_url)
-                                    pool.putconn(self.conn)
+                                    pool.putconn(conn)
                                 except Exception:
                                     pass
                                 self.conn = None
