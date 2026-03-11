@@ -40,7 +40,7 @@ def retry_on_disconnect(max_retries=3):
                         try:
                             res = func(self, *args, **kwargs)
                             if self.conn and not self.conn.autocommit:
-
+                                self.conn.commit()
                             return res
                         finally:
                             if self.conn:
@@ -809,8 +809,6 @@ class TradingRepository:
             "total": total,
             "open_positions": float(open_positions),
         }
-
-    def commit(self) -> None:
 
 
     @retry_on_disconnect()
