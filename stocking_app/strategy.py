@@ -67,17 +67,18 @@ def compute_all_indicators(daily: pd.DataFrame, exchange_tz: str) -> pd.DataFram
     weekly["ema_cmo"] = ema(weekly["cmo"], CMO_EMA_PERIOD)
     weekly["sma_cmo"] = sma(weekly["cmo"], CMO_SMA_PERIOD)
 
-    weekly_aliased = weekly[["upper_band_line", "ema_cmo", "sma_cmo"]].rename(
+    weekly_aliased = weekly[["upper_band_line", "lower_band_line", "ema_cmo", "sma_cmo"]].rename(
         columns={
             "upper_band_line": "weekly_upper_band",
+            "lower_band_line": "weekly_lower_band",
             "ema_cmo": "weekly_ema_cmo",
             "sma_cmo": "weekly_sma_cmo",
         }
     )
 
     aligned = daily.join(weekly_aliased, how="left")
-    aligned[["weekly_upper_band", "weekly_ema_cmo", "weekly_sma_cmo"]] = aligned[
-        ["weekly_upper_band", "weekly_ema_cmo", "weekly_sma_cmo"]
+    aligned[["weekly_upper_band", "weekly_lower_band", "weekly_ema_cmo", "weekly_sma_cmo"]] = aligned[
+        ["weekly_upper_band", "weekly_lower_band", "weekly_ema_cmo", "weekly_sma_cmo"]
     ].ffill()
 
     return aligned
@@ -87,6 +88,7 @@ def _compute_latest_signal(aligned: pd.DataFrame) -> tuple[str | None, float | N
     critical = [
         "close",
         "weekly_upper_band",
+        "weekly_lower_band",
         "ema_cmo",
         "sma_cmo",
         "weekly_ema_cmo",

@@ -477,7 +477,7 @@ class ScalableEngine:
         self.log.debug(f"Bulk-loading candles for {len(symbols_to_compute)} symbols in 1 query ...")
         all_bars = self.repo.get_combined_bars_for_symbols(
             symbols_to_compute,
-            daily_lookback_days=self.cfg.daily_lookback_days,
+            daily_lookback_days=self.cfg.compute_lookback_days,
         )
 
         futures = {}

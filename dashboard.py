@@ -538,6 +538,8 @@ def run_dashboard(strategy_name_or_path=None):
                                     
                                     if 'weekly_upper_band' in aligned.columns:
                                         fig.add_trace(go.Scatter(x=aligned.index, y=aligned['weekly_upper_band'], mode='lines', name='Weekly Upper Band', line=dict(color='cyan', dash='dash')), row=1, col=1)
+                                    if 'weekly_lower_band' in aligned.columns:
+                                        fig.add_trace(go.Scatter(x=aligned.index, y=aligned['weekly_lower_band'], mode='lines', name='Weekly Lower Band', line=dict(color='pink', dash='dash')), row=1, col=1)
 
                                     # Bottom Plot: CMO, EMA, SMA
                                     if 'cmo' in aligned.columns:
@@ -563,7 +565,7 @@ def run_dashboard(strategy_name_or_path=None):
                                     display_df.index = display_df.index.strftime('%Y-%m-%d')
                                     
                                     # Order columns nicely
-                                    cols_to_show = ['close', 'weekly_upper_band', 'cmo', 'ema_cmo', 'sma_cmo', 'weekly_ema_cmo', 'weekly_sma_cmo']
+                                    cols_to_show = ['close', 'weekly_upper_band', 'weekly_lower_band', 'cmo', 'ema_cmo', 'sma_cmo', 'weekly_ema_cmo', 'weekly_sma_cmo']
                                     available_cols = [c for c in cols_to_show if c in display_df.columns]
                                     
                                     st.dataframe(
