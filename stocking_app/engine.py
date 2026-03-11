@@ -383,8 +383,9 @@ class ScalableEngine:
                     self._dead_symbols.add(sym)
                     self.log.warning(
                         f"  ⚠ {sym}: empty fetch for {self.DEAD_SYMBOL_THRESHOLD} consecutive cycles. "
-                        f"Treating as de-listed — skipping in future cycles."
+                        f"Treating as de-listed — permanently suspending in database and skipping in future cycles."
                     )
+                    self.repo.mark_symbols_inactive([sym])
         
         # ── Background DB keepalive during fetch ──────────────────────────────
         # Supabase/PgBouncer kills idle connections after ~5 minutes.

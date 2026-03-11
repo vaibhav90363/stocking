@@ -445,6 +445,28 @@ class TradingRepository:
             "active": int(row["active"] or 0),
         }
 
+    @retry_on_disconnect()
+    def mark_symbols_inactive(self, symbols: list[str]) -> None:
+        """Mark a batch of symbols as inactive (e.g. delisted) directly in the database.
+        This ensures they stay dead across engine restarts to avoid rate limit spikes."""
+        if not symbols:
+            return
+        now = utc_now_iso()
+        rows = [(0, now, s) for s in symbols]
+        from psycopg2.extras import execute_batch
+        with self.conn.cursor() as cur:
+            execute_batch(
+                cur,
+                """
+                UPDATE universe
+                SET is_active=%s, updated_at=%s
+                WHERE symbol=%s
+                """,
+                rows,
+            )
+        import logging
+        logging.getLogger("stocking.engine").info(f"  Permanently suspended {len(symbols)} dead symbols in database.")
+
 
     @retry_on_disconnect()
     def upsert_candles_1d(self, symbol: str, bars: pd.DataFrame) -> int:
