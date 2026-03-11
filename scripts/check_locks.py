@@ -1,8 +1,17 @@
+"""Check for stuck queries, blocked queries, and locks on critical tables.
+
+BUG-HASHTAG-05 fix: reads DATABASE_URL from environment instead of hardcoded credentials.
+"""
 import os
+import sys
 import psycopg2
 from pprint import pprint
 
-db_url = "postgresql://postgres:Iusestocking%40123@db.pycgaxrekawtsmrwkyoe.supabase.co:5432/postgres"
+db_url = os.environ.get("DATABASE_URL", "")
+if not db_url:
+    print("ERROR: DATABASE_URL environment variable is not set.", file=sys.stderr)
+    print("Set it before running:  export DATABASE_URL=postgresql://user:pass@host:5432/db", file=sys.stderr)
+    sys.exit(1)
 
 def check_stuck_queries():
     conn = psycopg2.connect(db_url)

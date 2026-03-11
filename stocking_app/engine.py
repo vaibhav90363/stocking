@@ -13,6 +13,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+import pandas as pd
+
 from .config import AppConfig, load_config
 from .data_fetcher import FetchResult, fetch_daily_bars_async_gen
 from .db import SignalRecord, TradingRepository, utc_now_iso
@@ -123,7 +125,30 @@ class ScalableEngine:
             )
             raise RuntimeError("DATABASE_URL is required but not set. Engine cannot start.")
 
+        # BUG-DUALENGINE-06 fix: check if another engine is already running
+        # before writing our PID. Prevents two engines from processing the same
+        # universe simultaneously, which wastes resources and causes race conditions.
         self.pid_file = Path(cfg.db_path).parent / "engine.pid"
+        if self.pid_file.exists():
+            try:
+                old_pid = int(self.pid_file.read_text().strip())
+                # Check if old PID is still alive
+                os.kill(old_pid, 0)  # signal 0 = just check existence
+                self.log.error(
+                    f"ENGINE STARTUP BLOCKED: Another engine (PID {old_pid}) is already running "
+                    f"for suffix {cfg.ticker_suffix}. Kill it first or remove {self.pid_file}"
+                )
+                raise RuntimeError(f"Duplicate engine detected (PID {old_pid})")
+            except (ProcessLookupError, ValueError):
+                # Old process is dead or PID file is corrupt — safe to proceed
+                self.log.info(f"  Stale PID file found (PID gone). Overwriting.")
+            except PermissionError:
+                # Process exists but we can't signal it — it's running
+                self.log.error(
+                    f"ENGINE STARTUP BLOCKED: Another engine process is running. "
+                    f"Remove {self.pid_file} if this is a false positive."
+                )
+                raise RuntimeError("Duplicate engine detected (permission denied on PID check)")
         self.pid_file.write_text(str(os.getpid()))
 
         # State tracking for rate-limiting and dead symbols
@@ -463,8 +488,7 @@ class ScalableEngine:
             # Pop to free memory from the dictionary as we submit to the thread pool
             df_symbol = all_bars.pop(symbol, None)
             if df_symbol is None:
-                import pandas as _pd
-                df_symbol = _pd.DataFrame()
+                df_symbol = pd.DataFrame()  # BUG-IMPORT-04 fix: use module-level pd import
 
             fut = self.executor.submit(
                 compute_symbol_signal,

@@ -54,6 +54,11 @@ class StrategyConfig:
     daily_lookback: str
     backtest_days: int
 
+    # BUG-STRAT-12 fix: these were missing from to_app_config(), causing
+    # strategy YAML settings to be silently ignored.
+    auto_schedule: bool = True
+    fetch_start_delay_seconds: int = 0
+
     def to_app_config(self, database_url: str = "") -> AppConfig:
         return AppConfig(
             db_path=self.db_path,
@@ -70,6 +75,8 @@ class StrategyConfig:
             exchange_tz=self.timezone,
             market_open=self.market_open,
             market_close=self.market_close,
+            auto_schedule=self.auto_schedule,
+            fetch_start_delay_seconds=self.fetch_start_delay_seconds,
         )
 
 
@@ -128,6 +135,9 @@ def load_strategy(strategy_dir: str | Path) -> StrategyConfig:
 
         daily_lookback= str(bt.get("daily_lookback", "2y")),
         backtest_days = int(bt.get("backtest_days", 30)),
+
+        auto_schedule = bool(eng.get("auto_schedule", True)),
+        fetch_start_delay_seconds = int(eng.get("fetch_start_delay_seconds", 0)),
     )
 
 

@@ -58,8 +58,12 @@ def _get_db_url() -> str:
 
 # ── Helper — read live state from a strategy's DB ─────────────────────────────
 def _read_strategy_state(sc: StrategyConfig) -> dict:
-    import psycopg2
-    from psycopg2.extras import RealDictCursor
+    """Read live state using TradingRepository (pooled connections).
+
+    BUG-TIMEOUT-11 fix: previously used raw psycopg2.connect() per card,
+    creating un-pooled connections that could exhaust Supabase limits.
+    """
+    from stocking_app.db import TradingRepository
     db_url = _get_db_url()
 
     result = {
@@ -75,47 +79,44 @@ def _read_strategy_state(sc: StrategyConfig) -> dict:
     if not db_url:
         return result
     try:
-        conn = psycopg2.connect(db_url, cursor_factory=RealDictCursor, connect_timeout=8)
-        with conn.cursor() as cur:
-            # Heartbeat key is suffix-namespaced: engine_heartbeat_.NS, engine_heartbeat_.L etc.
-            try:
-                hb_key = f"engine_heartbeat_{sc.suffix}"
-                cur.execute("SELECT value FROM engine_state WHERE key=%s", (hb_key,))
-                row = cur.fetchone()
-                if row:
-                    hb = json.loads(row["value"])
-                    result["engine_state"] = hb.get("state", "offline")
-                    result["last_run"]     = hb.get("last_run")
-            except Exception:
-                pass
-            # Cycle metrics are suffix-scoped
-            try:
-                cur.execute(
-                    "SELECT status, symbols_fetched, symbols_total FROM run_metrics "
-                    "WHERE suffix=%s ORDER BY id DESC LIMIT 1",
-                    (sc.suffix,)
-                )
-                row = cur.fetchone()
-                if row:
-                    result["last_cycle_status"] = row["status"] or "—"
-                    result["symbols_fetched"]   = int(row["symbols_fetched"] or 0)
-                    result["symbols_total"]     = int(row["symbols_total"] or 0)
-            except Exception:
-                pass
-            try:
-                cur.execute(
-                    "SELECT realized_pnl, unrealized_pnl, open_positions FROM pnl_snapshots "
-                    "WHERE suffix=%s ORDER BY ts DESC LIMIT 1",
-                    (sc.suffix,)
-                )
-                row = cur.fetchone()
-                if row:
-                    result["realized_pnl"]   = float(row["realized_pnl"] or 0)
-                    result["unrealized_pnl"] = float(row["unrealized_pnl"] or 0)
-                    result["open_positions"] = int(row["open_positions"] or 0)
-            except Exception:
-                pass
-        conn.close()
+        repo = TradingRepository(db_url, suffix=sc.suffix)
+        # Read heartbeat
+        try:
+            hb = repo.get_engine_heartbeat()
+            if hb:
+                result["engine_state"] = hb.get("state", "offline")
+                result["last_run"]     = hb.get("last_run")
+        except Exception:
+            pass
+        # Read last cycle metrics
+        try:
+            metrics_df = repo.read_df(
+                "SELECT status, symbols_fetched, symbols_total FROM run_metrics "
+                "WHERE suffix=%s ORDER BY id DESC LIMIT 1",
+                (sc.suffix,)
+            )
+            if not metrics_df.empty:
+                row = metrics_df.iloc[0]
+                result["last_cycle_status"] = str(row.get("status", "—"))
+                result["symbols_fetched"]   = int(row.get("symbols_fetched", 0))
+                result["symbols_total"]     = int(row.get("symbols_total", 0))
+        except Exception:
+            pass
+        # Read PnL
+        try:
+            pnl_df = repo.read_df(
+                "SELECT realized_pnl, unrealized_pnl, open_positions FROM pnl_snapshots "
+                "WHERE suffix=%s ORDER BY ts DESC LIMIT 1",
+                (sc.suffix,)
+            )
+            if not pnl_df.empty:
+                row = pnl_df.iloc[0]
+                result["realized_pnl"]   = float(row.get("realized_pnl", 0))
+                result["unrealized_pnl"] = float(row.get("unrealized_pnl", 0))
+                result["open_positions"] = int(row.get("open_positions", 0))
+        except Exception:
+            pass
+        repo.close()
     except Exception:
         pass
     return result
@@ -323,13 +324,36 @@ with tab_strategies:
                 dash_url = f"/?strategy={sc.strategy_dir.name}"
                 st.link_button("📊 View Dashboard", dash_url, use_container_width=True)
             with b4:
-                log_f = sc.log_dir / "engine.log"
-                if log_f.exists():
-                    lines = log_f.read_text(errors="replace").splitlines()[-10:]
-                    with st.expander("📋 Last log lines"):
-                        st.code("\n".join(reversed(lines)), language=None)
-                else:
-                    st.caption("No log yet")
+                # BUG-LOGS-10 fix: read logs from Supabase system_logs table instead of local file.
+                # Local engine.log doesn't exist on Streamlit Cloud or Render.
+                try:
+                    from stocking_app.db import TradingRepository as _TRLog
+                    _cfg_log = load_config()
+                    _repo_log = _TRLog(_cfg_log.database_url or _cfg_log.db_path, suffix=sc.suffix)
+                    _log_df = _repo_log.get_recent_logs(limit=10)
+                    _repo_log.close()
+                    if not _log_df.empty:
+                        lines = _log_df["message"].tolist()
+                        with st.expander("📋 Last log lines"):
+                            st.code("\n".join(lines), language=None)
+                    else:
+                        # Fallback: try local file if no DB logs
+                        log_f = sc.log_dir / "engine.log"
+                        if log_f.exists():
+                            lines = log_f.read_text(errors="replace").splitlines()[-10:]
+                            with st.expander("📋 Last log lines (local)"):
+                                st.code("\n".join(reversed(lines)), language=None)
+                        else:
+                            st.caption("No logs yet")
+                except Exception:
+                    # Final fallback: local file
+                    log_f = sc.log_dir / "engine.log"
+                    if log_f.exists():
+                        lines = log_f.read_text(errors="replace").splitlines()[-10:]
+                        with st.expander("📋 Last log lines (local)"):
+                            st.code("\n".join(reversed(lines)), language=None)
+                    else:
+                        st.caption("No log yet")
             with b5:
                 strat_key = sc.strategy_dir.name
                 if st.button("🔬 Run Backtest", key=f"bt_run_{strat_key}",

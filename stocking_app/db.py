@@ -18,19 +18,20 @@ def utc_now_iso() -> str:
 
 
 def retry_on_disconnect(max_retries=3):
-    """Decorator to catch 'server closed the connection unexpectedly' errors and reconnect.
+    """Decorator to catch DB errors and reconnect.
 
-    BUG-01 fix: guard against max_retries=0 (last_err stays None) by raising a
-    RuntimeError if we exit the retry loop without ever capturing an exception.
-    BUG-02 fix: acquire the instance-level _lock before calling the wrapped method
-    so that the main thread and worker threads never share the DB connection concurrently.
-    BUG-03 fix: explicitly getconn and putconn on a per-method basis to prevent PoolError.
+    BUG-POOL-01 fix: the generic `except Exception` block now ALWAYS returns the
+    connection to the pool before re-raising — previously it only rolled back,
+    leaking connections and eventually exhausting the pool.
+    BUG-STATTIMEOUT-02 fix: psycopg2.errors.QueryCanceled (Supabase statement
+    timeout) is now retryable instead of crashing the engine immediately.
     """
     def decorator(func):
         from functools import wraps
         @wraps(func)
         def wrapper(self, *args, **kwargs):
             import psycopg2
+            import psycopg2.errors
             import time
             with self._lock:
                 is_nested = (getattr(self, 'conn', None) is not None)
@@ -54,7 +55,9 @@ def retry_on_disconnect(max_retries=3):
                                 except Exception:
                                     pass
                                 self.conn = None
-                    except (psycopg2.OperationalError, psycopg2.InterfaceError) as e:
+                    except (psycopg2.OperationalError, psycopg2.InterfaceError,
+                            psycopg2.errors.QueryCanceled) as e:
+                        # Retryable errors: connection lost, statement timeout, etc.
                         last_err = e
                         if self.conn:
                             try:
@@ -66,11 +69,19 @@ def retry_on_disconnect(max_retries=3):
                         if attempt < max_retries - 1:
                             time.sleep(0.5 * (2 ** attempt))
                     except Exception as e:
+                        # BUG-POOL-01 fix: ALWAYS return conn to pool before re-raising.
+                        # Previously this only called rollback(), leaking the connection.
                         if self.conn:
                             try:
                                 self.conn.rollback()
                             except Exception:
                                 pass
+                            try:
+                                pool = self.get_pool(self.db_url)
+                                pool.putconn(self.conn)
+                            except Exception:
+                                pass
+                            self.conn = None
                         raise e
                         
                 if last_err is None:
@@ -663,22 +674,9 @@ class TradingRepository:
         return result
 
 
-    @retry_on_disconnect()
-    def get_all_candles_for_symbols(self, symbols: list[str], lookback_days: int) -> pd.DataFrame:
-        """
-        Pulls candles for multiple symbols, capped to the last MAX_BARS_PER_SYMBOL
-        rows per symbol. Loads in chunks of CHUNK_SIZE to avoid materializing
-        millions of rows in a single fetchall() — the primary OOM risk on Render's
-        512 MB free tier.
-        """
-        import pandas as pd
-        from datetime import datetime, timedelta, timezone
+    # BUG-INCOMPLETE-03 fix: removed truncated get_all_candles_for_symbols() method.
+    # It had no return statement and silently returned None. Use get_combined_bars_for_symbols() instead.
 
-        if not symbols:
-            return pd.DataFrame()
-
-        # Cap per symbol: 30 days × ~75 bars/day = ~2250 bars max.
-        # We keep only the most recent 500 — enough for any weekly/daily signal window
 
     @retry_on_disconnect()
     def upsert_signal(self, signal: SignalRecord, acted: bool = False) -> None:
