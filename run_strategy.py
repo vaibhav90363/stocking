@@ -182,8 +182,17 @@ def main():
 
     if args.all_strategies:
         import time as _time
+        import threading
+        import json as _json
+        import signal as _signal
+        import urllib.request as _urllib
+        from http.server import HTTPServer, BaseHTTPRequestHandler
+        from datetime import datetime as _dt, timezone as _tz
 
-        print("\n  [Runner] Launching all strategies concurrently …")
+        from stocking_app.engine import ScalableEngine
+        from stocking_app.strategy_loader import load_strategy
+
+        print("\n  [Runner] Launching all strategies as threads (single-process) …")
         strategies_dir = ROOT / "strategies"
 
         # Collect all strategy directories (sorted for determinism)
@@ -197,19 +206,9 @@ def main():
             sys.exit(1)
 
         # ── Per-engine fetch-start stagger ─────────────────────────────────
-        # Assign each engine a different delay so they don't all burst Yahoo
-        # Finance simultaneously from the same IP on each cycle's first fetch.
-        # Order: 0s → 30s → 60s based on sorted directory index.
         FETCH_DELAYS = [0, 30, 60]
 
         # ── Web Service: Health endpoint + Keep-Alive self-ping ─────────────
-        # Start this in the parent watchdog process BEFORE spawning children so
-        # the host sees the port open immediately and doesn't timeout during slow child DB inits.
-        import threading
-        import json as _json
-        from http.server import HTTPServer, BaseHTTPRequestHandler
-        from datetime import datetime as _dt, timezone as _tz
-
         _engine_start_time = _dt.now(_tz.utc).isoformat()
 
         class HealthCheckHandler(BaseHTTPRequestHandler):
@@ -252,10 +251,7 @@ def main():
             _ping_urls.append(f"https://{_svc_name}.onrender.com")
         _ping_urls.append(f"http://localhost:{port}")
 
-        import urllib.request as _urllib
-
         def _keep_alive_loop():
-            import time as _time
             while True:
                 _time.sleep(_ping_interval)
                 for _url in _ping_urls:
@@ -266,8 +262,7 @@ def main():
                     except Exception as _e:
                         print(f"  [keep-alive] {_url} failed: {_e} — trying next …")
 
-        _ka = threading.Thread(target=_keep_alive_loop, daemon=True, name="keep-alive")
-        _ka.start()
+        threading.Thread(target=_keep_alive_loop, daemon=True, name="keep-alive").start()
 
         _primary_url = _ping_urls[0] if _ping_urls else f"http://localhost:{port}"
         if _ext_url or _svc_name:
@@ -275,57 +270,105 @@ def main():
         else:
             print(f"  [Watchdog] Keep-alive → {_primary_url}")
 
-        # ── Build process specs ─────────────────────────────────────────────
-        # Each spec holds everything needed to (re)spawn the process.
-        specs = []
+        # ── Build engine configs directly (no subprocess, no env-var relay) ──
+        database_url = os.environ.get("DATABASE_URL", "")
+        engines: list[ScalableEngine] = []
+        engine_threads: dict[str, dict] = {}
+
+        def _run_engine_thread(engine: ScalableEngine, name: str) -> None:
+            """Run one strategy engine. Called from a daemon thread."""
+            try:
+                engine.run_forever()
+            except Exception as exc:
+                print(f"  [watchdog] Engine {name} crashed: {exc}")
+            finally:
+                try:
+                    engine.close()
+                except Exception:
+                    pass
+
         for idx, d in enumerate(strategy_dirs):
-            print(f"  --> Launching {d.name} in mode {args.mode}")
-            child_env = os.environ.copy()
-            child_env["STOCKING_IS_PRIMARY"] = "1" if idx == 0 else "0"
-            child_env["STOCKING_FETCH_START_DELAY"] = str(FETCH_DELAYS[min(idx, len(FETCH_DELAYS) - 1)])
-            specs.append({
-                "name": d.name,
-                "cmd": [sys.executable, __file__, str(d), "--mode", args.mode],
-                "env": child_env,
-            })
+            sc = load_strategy(d)
+            cfg = sc.to_app_config(database_url=database_url)
+            # Override fetch_start_delay from the stagger list
+            cfg = cfg.__class__(
+                **{
+                    **{f.name: getattr(cfg, f.name) for f in cfg.__dataclass_fields__.values()},
+                    "fetch_start_delay_seconds": FETCH_DELAYS[min(idx, len(FETCH_DELAYS) - 1)],
+                }
+            )
+            print(f"  --> {sc.name}  (suffix={sc.suffix}, delay={cfg.fetch_start_delay_seconds}s)")
 
-        def _spawn(spec: dict) -> subprocess.Popen:
-            return subprocess.Popen(spec["cmd"], env=spec["env"])
+            engine = ScalableEngine(cfg)
+            engines.append(engine)
 
-        # ── Start all processes ─────────────────────────────────────────────
-        procs = {spec["name"]: {"proc": _spawn(spec), "spec": spec, "restarts": 0, "backoff": 1}
-                 for spec in specs}
+            t = threading.Thread(
+                target=_run_engine_thread,
+                args=(engine, sc.name),
+                daemon=True,
+                name=f"engine-{sc.suffix}",
+            )
+            t.start()
+            engine_threads[sc.name] = {"thread": t, "engine": engine, "sc": sc, "cfg": cfg, "restarts": 0, "backoff": 1}
 
-        print(f"  Started {len(procs)} engines in the background. Watching for crashes …")
+        print(f"  Started {len(engine_threads)} engine threads (PID {os.getpid()}). Watching …")
 
-        # ── Watchdog loop ───────────────────────────────────────────────────
-        # Polls every 5 seconds. If a child exits unexpectedly (non-zero or
-        # even zero when it shouldn't), it is restarted with exponential
-        # backoff (1s → 2s → 4s … capped at 60s) so a persistent crash
-        # doesn't spin-restart the whole Render service.
+        # ── Signal handling (main thread only) ──────────────────────────────
+        _shutdown = threading.Event()
+
+        def _handle_shutdown(_sig, _frame):
+            print("\n  Shutdown signal received — stopping all engines …")
+            for state in engine_threads.values():
+                state["engine"].stop()
+            _shutdown.set()
+
+        _signal.signal(_signal.SIGINT, _handle_shutdown)
+        _signal.signal(_signal.SIGTERM, _handle_shutdown)
+
+        # ── Watchdog loop — restart crashed threads ─────────────────────────
         try:
-            while True:
-                _time.sleep(5)
-                for name, state in procs.items():
-                    p = state["proc"]
-                    rc = p.poll()
-                    if rc is None:
+            while not _shutdown.is_set():
+                _shutdown.wait(timeout=10)
+                if _shutdown.is_set():
+                    break
+                for name, state in engine_threads.items():
+                    t = state["thread"]
+                    if t.is_alive():
                         continue  # still running — all good
 
                     state["restarts"] += 1
                     backoff = min(state["backoff"], 60)
                     print(
-                        f"  [watchdog] {name} exited (code={rc}). "
+                        f"  [watchdog] {name} thread died. "
                         f"Restart #{state['restarts']} in {backoff}s …"
                     )
                     _time.sleep(backoff)
-                    state["proc"] = _spawn(state["spec"])
-                    state["backoff"] = min(backoff * 2, 60)
+
+                    # Re-create engine and thread
+                    try:
+                        new_engine = ScalableEngine(state["cfg"])
+                        state["engine"] = new_engine
+                        new_t = threading.Thread(
+                            target=_run_engine_thread,
+                            args=(new_engine, name),
+                            daemon=True,
+                            name=f"engine-{state['sc'].suffix}",
+                        )
+                        new_t.start()
+                        state["thread"] = new_t
+                        state["backoff"] = min(backoff * 2, 60)
+                    except Exception as exc:
+                        print(f"  [watchdog] Failed to restart {name}: {exc}")
+                        state["backoff"] = min(backoff * 2, 60)
 
         except KeyboardInterrupt:
             print("\n  Shutting down all engines …")
-            for state in procs.values():
-                state["proc"].terminate()
+            for state in engine_threads.values():
+                state["engine"].stop()
+
+        # Wait briefly for threads to finish their current cycle
+        for state in engine_threads.values():
+            state["thread"].join(timeout=5)
 
         sys.exit(0)
 

@@ -39,12 +39,15 @@ def load_config() -> AppConfig:
     default_db = root / "data" / "stocking.db"
 
     database_url = os.getenv("DATABASE_URL", "")
-    try:
-        import streamlit as st
-        if "DATABASE_URL" in st.secrets:
-            database_url = st.secrets["DATABASE_URL"]
-    except Exception:
-        pass
+    # Only attempt streamlit secrets in dashboard mode — importing streamlit
+    # adds ~50 MB and is unnecessary for the engine path.
+    if os.getenv("STOCKING_MODE") == "dashboard":
+        try:
+            import streamlit as st
+            if "DATABASE_URL" in st.secrets:
+                database_url = st.secrets["DATABASE_URL"]
+        except Exception:
+            pass
 
     suffix = os.getenv("STOCKING_TICKER_SUFFIX", ".NS")
 

@@ -235,7 +235,7 @@ class TradingRepository:
             if db_url not in cls._pools:  # double-checked locking
                 cls._pools[db_url] = ThreadedConnectionPool(
                     minconn=1,
-                    maxconn=20,  # within Supabase free-tier limits
+                    maxconn=5,  # 3 engines × 2 concurrent conns (main + keepalive) = 6 max; 5 per-pool is safe
                     dsn=db_url,
                     cursor_factory=RealDictCursor,
                     keepalives=1,
@@ -642,7 +642,15 @@ class TradingRepository:
         for i in range(0, len(symbols), CHUNK_SIZE):
             chunk_symbols = symbols[i : i + CHUNK_SIZE]
 
-            with self.conn.cursor() as cur:
+            # Group rows by symbol as they stream in
+            daily_by_sym: dict = defaultdict(list)
+
+            # Use a named server-side cursor to avoid materialising all rows
+            # into Python memory at once. itersize=500 streams rows in batches.
+            cur_name = f"bulk_candles_{i}"
+            cur = self.conn.cursor(name=cur_name)
+            cur.itersize = 500
+            try:
                 cur.execute(
                     """
                     SELECT symbol, ts, open, high, low, close, volume
@@ -652,12 +660,10 @@ class TradingRepository:
                     """,
                     (chunk_symbols, daily_cutoff),
                 )
-                daily_rows = cur.fetchall()
-
-            # Group rows by symbol in Python
-            daily_by_sym: dict = defaultdict(list)
-            for r in daily_rows:
-                daily_by_sym[r["symbol"]].append(dict(r))
+                for row in cur:
+                    daily_by_sym[row["symbol"]].append(dict(row))
+            finally:
+                cur.close()
 
             for sym in set(daily_by_sym):
                 df_d = pd.DataFrame(daily_by_sym[sym]).drop(columns=["symbol"], errors="ignore")

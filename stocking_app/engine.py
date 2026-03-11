@@ -36,11 +36,11 @@ class DatabaseLogHandler(logging.Handler):
             self.handleError(record)
 
 
-def _setup_logger(log_dir: Path, repo: 'TradingRepository') -> logging.Logger:
+def _setup_logger(log_dir: Path, repo: 'TradingRepository', cfg: 'AppConfig | None' = None) -> logging.Logger:
     log_dir.mkdir(parents=True, exist_ok=True)
     log_file = log_dir / "engine.log"
 
-    logger = logging.getLogger("stocking.engine")
+    logger = logging.getLogger(f"stocking.engine.{cfg.ticker_suffix}")
     logger.setLevel(logging.DEBUG)
 
     fmt = logging.Formatter(
@@ -106,7 +106,7 @@ class ScalableEngine:
 
         # Logger writes to <db_path_dir>/logs/engine.log and the Supabase db
         log_dir = Path(cfg.db_path).parent / "logs"
-        self.log = _setup_logger(log_dir, self.repo)
+        self.log = _setup_logger(log_dir, self.repo, cfg)
         self.log.info("═" * 60)
         self.log.info("  Stocking Engine starting up")
         self.log.info(f"  DB          : {cfg.db_path}")
@@ -174,8 +174,11 @@ class ScalableEngine:
             self.log.info("Shutdown signal received — stopping after current cycle.")
             self.stop()
 
-        signal.signal(signal.SIGINT, _handle_signal)
-        signal.signal(signal.SIGTERM, _handle_signal)
+        # Only register signal handlers from the main thread.
+        # In --all-strategies mode, signal handling is done by the watchdog.
+        if threading.current_thread() is threading.main_thread():
+            signal.signal(signal.SIGINT, _handle_signal)
+            signal.signal(signal.SIGTERM, _handle_signal)
 
         # ── Per-engine fetch-start stagger ──────────────────────────────────
         # When multiple engines start together (--all-strategies), each gets a
