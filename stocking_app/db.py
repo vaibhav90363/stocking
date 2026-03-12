@@ -285,6 +285,38 @@ class TradingRepository:
 
     @retry_on_disconnect()
     def init_db(self) -> None:
+        # ── Schema-initialized guard ────────────────────────────────────────
+        # init_db is called by BOTH the engine (once at startup) AND by the
+        # Streamlit dashboard (on EVERY page re-render). Without this guard,
+        # the dashboard's DDL (CREATE TABLE, CREATE INDEX, ALTER TABLE) races
+        # against the engine's active row-lock transactions, causing a
+        # psycopg2.errors.DeadlockDetected.
+        #
+        # Fix: check if all expected tables already exist with a fast SELECT
+        # on pg_tables. If they do, skip all DDL entirely.
+        EXPECTED_TABLES = {
+            "universe", "signals", "positions_ledger", "trade_activity_log",
+            "pnl_snapshots", "engine_state", "symbol_state", "run_metrics",
+            "system_logs", "candles_1d",
+        }
+        with self.conn.cursor() as _chk:
+            _chk.execute(
+                """
+                SELECT tablename FROM pg_tables
+                WHERE schemaname = 'public'
+                  AND tablename = ANY(%s)
+                """,
+                (list(EXPECTED_TABLES),),
+            )
+            existing = {row["tablename"] for row in _chk.fetchall()}
+
+        if existing >= EXPECTED_TABLES:
+            # Schema is complete — skip all DDL to avoid lock contention
+            if self.get_engine_enabled() is None:
+                self.set_engine_enabled(False)
+            return
+
+        # ── First-time setup: schema not yet complete — run DDL ────────────
         with self.conn.cursor() as cur:
             cur.execute(SCHEMA_SQL)
 
@@ -348,6 +380,7 @@ class TradingRepository:
             
         if self.get_engine_enabled() is None:
             self.set_engine_enabled(False)
+
 
     @retry_on_disconnect()
     def set_engine_enabled(self, enabled: bool) -> None:

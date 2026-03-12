@@ -381,19 +381,29 @@ class ScalableEngine:
             # BUG-FIX: We no longer use asyncio. yfinance's internal threading
             # combined with asyncio.to_thread caused deadlocks on Render.
             # Use a plain synchronous generator instead.
+            #
+            # OOM-FIX: Stream-and-release — upsert each result immediately as
+            # it arrives from the generator instead of accumulating all DataFrames
+            # in a good_results list. At 500 symbols × 90 rows, the old approach
+            # held ~150-200 MB per engine simultaneously (3 engines = ~500 MB peak).
+            # Now each DataFrame is written to DB and freed before the next batch arrives.
             gen = fetch_daily_bars_gen(
                 live_symbols,
                 lookback_days=self.cfg.daily_lookback_days,
                 max_concurrency=self.cfg.max_fetch_concurrency,
             )
             count = 0
-            good_results: list[FetchResult] = []
             for result in gen:
                 count += 1
                 if result.error or result.bars.empty:
                     failed_symbols.append(result.symbol)
                 else:
-                    good_results.append(result)
+                    # Upsert immediately — don't buffer all bars in RAM
+                    self.repo.upsert_candles_1d(result.symbol, result.bars)
+                    fetched_symbols.append(result.symbol)
+                    state["total_bars"] += len(result.bars)
+                    # BUG-07: successful fetch resets the dead-symbol counter
+                    self._empty_fetch_counts.pop(result.symbol, None)
 
                 # Heartbeat every 50 symbols so the UI stays responsive
                 if count % 50 == 0 or count == total:
@@ -405,14 +415,6 @@ class ScalableEngine:
                             "fetch_total": total,
                         }
                     )
-
-            # ── Bulk upsert after all batches have landed ────────────────────
-            for result in good_results:
-                self.repo.upsert_candles_1d(result.symbol, result.bars)
-                fetched_symbols.append(result.symbol)
-                state["total_bars"] += len(result.bars)
-                # BUG-07: successful fetch resets the dead-symbol counter
-                self._empty_fetch_counts.pop(result.symbol, None)
 
             # BUG-07: increment counters for symbols that returned nothing
             newly_dead: list[str] = []
