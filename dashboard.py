@@ -495,7 +495,7 @@ def run_dashboard(strategy_name_or_path=None):
                         # Fetch the raw daily bars
                         daily_bars_dict = repo.get_combined_bars_for_symbols(
                             [selected_symbol],
-                            daily_lookback_days=cfg.compute_lookback_days
+                            daily_lookback_days=cfg.daily_lookback_days
                         )
                         
                         daily = daily_bars_dict.get(selected_symbol)

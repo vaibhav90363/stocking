@@ -76,10 +76,24 @@ def compute_all_indicators(daily: pd.DataFrame, exchange_tz: str) -> pd.DataFram
         }
     )
 
-    aligned = daily.join(weekly_aliased, how="left")
-    aligned[["weekly_upper_band", "weekly_lower_band", "weekly_ema_cmo", "weekly_sma_cmo"]] = aligned[
-        ["weekly_upper_band", "weekly_lower_band", "weekly_ema_cmo", "weekly_sma_cmo"]
-    ].ffill()
+    # BUG-WEEKLY-BAND-02 fix: daily index is UTC midnight, weekly index is
+    # exchange_tz midnight (e.g. IST +05:30).  A plain .join() matches on exact
+    # timestamp equality — but 2026-02-10T00:00+05:30 ≠ 2026-02-10T00:00+00:00,
+    # so ZERO rows match and every weekly column is NaN.
+    #
+    # merge_asof(direction="backward") finds, for each daily timestamp, the most
+    # recent weekly timestamp ≤ it (using absolute time comparison).  This
+    # correctly maps each trading day to its enclosing weekly bar regardless of
+    # timezone, and inherently forward-fills the weekly values.
+    weekly_aliased.index = weekly_aliased.index.tz_convert("UTC")
+
+    aligned = pd.merge_asof(
+        daily.sort_index(),
+        weekly_aliased.sort_index(),
+        left_index=True,
+        right_index=True,
+        direction="backward",
+    )
 
     return aligned
 
