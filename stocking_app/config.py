@@ -28,7 +28,9 @@ class AppConfig:
     # Daily-bar lookback: how many calendar days of 1d bars to fetch & store.
     # Used for long-horizon weekly fractal computation without loading 5m bars
     # for 90 days (which would OOM Render's 512 MB free tier).
-    daily_lookback_days: int = 60
+    # 120d ≈ 17 weekly bars — enough for fractal_chaos_bands (left_window=2, right_window=2)
+    # to find reliable pivot points and produce non-None weekly_upper_band / weekly_lower_band.
+    daily_lookback_days: int = 120
 
 
 
@@ -62,7 +64,7 @@ def load_config() -> AppConfig:
         cycle_seconds=int(os.getenv("STOCKING_CYCLE_SECONDS", "300")),
         disabled_poll_seconds=int(os.getenv("STOCKING_DISABLED_POLL_SECONDS", "60")),
         fetch_lookback_days=int(os.getenv("STOCKING_FETCH_LOOKBACK_DAYS", "2")),
-        compute_lookback_days=int(os.getenv("STOCKING_COMPUTE_LOOKBACK_DAYS", "30")),
+        compute_lookback_days=int(os.getenv("STOCKING_COMPUTE_LOOKBACK_DAYS", "30")),  # kept for backward compat, not used for band compute
         # 5 concurrent batches is safe for Yahoo Finance free tier
         max_fetch_concurrency=int(os.getenv("STOCKING_FETCH_CONCURRENCY", "5")),
         # 1 worker avoids fork/spawn overhead & CPU thrashing on 0.15 CPU free tier
@@ -74,5 +76,5 @@ def load_config() -> AppConfig:
         market_close=os.getenv("STOCKING_MARKET_CLOSE", def_close),
         auto_schedule=os.getenv("STOCKING_AUTO_SCHEDULE", "1") not in ("0", "false", "False"),
         fetch_start_delay_seconds=int(os.getenv("STOCKING_FETCH_START_DELAY", "0")),
-        daily_lookback_days=int(os.getenv("STOCKING_DAILY_LOOKBACK_DAYS", "60")),
+        daily_lookback_days=int(os.getenv("STOCKING_DAILY_LOOKBACK_DAYS", "120")),
     )

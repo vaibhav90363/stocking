@@ -478,9 +478,15 @@ class ScalableEngine:
         # saves ~1.5s; at 500 symbols ~7.5s of serial DB idle time before any
         # compute thread can start.
         self.log.debug(f"Bulk-loading candles for {len(symbols_to_compute)} symbols in 1 query ...")
+        # BUG-WEEKLY-BAND-01 fix: use daily_lookback_days (not compute_lookback_days) for
+        # the candle query so weekly fractal chaos bands have enough history.
+        # compute_lookback_days=30 gives only ~4 weekly bars — not enough for fractal_chaos_bands
+        # to find any pivot points (left_window=2, right_window=2 needs ~5+ weekly bars minimum,
+        # but realistically 12+ weeks for reliable signals). daily_lookback_days defaults to 120d
+        # which gives ~17 weekly bars — enough to calculate stable fractal band lines.
         all_bars = self.repo.get_combined_bars_for_symbols(
             symbols_to_compute,
-            daily_lookback_days=self.cfg.compute_lookback_days,
+            daily_lookback_days=self.cfg.daily_lookback_days,
         )
 
         futures = {}
