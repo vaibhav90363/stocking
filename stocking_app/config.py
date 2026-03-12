@@ -26,11 +26,11 @@ class AppConfig:
     # all 3 engines don't burst Yahoo Finance simultaneously from the same IP.
     fetch_start_delay_seconds: int = 0
     # Daily-bar lookback: how many calendar days of 1d bars to fetch & store.
-    # Used for long-horizon weekly fractal computation without loading 5m bars
-    # for 90 days (which would OOM Render's 512 MB free tier).
-    # 120d ≈ 17 weekly bars — enough for fractal_chaos_bands (left_window=2, right_window=2)
-    # to find reliable pivot points and produce non-None weekly_upper_band / weekly_lower_band.
-    daily_lookback_days: int = 120
+    # Used for long-horizon weekly fractal computation without loading 5m bars.
+    # 365d ≈ 52 weekly bars — matches reference backtest which fetches from 2023
+    # onwards; enough to always find both upper and lower fractal pivots even in
+    # strongly trending markets where one fractal type is rare over short windows.
+    daily_lookback_days: int = 365
 
 
 
@@ -76,5 +76,5 @@ def load_config() -> AppConfig:
         market_close=os.getenv("STOCKING_MARKET_CLOSE", def_close),
         auto_schedule=os.getenv("STOCKING_AUTO_SCHEDULE", "1") not in ("0", "false", "False"),
         fetch_start_delay_seconds=int(os.getenv("STOCKING_FETCH_START_DELAY", "0")),
-        daily_lookback_days=int(os.getenv("STOCKING_DAILY_LOOKBACK_DAYS", "120")),
+        daily_lookback_days=int(os.getenv("STOCKING_DAILY_LOOKBACK_DAYS", "365")),
     )
