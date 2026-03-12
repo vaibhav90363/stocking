@@ -503,78 +503,191 @@ def run_dashboard(strategy_name_or_path=None):
                         if daily is None or daily.empty:
                             st.warning(f"No daily bar data found for {selected_symbol}.")
                         else:
-                            from stocking_app.strategy import compute_all_indicators
+                            from stocking_app.strategy import compute_all_indicators, _to_weekly
+                            from stocking_app.indicators import fractal_chaos_bands
                             import plotly.graph_objects as go
                             from plotly.subplots import make_subplots
-                            
+
                             # Run the shared indicator logic
                             try:
                                 aligned = compute_all_indicators(daily, cfg.exchange_tz)
-                                
+
                                 if aligned.empty:
                                     st.warning(f"Insufficient data to compute indicators for {selected_symbol}.")
                                 else:
-                                    # Plotting
-                                    st.markdown(f"### 📈 {selected_symbol} Charts")
-                                    
-                                    # Create figure with secondary y-axis
-                                    fig = make_subplots(rows=2, cols=1, shared_xaxes=True, 
-                                                        vertical_spacing=0.1, 
-                                                        subplot_titles=('Price & Fractal Band', 'CMO Oscillator'),
-                                                        row_heights=[0.7, 0.3])
+                                    # ── Compute weekly OHLCV + fractals for the weekly subplot ──
+                                    weekly_df = _to_weekly(daily, cfg.exchange_tz)
+                                    weekly_df = fractal_chaos_bands(weekly_df, 2, 2)
 
-                                    # Top Plot: Price & Fractal Band
-                                    # We can use a simple line chart for close price to keep it clean, or candlestick if we have open/high/low/close
-                                    if all(col in aligned.columns for col in ['open', 'high', 'low', 'close']):
-                                        fig.add_trace(go.Candlestick(x=aligned.index,
-                                                        open=aligned['open'],
-                                                        high=aligned['high'],
-                                                        low=aligned['low'],
-                                                        close=aligned['close'],
-                                                        name='Price'
-                                                    ), row=1, col=1)
-                                    else:
-                                        fig.add_trace(go.Scatter(x=aligned.index, y=aligned['close'], mode='lines', name='Close Price', line=dict(color='white')), row=1, col=1)
-                                    
-                                    if 'weekly_upper_band' in aligned.columns:
-                                        fig.add_trace(go.Scatter(x=aligned.index, y=aligned['weekly_upper_band'], mode='lines', name='Weekly Upper Band', line=dict(color='cyan', dash='dash')), row=1, col=1)
-                                    if 'weekly_lower_band' in aligned.columns:
-                                        fig.add_trace(go.Scatter(x=aligned.index, y=aligned['weekly_lower_band'], mode='lines', name='Weekly Lower Band', line=dict(color='pink', dash='dash')), row=1, col=1)
+                                    # ── 3-panel chart ─────────────────────────────────────────
+                                    st.markdown(f"### 📈 {selected_symbol} — Deep Dive")
 
-                                    # Bottom Plot: CMO, EMA, SMA
-                                    if 'cmo' in aligned.columns:
-                                        fig.add_trace(go.Scatter(x=aligned.index, y=aligned['cmo'], mode='lines', name='CMO', line=dict(color='gray', width=1)), row=2, col=1)
-                                    if 'ema_cmo' in aligned.columns:
-                                        fig.add_trace(go.Scatter(x=aligned.index, y=aligned['ema_cmo'], mode='lines', name='EMA(CMO)', line=dict(color='yellow')), row=2, col=1)
-                                    if 'sma_cmo' in aligned.columns:
-                                        fig.add_trace(go.Scatter(x=aligned.index, y=aligned['sma_cmo'], mode='lines', name='SMA(CMO)', line=dict(color='orange')), row=2, col=1)
+                                    fig = make_subplots(
+                                        rows=3, cols=1,
+                                        shared_xaxes=False,   # independent x-axes so weekly doesn't stretch daily
+                                        vertical_spacing=0.07,
+                                        subplot_titles=(
+                                            "📅 Daily Price · Fractal Chaos Bands",
+                                            "📆 Weekly Candles · Fractal Pivots",
+                                            "〰️ CMO Oscillator · Daily & Weekly",
+                                        ),
+                                        row_heights=[0.38, 0.32, 0.30],
+                                    )
 
-                                    # Update layout
-                                    fig.update_layout(height=700, showlegend=True,
-                                                      xaxis_rangeslider_visible=False,
-                                                      margin=dict(l=20, r=20, t=40, b=20),
-                                                      template="plotly_dark")
-                                    
+                                    # ── Row 1: Daily candlestick + weekly band lines ───────────
+                                    fig.add_trace(go.Candlestick(
+                                        x=aligned.index, name="Daily",
+                                        open=aligned["open"], high=aligned["high"],
+                                        low=aligned["low"],   close=aligned["close"],
+                                        increasing_line_color="#4ade80",
+                                        decreasing_line_color="#f87171",
+                                        showlegend=True,
+                                    ), row=1, col=1)
+
+                                    if "weekly_upper_band" in aligned.columns:
+                                        fig.add_trace(go.Scatter(
+                                            x=aligned.index, y=aligned["weekly_upper_band"],
+                                            mode="lines", name="Weekly Upper Band",
+                                            line=dict(color="#22d3ee", width=1.5, dash="dash"),
+                                        ), row=1, col=1)
+                                    if "weekly_lower_band" in aligned.columns:
+                                        fig.add_trace(go.Scatter(
+                                            x=aligned.index, y=aligned["weekly_lower_band"],
+                                            mode="lines", name="Weekly Lower Band",
+                                            line=dict(color="#f9a8d4", width=1.5, dash="dash"),
+                                        ), row=1, col=1)
+
+                                    # ── Row 2: Weekly candlestick + fractal pivot markers ──────
+                                    if not weekly_df.empty:
+                                        fig.add_trace(go.Candlestick(
+                                            x=weekly_df.index, name="Weekly",
+                                            open=weekly_df["open"], high=weekly_df["high"],
+                                            low=weekly_df["low"],   close=weekly_df["close"],
+                                            increasing_line_color="#34d399",
+                                            decreasing_line_color="#fb923c",
+                                            showlegend=True,
+                                        ), row=2, col=1)
+
+                                        # Upper fractal pivots — triangle-down above bar
+                                        uf = weekly_df[weekly_df["upper_fractal_point"].notna()]
+                                        if not uf.empty:
+                                            fig.add_trace(go.Scatter(
+                                                x=uf.index, y=uf["upper_fractal_point"] * 1.002,
+                                                mode="markers", name="Upper Fractal",
+                                                marker=dict(symbol="triangle-down", color="#22d3ee", size=10),
+                                            ), row=2, col=1)
+
+                                        # Lower fractal pivots — triangle-up below bar
+                                        lf = weekly_df[weekly_df["lower_fractal_point"].notna()]
+                                        if not lf.empty:
+                                            fig.add_trace(go.Scatter(
+                                                x=lf.index, y=lf["lower_fractal_point"] * 0.998,
+                                                mode="markers", name="Lower Fractal",
+                                                marker=dict(symbol="triangle-up", color="#f9a8d4", size=10),
+                                            ), row=2, col=1)
+
+                                        # Forward-filled band lines on weekly chart too
+                                        if "upper_band_line" in weekly_df.columns:
+                                            fig.add_trace(go.Scatter(
+                                                x=weekly_df.index, y=weekly_df["upper_band_line"],
+                                                mode="lines", name="Upper Band (W)",
+                                                line=dict(color="#22d3ee", width=1, dash="dot"),
+                                                showlegend=False,
+                                            ), row=2, col=1)
+                                        if "lower_band_line" in weekly_df.columns:
+                                            fig.add_trace(go.Scatter(
+                                                x=weekly_df.index, y=weekly_df["lower_band_line"],
+                                                mode="lines", name="Lower Band (W)",
+                                                line=dict(color="#f9a8d4", width=1, dash="dot"),
+                                                showlegend=False,
+                                            ), row=2, col=1)
+
+                                    # ── Row 3: CMO oscillator — daily + weekly ─────────────────
+                                    # Daily CMO raw (faint background)
+                                    if "cmo" in aligned.columns:
+                                        fig.add_trace(go.Scatter(
+                                            x=aligned.index, y=aligned["cmo"],
+                                            mode="lines", name="CMO (D)",
+                                            line=dict(color="#64748b", width=1),
+                                        ), row=3, col=1)
+                                    # Daily EMA / SMA
+                                    if "ema_cmo" in aligned.columns:
+                                        fig.add_trace(go.Scatter(
+                                            x=aligned.index, y=aligned["ema_cmo"],
+                                            mode="lines", name="EMA CMO (D)",
+                                            line=dict(color="#facc15", width=1.5),
+                                        ), row=3, col=1)
+                                    if "sma_cmo" in aligned.columns:
+                                        fig.add_trace(go.Scatter(
+                                            x=aligned.index, y=aligned["sma_cmo"],
+                                            mode="lines", name="SMA CMO (D)",
+                                            line=dict(color="#fb923c", width=1.5),
+                                        ), row=3, col=1)
+                                    # Weekly EMA / SMA
+                                    if "weekly_ema_cmo" in aligned.columns:
+                                        fig.add_trace(go.Scatter(
+                                            x=aligned.index, y=aligned["weekly_ema_cmo"],
+                                            mode="lines", name="EMA CMO (W)",
+                                            line=dict(color="#22d3ee", width=1.5, dash="dash"),
+                                        ), row=3, col=1)
+                                    if "weekly_sma_cmo" in aligned.columns:
+                                        fig.add_trace(go.Scatter(
+                                            x=aligned.index, y=aligned["weekly_sma_cmo"],
+                                            mode="lines", name="SMA CMO (W)",
+                                            line=dict(color="#f9a8d4", width=1.5, dash="dash"),
+                                        ), row=3, col=1)
+                                    # Zero line
+                                    fig.add_hline(y=0, line=dict(color="#475569", width=1, dash="dot"), row=3, col=1)
+
+                                    # ── Layout ────────────────────────────────────────────────
+                                    fig.update_layout(
+                                        height=900,
+                                        showlegend=True,
+                                        legend=dict(orientation="h", yanchor="bottom", y=1.01, xanchor="left", x=0),
+                                        margin=dict(l=20, r=20, t=60, b=20),
+                                        template="plotly_dark",
+                                        paper_bgcolor="#0f172a",
+                                        plot_bgcolor="#0f172a",
+                                    )
+                                    fig.update_xaxes(rangeslider_visible=False)
+                                    fig.update_xaxes(showgrid=True, gridcolor="#1e293b")
+                                    fig.update_yaxes(showgrid=True, gridcolor="#1e293b")
+
                                     st.plotly_chart(fig, use_container_width=True)
-                                    
-                                    # Raw Data
-                                    st.markdown("### 🧮 Raw Indicator Data (Latest 20 Days)")
-                                    
-                                    # Format datetime index for display
+
+                                    # ── Raw data table ────────────────────────────────────────
+                                    st.markdown("### 🧮 Raw Indicator Data (Latest 20 days)")
                                     display_df = aligned.copy()
-                                    display_df.index = display_df.index.strftime('%Y-%m-%d')
-                                    
-                                    # Order columns nicely
-                                    cols_to_show = ['close', 'weekly_upper_band', 'weekly_lower_band', 'cmo', 'ema_cmo', 'sma_cmo', 'weekly_ema_cmo', 'weekly_sma_cmo']
+                                    display_df.index = display_df.index.strftime("%Y-%m-%d")
+                                    cols_to_show = [
+                                        "close",
+                                        "weekly_upper_band", "weekly_lower_band",
+                                        "cmo", "ema_cmo", "sma_cmo",
+                                        "weekly_ema_cmo", "weekly_sma_cmo",
+                                    ]
                                     available_cols = [c for c in cols_to_show if c in display_df.columns]
-                                    
                                     st.dataframe(
                                         display_df[available_cols].tail(20).style.format("{:.4f}"),
-                                        use_container_width=True
+                                        use_container_width=True,
                                     )
-                                    
+
+                                    # ── Weekly data table ─────────────────────────────────────
+                                    if not weekly_df.empty:
+                                        st.markdown("### 📆 Weekly Bar Data (Latest 20 weeks)")
+                                        wk_display = weekly_df[["open", "high", "low", "close",
+                                                                  "upper_fractal_point", "lower_fractal_point",
+                                                                  "upper_band_line", "lower_band_line"]].copy()
+                                        wk_display.index = wk_display.index.strftime("%Y-%m-%d")
+                                        st.dataframe(
+                                            wk_display.tail(20).style.format("{:.4f}"),
+                                            use_container_width=True,
+                                        )
+
                             except Exception as e:
+                                import traceback
                                 st.error(f"Error computing indicators: {e}")
+                                st.code(traceback.format_exc())
+
 
     # ══════════════════════════════════════════════════════════════════════════════
     # TAB 5 — SIGNALS
