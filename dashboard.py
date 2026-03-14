@@ -656,7 +656,7 @@ def run_dashboard(strategy_name_or_path=None):
                                     st.plotly_chart(fig, use_container_width=True)
 
                                     # ── Raw data table ────────────────────────────────────────
-                                    st.markdown("### 🧮 Raw Indicator Data (Latest 20 days)")
+                                    st.markdown("### 🧮 Raw Indicator Data (Full Year)")
                                     display_df = aligned.copy()
                                     display_df.index = display_df.index.strftime("%Y-%m-%d")
                                     cols_to_show = [
@@ -667,19 +667,19 @@ def run_dashboard(strategy_name_or_path=None):
                                     ]
                                     available_cols = [c for c in cols_to_show if c in display_df.columns]
                                     st.dataframe(
-                                        display_df[available_cols].tail(20).style.format("{:.4f}"),
+                                        display_df[available_cols].style.format("{:.4f}"),
                                         use_container_width=True,
                                     )
 
                                     # ── Weekly data table ─────────────────────────────────────
                                     if not weekly_df.empty:
-                                        st.markdown("### 📆 Weekly Bar Data (Latest 20 weeks)")
+                                        st.markdown("### 📆 Weekly Bar Data (Full Year)")
                                         wk_display = weekly_df[["open", "high", "low", "close",
                                                                   "upper_fractal_point", "lower_fractal_point",
                                                                   "upper_band_line", "lower_band_line"]].copy()
                                         wk_display.index = wk_display.index.strftime("%Y-%m-%d")
                                         st.dataframe(
-                                            wk_display.tail(20).style.format("{:.4f}"),
+                                            wk_display.style.format("{:.4f}"),
                                             use_container_width=True,
                                         )
 
