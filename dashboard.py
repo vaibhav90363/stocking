@@ -904,10 +904,14 @@ def run_dashboard(strategy_name_or_path=None):
     # ── Footer / auto-refresh ──────────────────────────────────────────────────────
     st.divider()
     st.caption(
+        f"VER: `2026-03-14-v1` | LOOKBACK: `{cfg.daily_lookback_days}d` | "
         f"DB: `{cfg.db_path}`  |  Suffix: `{cfg.ticker_suffix}`  |  "
         f"Cycle: `{cfg.cycle_seconds}s`  |  "
         f"Open positions: `{n_open}`  |  Universe: `{uni_summary['active']} active`"
     )
+    if st.sidebar.button("🗑️ Clear Dashboard Cache"):
+        st.cache_data.clear()
+        st.rerun()
 
     # Auto-refresh handled by st_autorefresh in sidebar
 
