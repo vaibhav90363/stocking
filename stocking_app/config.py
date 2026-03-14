@@ -41,15 +41,17 @@ def load_config() -> AppConfig:
     default_db = root / "data" / "stocking.db"
 
     database_url = os.getenv("DATABASE_URL", "")
-    # Only attempt streamlit secrets in dashboard mode — importing streamlit
-    # adds ~50 MB and is unnecessary for the engine path.
-    if os.getenv("STOCKING_MODE") == "dashboard":
-        try:
-            import streamlit as st
+    # If running inside Streamlit, try to pull configuration from st.secrets
+    secrets_lookback = None
+    try:
+        import streamlit as st
+        if hasattr(st, "secrets"):
             if "DATABASE_URL" in st.secrets:
                 database_url = st.secrets["DATABASE_URL"]
-        except Exception:
-            pass
+            if "STOCKING_DAILY_LOOKBACK_DAYS" in st.secrets:
+                secrets_lookback = int(st.secrets["STOCKING_DAILY_LOOKBACK_DAYS"])
+    except Exception:
+        pass
 
     suffix = os.getenv("STOCKING_TICKER_SUFFIX", ".NS")
 
@@ -76,5 +78,5 @@ def load_config() -> AppConfig:
         market_close=os.getenv("STOCKING_MARKET_CLOSE", def_close),
         auto_schedule=os.getenv("STOCKING_AUTO_SCHEDULE", "1") not in ("0", "false", "False"),
         fetch_start_delay_seconds=int(os.getenv("STOCKING_FETCH_START_DELAY", "0")),
-        daily_lookback_days=int(os.getenv("STOCKING_DAILY_LOOKBACK_DAYS", "365")),
+        daily_lookback_days=int(os.getenv("STOCKING_DAILY_LOOKBACK_DAYS", str(secrets_lookback or "365"))),
     )
