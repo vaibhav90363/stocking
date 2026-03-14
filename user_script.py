@@ -1,4 +1,4 @@
-# -*- coding: utf-8 -*-
+    # -*- coding: utf-8 -*-
 """
 Stock Backtesting Script: Fractal Breakout (Buy at Band Price) and CMO MA Crossover Exit Strategy (v6.2)
 """

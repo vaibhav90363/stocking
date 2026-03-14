@@ -1,0 +1,442 @@
+version: "1.0"
+artifact: "Search Quality Multi-Agent Spec Sheet"
+source_document:
+  name: "General Guidelines"
+  version: "10.1"
+  date: "2025-01-22"
+  file: "/Users/vaibhavchaudhary/Downloads/General_Guidelines Jan 22 2025.pdf"
+
+reference_index:
+  "0.2": {title: "Raters represent locale", pages: [7]}
+  "2.2": {title: "Understand page purpose", pages: [10]}
+  "2.3": {title: "YMYL topics", pages: [11, 12, 13]}
+  "2.4.1": {title: "Main Content (MC)", pages: [13]}
+  "2.4.2": {title: "Supplementary Content (SC)", pages: [14]}
+  "2.4.3": {title: "Ads/Monetization", pages: [14]}
+  "2.5.2": {title: "Who is responsible", pages: [16]}
+  "3.0": {title: "Overall PQ process", pages: [19]}
+  "3.1": {title: "PQ considerations", pages: [19]}
+  "3.2": {title: "MC quality: effort/originality/skill/accuracy", pages: [21]}
+  "3.3": {title: "Reputation", pages: [22]}
+  "3.3.3": {title: "How to research reputation", pages: [23]}
+  "3.4": {title: "E-E-A-T with Trust central", pages: [26, 27]}
+  "3.4.1": {title: "YMYL: experience vs expertise", pages: [28]}
+  "4.0": {title: "Lowest quality screening", pages: [29]}
+  "4.1": {title: "Types of Lowest pages", pages: [31]}
+  "4.2": {title: "Harmful to self/others", pages: [32]}
+  "4.3": {title: "Harmful to specified groups", pages: [33]}
+  "4.4": {title: "Harmfully misleading information", pages: [34, 35]}
+  "4.5": {title: "Untrustworthy/deceptive pages", pages: [35, 36]}
+  "4.6": {title: "Spammy pages", pages: [39, 42, 43]}
+  "5.1": {title: "Low due to lacking E-E-A-T", pages: [60]}
+  "5.2": {title: "Low quality MC", pages: [60, 61]}
+  "5.2.2": {title: "Filler as poor UX", pages: [62]}
+  "5.3": {title: "Distracting Ads/SC", pages: [62]}
+  "5.5": {title: "Unsatisfying site/creator info", pages: [63]}
+  "5.6": {title: "Exaggerated/mildly misleading info", pages: [63]}
+  "6.1": {title: "Medium page types", pages: [69]}
+  "7.1": {title: "High quality MC", pages: [72]}
+  "7.2": {title: "Positive reputation", pages: [72]}
+  "7.3": {title: "High E-E-A-T", pages: [73]}
+  "8.1": {title: "Very high quality MC", pages: [78]}
+  "8.2": {title: "Very positive reputation", pages: [78]}
+  "8.3": {title: "Very high E-E-A-T", pages: [78]}
+  "12.1": {title: "Query/result/LP definitions", pages: [94, 95]}
+  "12.2": {title: "Understand query first", pages: [95]}
+  "12.3": {title: "Locale and user location", pages: [96]}
+  "12.4": {title: "Explicit location", pages: [97]}
+  "12.5": {title: "Multiple interpretations", pages: [98]}
+  "12.6": {title: "Meanings change over time", pages: [101]}
+  "12.7": {title: "Intent families", pages: [101]}
+  "12.7.1": {title: "Know / Know Simple", pages: [102, 103]}
+  "12.7.2": {title: "Do", pages: [103]}
+  "12.7.3": {title: "Website", pages: [104]}
+  "12.7.4": {title: "Visit-in-Person", pages: [105]}
+  "12.7.5": {title: "Multiple user intents", pages: [107]}
+  "12.8": {title: "Result blocks", pages: [108, 109]}
+  "13.0": {title: "Needs Met scale", pages: [113]}
+  "13.1.1": {title: "Landing-page NM vs block-content NM", pages: [117]}
+  "13.2": {title: "Fully Meets", pages: [118]}
+  "13.3": {title: "Highly Meets", pages: [123]}
+  "13.4": {title: "Moderately Meets", pages: [130]}
+  "13.5": {title: "Slightly Meets", pages: [132]}
+  "13.6": {title: "Fails to Meet", pages: [134]}
+  "14.0": {title: "PQ vs NM relationship", pages: [141]}
+  "15.0": {title: "Porn/foreign language/did-not-load", pages: [143, 145, 148]}
+  "18.0": {title: "Freshness", pages: [157]}
+  "21.0": {title: "Product queries and browsing", pages: [162]}
+  "22.0": {title: "Visit-in-person rating", pages: [163]}
+
+shared_input_schema: &shared_input_schema
+  type: object
+  required: [task_id, query, locale, task_mode, runtime]
+  properties:
+    task_id: {type: string}
+    query: {type: string}
+    locale:
+      type: object
+      required: [language, country]
+      properties:
+        language: {type: string}
+        country: {type: string}
+    user_location:
+      type: object
+      properties:
+        city: {type: string}
+        state: {type: string}
+        country: {type: string}
+        lat: {type: number}
+        lon: {type: number}
+    task_mode: {type: string, enum: [PQ, NM, LP_NM, BLOCK_NM]}
+    result_block: {type: object}
+    landing_page: {type: object}
+    runtime:
+      type: object
+      required: [current_date]
+      properties:
+        current_date: {type: string}
+        timezone: {type: string}
+    agent_outputs: {type: object}
+
+common_tool_permissions: &common_tool_permissions
+  allow:
+    - "internal.search.read"
+    - "internal.page.fetch"
+    - "internal.page.render"
+    - "internal.page.extract"
+    - "internal.ocr.read"
+    - "internal.geocode.read"
+    - "internal.factcheck.read"
+    - "internal.reputation.read"
+    - "internal.safety.read"
+    - "internal.similarity.read"
+  deny:
+    - "write_to_training_labels"
+    - "mutate_ground_truth"
+    - "finalize_without_evidence"
+
+agents:
+  - id: "A0_intake_normalization"
+    system_prompt: |
+      You are A0 Intake & Normalization.
+      Objective: convert raw task artifacts into canonical task JSON with stable evidence IDs.
+      Strictly avoid any Page Quality (PQ) or Needs Met (NM) judgment.
+      Enforce task-mode semantics from Sec 13.1.1 and core query/result definitions from Sec 12.1.
+      Resolve redirects, parse block type, extract OCR-visible text, preserve render text, and detect visible dates.
+      For missing fields, return null rather than inference.
+      Output must validate against schema and be deterministic for same input.
+      References: Sec 12.1, 12.8, 13.1.1.
+    input_schema: *shared_input_schema
+    output_schema:
+      type: object
+      required: [normalized_task, missing_fields, extraction_warnings]
+      properties:
+        normalized_task: {type: object}
+        missing_fields: {type: array, items: {type: string}}
+        extraction_warnings: {type: array, items: {type: string}}
+    tool_permissions: *common_tool_permissions
+    api_calls:
+      - {name: "POST /tasks/normalize", purpose: "canonical structure + validation"}
+      - {name: "POST /serp/block/parse", purpose: "block type/title/snippet extraction"}
+      - {name: "POST /page/fetch", purpose: "URL fetch + redirect chain"}
+      - {name: "POST /page/render", purpose: "rendered text/screenshots"}
+    retrieval_pack:
+      guideline_sections: ["12.1", "12.8", "13.1.1"]
+      context_examples: ["web block", "SCRB", "landing-page NM mode", "block-content NM mode"]
+    eval_slices:
+      dataset: {name: "a0_normalization_gold", min_size: 2000}
+      slices: ["redirect-chain", "screenshot-only", "html-only", "pdf-landing-page", "local-pack", "missing-location"]
+      metrics: ["schema_validity", "field_exact_match", "date_extraction_f1", "block_type_accuracy"]
+
+  - id: "A1_query_understanding"
+    system_prompt: |
+      You are A1 Query Understanding.
+      Represent users in the provided locale and location (Sec 0.2, 12.3).
+      Determine dominant/common/reasonable-minor/unlikely interpretations (Sec 12.5).
+      Infer intent mix: Know, Know Simple, Do, Website, Visit-in-Person (Sec 12.7.x).
+      Apply explicit-location handling (Sec 12.4), freshness rules (Sec 12.6, 18.0), product-query behavior (Sec 21.0),
+      and visit-in-person behavior (Sec 22.0).
+      Do not use top-ranked SERP position as evidence of meaning (Sec 12.2).
+      Output a calibrated distribution and ambiguity level.
+      References: Sec 12.2-12.7.5, 18.0, 21.0, 22.0.
+    input_schema: *shared_input_schema
+    output_schema:
+      type: object
+      required: [dominant_interpretation, intent_distribution, freshness_sensitive, location_sensitive, ambiguity_level]
+      properties:
+        dominant_interpretation: {type: string}
+        common_interpretations: {type: array, items: {type: string}}
+        reasonable_minor_interpretations: {type: array, items: {type: string}}
+        unlikely_interpretations: {type: array, items: {type: string}}
+        intent_distribution: {type: object}
+        explicit_location: {type: [string, "null"]}
+        freshness_sensitive: {type: boolean}
+        location_sensitive: {type: boolean}
+        product_research_query: {type: boolean}
+        ambiguity_level: {type: string, enum: [low, medium, high]}
+    tool_permissions: *common_tool_permissions
+    api_calls:
+      - {name: "POST /query/interpret", purpose: "query-intent/interpretation draft"}
+      - {name: "POST /factcheck/verify", purpose: "time-sensitive interpretation checks"}
+      - {name: "POST /geocode/resolve", purpose: "explicit/user location normalization"}
+    retrieval_pack:
+      guideline_sections: ["0.2", "12.2", "12.3", "12.4", "12.5", "12.6", "12.7", "12.7.1", "12.7.2", "12.7.3", "12.7.4", "12.7.5", "18.0", "21.0", "22.0"]
+      context_examples: ["[iphone]", "[walmart]", "[harvard]", "[weather]", "[gas stations]", "[target website]"]
+    eval_slices:
+      dataset: {name: "a1_query_intent_gold", min_size: 5000}
+      slices: ["ambiguous-entity", "explicit-location", "freshness-demanding", "product-browse", "visit-in-person", "website-intent"]
+      metrics: ["dominant_interp_accuracy", "top3_interp_recall", "intent_macro_f1", "freshness_flag_f1", "location_sensitive_accuracy"]
+
+  - id: "A2_result_block_understanding"
+    system_prompt: |
+      You are A2 Result Block Understanding.
+      Judge what the block itself communicates before click, including misleading titles/snippets.
+      If task_mode is BLOCK_NM, score using block-only content (Sec 13.1.1).
+      If task_mode is LP_NM or NM, provide expectation and likely fit, but do not finalize NM.
+      Respect result-block definitions and SCRB assumptions (Sec 12.8 and 12.8.2).
+      References: Sec 12.8, 13.1.1, 13.5, 13.6.
+    input_schema: *shared_input_schema
+    output_schema:
+      type: object
+      required: [block_expectation_summary, intent_fit, misleading_title, misleading_snippet]
+      properties:
+        block_expectation_summary: {type: string}
+        intent_fit: {type: object}
+        misleading_title: {type: boolean}
+        misleading_snippet: {type: boolean}
+        block_only_nm_candidate: {type: [string, "null"]}
+    tool_permissions: *common_tool_permissions
+    api_calls:
+      - {name: "POST /serp/block/parse", purpose: "title/snippet/visible feature extraction"}
+      - {name: "POST /ocr/extract", purpose: "screenshot text recovery"}
+      - {name: "POST /page/classify", purpose: "block family classification"}
+    retrieval_pack:
+      guideline_sections: ["12.8", "13.1.1", "13.5", "13.6"]
+      context_examples: ["web result block", "SCRB weather", "misleading headline block", "block-only NM task"]
+    eval_slices:
+      dataset: {name: "a2_block_quality_gold", min_size: 1800}
+      slices: ["block-only", "web-snippet-mismatch", "stale-block", "local-pack", "shopping-card"]
+      metrics: ["block_nm_weighted_kappa", "misleading_title_precision", "misleading_title_recall"]
+
+  - id: "A3_landing_page_purpose_structure"
+    system_prompt: |
+      You are A3 Landing Page Purpose & Structure.
+      Identify true purpose (Sec 2.2), MC/SC/Ads partition (Sec 2.4.1-2.4.3), and responsible entities (Sec 2.5.2).
+      Explore tabs/features enough to avoid shallow misclassification.
+      Check presence of about/contact/customer-service info without scoring trust yet.
+      Do not assign PQ or NM; this is structural and contextual analysis only.
+      References: Sec 2.2, 2.4.1, 2.4.2, 2.4.3, 2.5.2, 3.1.
+    input_schema: *shared_input_schema
+    output_schema:
+      type: object
+      required: [page_purpose, purpose_category, mc_summary, sc_summary, ads_summary, responsible_entity]
+      properties:
+        page_purpose: {type: string}
+        purpose_category: {type: string}
+        mc_summary: {type: string}
+        sc_summary: {type: string}
+        ads_summary: {type: string}
+        responsible_entity: {type: object}
+        transparency_signals: {type: object}
+    tool_permissions: *common_tool_permissions
+    api_calls:
+      - {name: "POST /page/render", purpose: "interactive rendering and screenshots"}
+      - {name: "POST /page/extract", purpose: "MC/SC/Ads candidates + metadata"}
+      - {name: "POST /page/classify", purpose: "purpose category prediction"}
+    retrieval_pack:
+      guideline_sections: ["2.2", "2.4.1", "2.4.2", "2.4.3", "2.5.2", "3.1"]
+      context_examples: ["news page", "shopping page", "forum page", "bank login page"]
+    eval_slices:
+      dataset: {name: "a3_structure_gold", min_size: 2200}
+      slices: ["ecommerce", "forum", "news", "calculator-tool", "login", "error-page"]
+      metrics: ["purpose_accuracy", "mc_sc_ads_f1", "responsible_entity_accuracy"]
+
+  - id: "A4_safety_ymyl_deception_gate"
+    system_prompt: |
+      You are A4 Safety/YMYL/Deception Gate.
+      Run hard screening first (Sec 3.0, 4.0): harmful purpose, harmful misinformation, deception, spam, malicious risk.
+      Classify YMYL level using harm potential framework (Sec 2.3).
+      If any hard Lowest condition is met, emit required_pq_cap=Lowest and required_nm_cap=FailsM.
+      Perform factual checks for consequential claims with trustworthy independent sources (Sec 4.4).
+      References: Sec 2.3, 3.0, 4.0-4.6, 15.0, 18.0.
+    input_schema: *shared_input_schema
+    output_schema:
+      type: object
+      required: [ymyl_level, hard_lowest_triggered, hard_lowest_reasons]
+      properties:
+        ymyl_level: {type: string, enum: [clear, possible, not_ymyl]}
+        hard_lowest_triggered: {type: boolean}
+        hard_lowest_reasons: {type: array, items: {type: string}}
+        required_pq_cap: {type: [string, "null"]}
+        required_nm_cap: {type: [string, "null"]}
+    tool_permissions: *common_tool_permissions
+    api_calls:
+      - {name: "POST /risk/ymyl", purpose: "ymyl classification"}
+      - {name: "POST /risk/safety-check", purpose: "harm/deception/spam scan"}
+      - {name: "POST /factcheck/verify", purpose: "high-impact claim verification"}
+      - {name: "POST /safety/url-check", purpose: "malware/phishing signal"}
+    retrieval_pack:
+      guideline_sections: ["2.3", "3.0", "4.0", "4.1", "4.2", "4.3", "4.4", "4.5", "4.6", "15.0", "18.0"]
+      context_examples: ["medical misinformation", "financial scam", "hateful content", "deceptive design", "spam no-value pages"]
+    eval_slices:
+      dataset: {name: "a4_safety_gold", min_size: 3000}
+      slices: ["clear-ymyl", "harmful-misleading", "deceptive-store", "spam-generated", "benign-controversial"]
+      metrics: ["hard_lowest_recall", "hard_lowest_false_negative_rate", "ymyl_f1", "deception_precision"]
+
+  - id: "A5_reputation_eeat"
+    system_prompt: |
+      You are A5 Reputation & E-E-A-T.
+      Assess trust first, then experience/expertise/authoritativeness (Sec 3.4).
+      Use independent sources and reputation research methods (Sec 3.3.3), not site self-claims alone.
+      For YMYL topics, require expert-backed trust signals and consensus-aware sourcing (Sec 3.3, 3.4.1).
+      Treat no-reputation for small/ordinary creators as neutral unless task context requires stronger trust evidence.
+      References: Sec 3.3, 3.3.3, 3.4, 3.4.1, 5.5, 5.6, 7.2, 7.3, 8.2, 8.3.
+    input_schema: *shared_input_schema
+    output_schema:
+      type: object
+      required: [trust_level, eeat_levels, website_reputation, creator_reputation, evidence_quality]
+      properties:
+        trust_level: {type: string, enum: [very_low, low, adequate, high, very_high]}
+        eeat_levels: {type: object}
+        website_reputation: {type: string}
+        creator_reputation: {type: string}
+        conflict_of_interest: {type: boolean}
+        evidence_quality: {type: string, enum: [weak, moderate, strong]}
+    tool_permissions: *common_tool_permissions
+    api_calls:
+      - {name: "POST /reputation/search", purpose: "independent source discovery"}
+      - {name: "POST /reputation/evidence", purpose: "source scoring and extraction"}
+      - {name: "POST /factcheck/verify", purpose: "credential and claim validation"}
+    retrieval_pack:
+      guideline_sections: ["3.3", "3.3.3", "3.4", "3.4.1", "5.5", "5.6", "7.2", "7.3", "8.2", "8.3"]
+      context_examples: ["hospital website", "independent journalist", "influencer review with sponsorship", "small local business"]
+    eval_slices:
+      dataset: {name: "a5_eeat_gold", min_size: 2500}
+      slices: ["medical", "finance", "news", "product-review", "forum-user", "small-site-no-reputation"]
+      metrics: ["trust_weighted_kappa", "eeat_macro_f1", "source_independence_precision", "evidence_sufficiency_score"]
+
+  - id: "A6_main_content_quality"
+    system_prompt: |
+      You are A6 Main Content Quality.
+      Score MC quality by purpose-fit using effort, originality, skill/talent, and accuracy (Sec 3.2).
+      Detect low-value patterns: filler, low effort repackage, copied/paraphrased content (Sec 5.2, 5.2.2).
+      For YMYL informational content, require accuracy aligned with expert consensus.
+      Do not use reputation as a shortcut; evaluate the MC itself.
+      References: Sec 3.2, 5.2, 5.2.2, 7.1, 8.1.
+    input_schema: *shared_input_schema
+    output_schema:
+      type: object
+      required: [effort, originality, skill, accuracy, filler_penalty, copied_content_risk, mc_quality_band]
+      properties:
+        effort: {type: number}
+        originality: {type: number}
+        skill: {type: number}
+        accuracy: {type: number}
+        filler_penalty: {type: number}
+        copied_content_risk: {type: number}
+        mc_quality_band: {type: string, enum: [Low, Medium, High, Highest]}
+    tool_permissions: *common_tool_permissions
+    api_calls:
+      - {name: "POST /content/quality", purpose: "MC feature extraction"}
+      - {name: "POST /content/similarity", purpose: "copy/paraphrase detection"}
+      - {name: "POST /factcheck/verify", purpose: "accuracy checks on factual claims"}
+    retrieval_pack:
+      guideline_sections: ["3.2", "5.2", "5.2.2", "7.1", "8.1"]
+      context_examples: ["investigative article", "copied listicle", "filler-heavy tutorial", "high-quality how-to video"]
+    eval_slices:
+      dataset: {name: "a6_mc_quality_gold", min_size: 3000}
+      slices: ["copied-content", "high-originality", "low-effort-ai-like", "high-skill-howto", "ymyl-factual"]
+      metrics: ["mc_band_weighted_kappa", "copied_content_pr", "accuracy_violation_recall"]
+
+  - id: "A7_page_quality_rating"
+    system_prompt: |
+      You are A7 Page Quality Rater.
+      Produce final PQ slider label: Lowest, Lowest+, Low, Low+, Medium, Medium+, High, High+, Highest.
+      Apply hard Lowest caps from A4 first (Sec 3.0, 4.0).
+      Otherwise rate how well the page achieves its purpose (Sec 3.1), using MC quality, E-E-A-T/trust, and reputation.
+      Medium means adequate with nothing notable (Sec 6.1); High requires satisfying quality (Sec 7.x);
+      Highest requires outstanding quality/trust/reputation signals (Sec 8.x).
+      References: Sec 3.0-3.4, 4.0-4.6, 5.1-5.6, 6.1, 7.1-7.3, 8.1-8.3.
+    input_schema: *shared_input_schema
+    output_schema:
+      type: object
+      required: [pq_rating, confidence, rationale]
+      properties:
+        pq_rating: {type: string}
+        confidence: {type: number}
+        rationale: {type: array, items: {type: string}}
+    tool_permissions: *common_tool_permissions
+    api_calls:
+      - {name: "POST /rating/pq", purpose: "rule + model fused PQ decision"}
+    retrieval_pack:
+      guideline_sections: ["3.0", "3.1", "3.2", "3.3", "3.4", "4.0", "4.1", "4.4", "4.5", "4.6", "5.1", "5.2", "5.3", "5.5", "5.6", "6.1", "7.1", "7.2", "7.3", "8.1", "8.2", "8.3"]
+      context_examples: ["lowest scam", "low thin content", "medium adequate page", "high satisfying page", "highest authoritative page"]
+    eval_slices:
+      dataset: {name: "a7_pq_gold", min_size: 5000}
+      slices: ["ymyl-high-scrutiny", "non-ymyl", "reputation-present", "reputation-absent", "spam-like"]
+      metrics: ["weighted_kappa", "catastrophic_miss_rate", "calibration_error"]
+
+  - id: "A8_needs_met_rating"
+    system_prompt: |
+      You are A8 Needs Met Rater.
+      Produce NM label: FailsM, SM, MM, HM, HM+, FullyM.
+      NM is query+result dependent (Sec 13, 14), using A1 intent distribution, A2 block expectation, and landing-page evidence.
+      Apply freshness for time-sensitive queries (Sec 18.0), product-browse behavior (Sec 21.0), and location fit (Sec 22.0).
+      HM is disallowed when untrustworthy/inaccurate/stale for the query need (Sec 13.3, 14.0).
+      FullyM is conservative and only for clear unambiguous intent with near-universal satisfaction (Sec 13.2).
+      References: Sec 13.0-13.6, 14.0, 18.0, 21.0, 22.0.
+    input_schema: *shared_input_schema
+    output_schema:
+      type: object
+      required: [nm_rating, confidence, target_intent, rationale]
+      properties:
+        nm_rating: {type: string}
+        confidence: {type: number}
+        target_intent: {type: string}
+        rationale: {type: array, items: {type: string}}
+    tool_permissions: *common_tool_permissions
+    api_calls:
+      - {name: "POST /rating/nm", purpose: "intent-fit + freshness + location NM decision"}
+      - {name: "POST /factcheck/verify", purpose: "validate current-fact freshness-sensitive claims"}
+      - {name: "POST /geocode/resolve", purpose: "distance/nearby relevance checks"}
+    retrieval_pack:
+      guideline_sections: ["13.0", "13.1.1", "13.2", "13.3", "13.4", "13.5", "13.6", "14.0", "18.0", "21.0", "22.0"]
+      context_examples: ["clear website intent", "broad query with multiple intents", "stale news result", "product browsing result", "nearby business result"]
+    eval_slices:
+      dataset: {name: "a8_nm_gold", min_size: 6000}
+      slices: ["fullym-eligible", "hm-vs-mm", "stale-sensitive", "visit-in-person", "product-browse", "off-topic-failsm"]
+      metrics: ["weighted_kappa", "hm_overgrant_rate", "freshness_error_rate", "location_fit_accuracy"]
+
+  - id: "A9_final_arbiter_calibration"
+    system_prompt: |
+      You are A9 Final Arbiter & Calibration.
+      Combine upstream outputs into final official decision with evidence trace.
+      Resolve conflicts by priority:
+      1) hard safety/deception/spam findings
+      2) page purpose and YMYL level
+      3) trust/E-E-A-T and MC quality
+      4) query-intent fit, freshness, location fit
+      Enforce Sec 14.0: PQ and NM are related but not identical.
+      If confidence is low or evidence conflicts materially, set review_flag=true and explain.
+      References: Sec 3.0, 4.0, 13.0-13.6, 14.0, 18.0, 21.0, 22.0.
+    input_schema: *shared_input_schema
+    output_schema:
+      type: object
+      required: [final_pq, final_nm, confidence, review_flag, evidence_trace]
+      properties:
+        final_pq: {type: string}
+        final_nm: {type: string}
+        confidence: {type: number}
+        review_flag: {type: boolean}
+        review_reason: {type: [string, "null"]}
+        evidence_trace: {type: array, items: {type: string}}
+    tool_permissions: *common_tool_permissions
+    api_calls:
+      - {name: "POST /rating/finalize", purpose: "final arbitration and confidence calibration"}
+    retrieval_pack:
+      guideline_sections: ["3.0", "4.0", "13.0", "13.2", "13.3", "13.4", "13.5", "13.6", "14.0", "18.0", "21.0", "22.0"]
+      context_examples: ["PQ high NM fails", "PQ low NM website-intent edge case", "conflicting upstream agent outputs"]
+    eval_slices:
+      dataset: {name: "a9_e2e_adjudicated_gold", min_size: 2000}
+      slices: ["high-conflict", "low-confidence", "safety-veto", "freshness-critical", "location-critical"]
+      metrics: ["pq_nm_pair_accuracy", "human_override_rate", "internal_contradiction_rate", "confidence_calibration_error"]
