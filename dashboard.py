@@ -248,16 +248,18 @@ def run_dashboard(strategy_name_or_path=None):
     st.divider()
 
     # ── Tabs ───────────────────────────────────────────────────────────────────────
-    tab_overview, tab_portfolio, tab_universe, tab_deepdive, tab_signals, tab_ledger, tab_system, tab_log = st.tabs([
+    tabs = st.tabs([
         "📊 Overview",
         "💰 Portfolio",
         "🌐 Universe",
+        "🕵️ Alerts",
         "🔬 Deep Dive",
         "🚦 Signals",
         "📒 Ledger",
         "⚙️ System",
-        "📋 Live Log",
+        "📋 Live Log"
     ])
+    tab_overview, tab_portfolio, tab_universe, tab_alerts, tab_deep_dive, tab_signals, tab_ledger, tab_system, tab_logs = tabs
 
 
     # ══════════════════════════════════════════════════════════════════════════════
@@ -468,9 +470,107 @@ def run_dashboard(strategy_name_or_path=None):
 
 
     # ══════════════════════════════════════════════════════════════════════════════
-    # TAB 4 — DEEP DIVE
+    # TAB 4 — ALERTS (PROXIMITY)
     # ══════════════════════════════════════════════════════════════════════════════
-    with tab_deepdive:
+    with tab_alerts:
+        st.markdown('<p class="section-header">Fractal Proximity Alerts (±0.5%)</p>', unsafe_allow_html=True)
+        st.caption("Scans the active universe for stocks approaching or just crossing their weekly fractal bands.")
+
+        col1, col2 = st.columns([1, 4])
+        with col1:
+            run_btn = st.button("🚀 Run Universe Scan", use_container_width=True)
+        
+        if run_btn:
+            with st.status("Scanning universe...", expanded=True) as status:
+                st.write("Fetching active symbols...")
+                uni_df = repo.read_df("SELECT symbol FROM universe WHERE is_active=1")
+                all_syms = uni_df['symbol'].tolist()
+                
+                results = {
+                    "above_upper": [],
+                    "below_upper": [],
+                    "above_lower": [],
+                    "below_lower": []
+                }
+                
+                progress_bar = st.progress(0)
+                batch_size = 30
+                from stocking_app.strategy import compute_all_indicators
+                
+                for idx in range(0, len(all_syms), batch_size):
+                    batch = all_syms[idx : idx + batch_size]
+                    status.update(label=f"Scanning {idx + len(batch)} / {len(all_syms)} symbols...")
+                    
+                    daily_dict = repo.get_combined_bars_for_symbols(batch, daily_lookback_days=365)
+                    
+                    for sym in batch:
+                        df = daily_dict.get(sym)
+                        if df is None or df.empty:
+                            continue
+                        
+                        try:
+                            # Use Asia/Kolkata for NSE, or NYSE for US. 
+                            # We'll use cfg.exchange_tz to be safe.
+                            aligned = compute_all_indicators(df, cfg.exchange_tz)
+                            if aligned.empty:
+                                continue
+                                
+                            last = aligned.iloc[-1]
+                            close = float(last["close"])
+                            ub = float(last["weekly_upper_band"])
+                            lb = float(last["weekly_lower_band"])
+                            
+                            if pd.isna(ub) or pd.isna(lb):
+                                continue
+                                
+                            diff_u = (close - ub) / ub
+                            diff_l = (close - lb) / lb
+                            
+                            # Categorize (0.5% threshold)
+                            if 0 < diff_u <= 0.005:
+                                results["above_upper"].append({"Symbol": sym, "Price": close, "Band": ub, "Dist%": round(diff_u * 100, 3)})
+                            elif -0.005 <= diff_u < 0:
+                                results["below_upper"].append({"Symbol": sym, "Price": close, "Band": ub, "Dist%": round(diff_u * 100, 3)})
+                                
+                            if 0 < diff_l <= 0.005:
+                                results["above_lower"].append({"Symbol": sym, "Price": close, "Band": lb, "Dist%": round(diff_l * 100, 3)})
+                            elif -0.005 <= diff_l < 0:
+                                results["below_lower"].append({"Symbol": sym, "Price": close, "Band": lb, "Dist%": round(diff_l * 100, 3)})
+                        except:
+                            continue
+                            
+                    progress_bar.progress(min((idx + batch_size) / len(all_syms), 1.0))
+                
+                st.session_state["proximity_alerts"] = results
+                status.update(label="Scan complete!", state="complete", expanded=False)
+
+        # Display results from session state
+        if "proximity_alerts" in st.session_state:
+            res = st.session_state["proximity_alerts"]
+            
+            # Helper to display a section
+            def show_alert_table(label, data, color):
+                st.markdown(f"#### {label}")
+                if not data:
+                    st.info("No stocks found in this range.")
+                else:
+                    df = pd.DataFrame(data).sort_values("Dist%", ascending=True)
+                    st.dataframe(df, use_container_width=True, hide_index=True)
+
+            # Four Sections as requested
+            st.write("---")
+            c1, c2 = st.columns(2)
+            with c1:
+                show_alert_table("📈 0.5% ABOVE Upper Fractal Band", res["above_upper"], "green")
+                show_alert_table("📉 0.5% BELOW Upper Fractal Band", res["below_upper"], "orange")
+            with c2:
+                show_alert_table("📈 0.5% ABOVE Lower Fractal Band", res["above_lower"], "blue")
+                show_alert_table("📉 0.5% BELOW Lower Fractal Band", res["below_lower"], "red")
+
+    # ══════════════════════════════════════════════════════════════════════════════
+    # TAB 5 — DEEP DIVE
+    # ══════════════════════════════════════════════════════════════════════════════
+    with tab_deep_dive:
         st.markdown('<p class="section-header">Symbol Deep Dive</p>', unsafe_allow_html=True)
         st.caption("Select a symbol to view its complete indicator calculations and charts.")
 
@@ -658,6 +758,8 @@ def run_dashboard(strategy_name_or_path=None):
                                     # ── Raw data table ────────────────────────────────────────
                                     st.markdown("### 🧮 Raw Indicator Data (Full Year)")
                                     display_df = aligned.copy()
+                                    display_df.index = pd.to_datetime(display_df.index)
+                                    display_df = display_df.sort_index(ascending=False)
                                     display_df.index = display_df.index.strftime("%Y-%m-%d")
                                     cols_to_show = [
                                         "close",
@@ -677,6 +779,8 @@ def run_dashboard(strategy_name_or_path=None):
                                         wk_display = weekly_df[["open", "high", "low", "close",
                                                                   "upper_fractal_point", "lower_fractal_point",
                                                                   "upper_band_line", "lower_band_line"]].copy()
+                                        wk_display.index = pd.to_datetime(wk_display.index)
+                                        wk_display = wk_display.sort_index(ascending=False)
                                         wk_display.index = wk_display.index.strftime("%Y-%m-%d")
                                         st.dataframe(
                                             wk_display.style.format("{:.4f}"),
