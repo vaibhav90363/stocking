@@ -410,6 +410,8 @@ def run_dashboard(strategy_name_or_path=None):
                 u.is_active,
                 SUBSTR(ss.last_candle_ts, 1, 19)  AS last_fetched,
                 SUBSTR(ss.last_compute_ts, 1, 19) AS last_computed,
+                ss.last_price_seen AS last_price,
+                SUBSTR(ss.last_price_seen_at, 1, 19) AS captured_at,
                 CASE
                   WHEN ss.last_candle_ts IS NULL THEN 'Never fetched'
                   WHEN ss.last_compute_ts IS NULL THEN 'Never computed'
