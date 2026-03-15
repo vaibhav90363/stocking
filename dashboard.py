@@ -974,7 +974,7 @@ def run_dashboard(strategy_name_or_path=None):
     # ══════════════════════════════════════════════════════════════════════════════
     # TAB 7 — LIVE LOG
     # ══════════════════════════════════════════════════════════════════════════════
-    with tab_log:
+    with tab_logs:
         st.markdown('<p class="section-header">Live Engine Log</p>', unsafe_allow_html=True)
 
         n_lines = st.slider("Lines to show", min_value=20, max_value=500, value=100, step=20)
