@@ -476,20 +476,14 @@ class ScalableEngine:
         compute_payloads: list[dict[str, Any]] = []
 
         # BUG-10 fix: bulk-load all symbol candle data in 1 DB round-trip
-        # instead of N individual calls (one per symbol). At 100 symbols this
-        # saves ~1.5s; at 500 symbols ~7.5s of serial DB idle time before any
-        # compute thread can start.
         self.log.debug(f"Bulk-loading candles for {len(symbols_to_compute)} symbols in 1 query ...")
-        # BUG-WEEKLY-BAND-01 fix: use daily_lookback_days (not compute_lookback_days) for
-        # the candle query so weekly fractal chaos bands have enough history.
-        # compute_lookback_days=30 gives only ~4 weekly bars — not enough for fractal_chaos_bands
-        # to find any pivot points (left_window=2, right_window=2 needs ~5+ weekly bars minimum,
-        # but realistically 12+ weeks for reliable signals). daily_lookback_days defaults to 120d
-        # which gives ~17 weekly bars — enough to calculate stable fractal band lines.
         all_bars = self.repo.get_combined_bars_for_symbols(
             symbols_to_compute,
             daily_lookback_days=self.cfg.daily_lookback_days,
         )
+
+        # RETRIEVE LAST PRICE MEMORY (for 5-min crossovers)
+        prev_prices = self.repo.get_last_prices(symbols_to_compute)
 
         futures = {}
         for symbol in symbols_to_compute:
@@ -498,11 +492,16 @@ class ScalableEngine:
             if df_symbol is None:
                 df_symbol = pd.DataFrame()  # BUG-IMPORT-04 fix: use module-level pd import
 
+            # Get prev_price tuple: (price, ts)
+            prev_data = prev_prices.get(symbol)
+            prev_p = prev_data[0] if prev_data else None
+
             fut = self.executor.submit(
                 compute_symbol_signal,
                 symbol,
                 df_symbol,
                 self.cfg.exchange_tz,
+                prev_price=prev_p,
             )
             futures[fut] = symbol
 
@@ -569,16 +568,12 @@ class ScalableEngine:
         open_positions = self.repo.get_open_positions()
         position_prices: dict[str, tuple[float, str]] = {}
 
-        # Collect (symbol, asof_ts) pairs for batch upsert at end — avoids N DB round-trips
-        computed_pairs: list[tuple[str, str | None]] = []
         actions_taken = []
         for payload in compute_payloads:
             symbol = payload["symbol"]
             asof_ts = payload.get("asof_ts")
-            if asof_ts:
-                computed_pairs.append((symbol, asof_ts))
-
             last_price = payload.get("last_price")
+            
             if symbol in open_positions and last_price is not None and asof_ts:
                 position_prices[symbol] = (float(last_price), asof_ts)
 
@@ -593,7 +588,6 @@ class ScalableEngine:
             acted = False
             if signal == "BUY" and symbol not in open_positions:
                 # RE-ENTRY GUARD: Check if we already bought this symbol today.
-                # 'asof_ts' for 1D polling is the start of the daily candle (YYYY-MM-DDT00:00:00+00:00)
                 if asof_ts and self.repo.has_acted_buy_today(symbol, asof_ts):
                     self.log.info(f"       ⚠️  RE-ENTRY GUARD: Already bought {symbol} today. Skipping.")
                     continue
@@ -623,9 +617,16 @@ class ScalableEngine:
         if position_prices:
             self.repo.update_position_prices(position_prices)
 
-        # Single batch upsert for all symbol compute states — replaces N individual commits
-        if computed_pairs:
-            self.repo.batch_mark_symbols_computed(computed_pairs)
+        # Single batch upsert for all symbol compute states — also persists 'last_price_seen'
+        payload_data = []
+        for payload in compute_payloads:
+            sym = payload["symbol"]
+            ts = payload.get("asof_ts")
+            lp = payload.get("last_price")
+            # payload_data row: (symbol, asof_ts, price, price_ts)
+            payload_data.append((sym, ts, lp, ts))
+            
+        self.repo.batch_mark_symbols_computed(payload_data)
 
         snap_ts = utc_now_iso()
         self.repo.snapshot_pnl(ts=snap_ts)

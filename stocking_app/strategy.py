@@ -97,7 +97,7 @@ def compute_all_indicators(daily: pd.DataFrame, exchange_tz: str) -> pd.DataFram
 
     return aligned
 
-def _compute_latest_signal(aligned: pd.DataFrame) -> tuple[str | None, float | None, str]:
+def _compute_latest_signal(aligned: pd.DataFrame, prev_price_override: float | None = None) -> tuple[str | None, float | None, str]:
 
     critical = [
         "close",
@@ -115,7 +115,12 @@ def _compute_latest_signal(aligned: pd.DataFrame) -> tuple[str | None, float | N
     prev = aligned.iloc[-2]
     curr = aligned.iloc[-1]
 
-    buy_cross = prev["close"] <= prev["weekly_upper_band"] and curr["close"] > curr["weekly_upper_band"]
+    # BUG-CROSS-01: Use prev_price_override (from last cycle) if provided,
+    # otherwise fall back to the previous day's close. This allows 5-minute
+    # sensitivity on daily data polling.
+    prev_close = prev_price_override if prev_price_override is not None else prev["close"]
+
+    buy_cross = prev_close <= prev["weekly_upper_band"] and curr["close"] > curr["weekly_upper_band"]
     daily_sell_cross = curr["ema_cmo"] < curr["sma_cmo"] and prev["ema_cmo"] >= prev["sma_cmo"]
     weekly_sell_cross = (
         curr["weekly_ema_cmo"] < curr["weekly_sma_cmo"]
@@ -132,7 +137,7 @@ def _compute_latest_signal(aligned: pd.DataFrame) -> tuple[str | None, float | N
     return None, None, "no_signal"
 
 
-def compute_symbol_signal(symbol: str, daily: pd.DataFrame, exchange_tz: str) -> dict[str, Any]:
+def compute_symbol_signal(symbol: str, daily: pd.DataFrame, exchange_tz: str, prev_price: float | None = None) -> dict[str, Any]:
     """
     Compute the latest signal for a symbol given its 1d candle DataFrame.
     """
@@ -155,7 +160,7 @@ def compute_symbol_signal(symbol: str, daily: pd.DataFrame, exchange_tz: str) ->
             "signal_reason": "insufficient_weekly_bars",
         }
 
-    signal, signal_price, reason = _compute_latest_signal(aligned)
+    signal, signal_price, reason = _compute_latest_signal(aligned, prev_price_override=prev_price)
     return {
         "symbol": symbol,
         "asof_ts": last_ts.isoformat(),

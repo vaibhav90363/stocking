@@ -349,6 +349,17 @@ class TradingRepository:
                 END IF;
             END $$;
             """,
+            """
+            DO $$ BEGIN
+                IF NOT EXISTS (
+                    SELECT 1 FROM information_schema.columns 
+                    WHERE table_name='symbol_state' AND column_name='last_price_seen'
+                ) THEN
+                    ALTER TABLE symbol_state ADD COLUMN last_price_seen DOUBLE PRECISION;
+                    ALTER TABLE symbol_state ADD COLUMN last_price_seen_at TEXT;
+                END IF;
+            END $$;
+            """,
             # signals UNIQUE constraint — needed for ON CONFLICT(symbol, ts, signal_type)
             """
             DO $$ BEGIN
@@ -568,25 +579,43 @@ class TradingRepository:
             )
 
         return len(rows)
+            
+    @retry_on_disconnect()
+    def get_last_prices(self, symbols: list[str]) -> dict[str, tuple[float, str]]:
+        if not symbols:
+            return {}
+        with self.conn.cursor() as cur:
+            cur.execute(
+                "SELECT symbol, last_price_seen, last_price_seen_at FROM symbol_state WHERE symbol = ANY(%s)",
+                (symbols,)
+            )
+            rows = cur.fetchall()
+        return {
+            r["symbol"]: (r["last_price_seen"], r["last_price_seen_at"]) 
+            for r in rows 
+            if r["last_price_seen"] is not None and r["last_price_seen_at"] is not None
+        }
 
     @retry_on_disconnect()
-    def batch_mark_symbols_computed(self, pairs: list[tuple[str, str | None]]) -> None:
-        """Batch-upsert last_compute_ts for many symbols in a single round-trip.
-        Replaces N individual mark_symbol_computed() calls in the persist loop."""
-        if not pairs:
+    def batch_mark_symbols_computed(self, data: list[tuple[str, str | None, float | None, str | None]]) -> None:
+        """Batch-upsert last_compute_ts and last_price_seen for many symbols."""
+        if not data:
             return
         now = utc_now_iso()
-        rows = [(sym, None, now, now) for sym, ts in pairs]
+        # rows: (symbol, last_candle_ts, last_compute_ts, updated_at, last_price_seen, last_price_seen_at)
+        rows = [(sym, None, now, now, lp, ts) for sym, _, lp, ts in data]
         from psycopg2.extras import execute_values
         with self.conn.cursor() as cur:
             execute_values(
                 cur,
                 """
-                INSERT INTO symbol_state(symbol, last_candle_ts, last_compute_ts, updated_at)
+                INSERT INTO symbol_state(symbol, last_candle_ts, last_compute_ts, updated_at, last_price_seen, last_price_seen_at)
                 VALUES %s
                 ON CONFLICT(symbol) DO UPDATE SET
                     last_compute_ts=EXCLUDED.last_compute_ts,
-                    updated_at=EXCLUDED.updated_at
+                    updated_at=EXCLUDED.updated_at,
+                    last_price_seen=EXCLUDED.last_price_seen,
+                    last_price_seen_at=EXCLUDED.last_price_seen_at
                 """,
                 rows,
             )
