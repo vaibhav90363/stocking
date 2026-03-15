@@ -483,7 +483,10 @@ def run_dashboard(strategy_name_or_path=None):
         if run_btn:
             with st.status("Scanning universe...", expanded=True) as status:
                 st.write("Fetching active symbols...")
-                uni_df = repo.read_df("SELECT symbol FROM universe WHERE is_active=1")
+                uni_df = repo.read_df(
+                    "SELECT symbol FROM universe WHERE is_active=1 AND symbol LIKE %s",
+                    (f"%{cfg.ticker_suffix}",)
+                )
                 all_syms = uni_df['symbol'].tolist()
                 
                 results = {
