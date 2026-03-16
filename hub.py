@@ -586,27 +586,29 @@ with tab_health:
     # ── Section 2: Per-strategy Engine Heartbeats ─────────────────────────────
     st.markdown("### 💓 Engine Heartbeats (per strategy)")
     try:
-        import psycopg2 as _pg2
-        from psycopg2.extras import RealDictCursor as _RDC
-        _db_url = _get_db_url()
-        _conn_hb = _pg2.connect(_db_url, cursor_factory=_RDC, connect_timeout=8)
-
+        from stocking_app.db import TradingRepository as _TRHB
+        from stocking_app.config import load_config as _LCHB
+        _cfg_hb = _LCHB()
+        
         _hb_cols = st.columns(max(1, len(strategies)))
         for _hb_idx, _hb_sc in enumerate(strategies):
             with _hb_cols[_hb_idx]:
                 st.markdown(f"**{_hb_sc.suffix}** — {_hb_sc.name.split('—')[-1].strip()}")
                 try:
-                    _hb_key = f"engine_heartbeat_{_hb_sc.suffix}"
-                    with _conn_hb.cursor() as _hb_cur:
-                        _hb_cur.execute(
-                            "SELECT value, updated_at FROM engine_state WHERE key=%s",
-                            (_hb_key,)
-                        )
-                        _hb_row = _hb_cur.fetchone()
+                    _repo_hb = _TRHB(_cfg_hb.database_url or _cfg_hb.db_path, suffix=_hb_sc.suffix)
+                    _hb_row = None
+                    # Use repo method instead of raw SQL
+                    _hb_data = _repo_hb.get_engine_heartbeat()
+                    
+                    # We still need the updated_at from the table for age calculation
+                    _hb_raw = _repo_hb.read_df(
+                        "SELECT updated_at FROM engine_state WHERE key=%s",
+                        (f"engine_heartbeat_{_hb_sc.suffix}",)
+                    )
+                    _repo_hb.close()
 
-                    if _hb_row:
-                        _hb_data  = json.loads(_hb_row["value"])
-                        _hb_upd   = str(_hb_row["updated_at"])
+                    if _hb_data and not _hb_raw.empty:
+                        _hb_upd   = str(_hb_raw.iloc[0]["updated_at"])
                         _hb_state = _hb_data.get("state", "unknown")
                         _hb_ts    = _hb_data.get("last_run") or _hb_data.get("ts", "—")
 
@@ -631,7 +633,6 @@ with tab_health:
                         st.caption("No heartbeat yet")
                 except Exception as _hbe:
                     st.caption(f"Error: {str(_hbe)[:60]}")
-        _conn_hb.close()
     except Exception as _he:
         st.error(f"Could not read heartbeats: {_he}")
 
@@ -640,16 +641,14 @@ with tab_health:
     # ── Section 3: Last 10 Engine Cycles (per strategy) ─────────────────────
     st.markdown("### 🔄 Recent Engine Cycles")
     try:
-        import psycopg2 as _pg3
-        from psycopg2.extras import RealDictCursor as _RDC3
-        _db_url3 = _get_db_url()
-        _conn3 = _pg3.connect(_db_url3, cursor_factory=_RDC3, connect_timeout=8)
-
+        from stocking_app.db import TradingRepository as _TRC
+        _cfg_c = _LCHB()
+        
         for _cyc_sc in strategies:
             st.markdown(f"**{_cyc_sc.name}** (`{_cyc_sc.suffix}`):")
             try:
-                with _conn3.cursor() as _cur3:
-                    _cur3.execute("""
+                _repo_c = _TRC(_cfg_c.database_url or _cfg_c.db_path, suffix=_cyc_sc.suffix)
+                _cyc_df = _repo_c.read_df("""
                         SELECT
                             run_started_at,
                             status,
@@ -664,10 +663,9 @@ with tab_health:
                         ORDER BY id DESC
                         LIMIT 10
                     """, (_cyc_sc.suffix,))
-                    _cyc_rows = _cur3.fetchall()
+                _repo_c.close()
 
-                if _cyc_rows:
-                    _cyc_df = pd.DataFrame([dict(r) for r in _cyc_rows])
+                if not _cyc_df.empty:
                     def _cyc_color(val):
                         if val == "OK":     return "color:#4ade80;font-weight:700"
                         if val == "FAILED": return "color:#f87171;font-weight:700"
@@ -676,17 +674,15 @@ with tab_health:
                         _cyc_df.style.applymap(_cyc_color, subset=["status"]),
                         use_container_width=True, hide_index=True,
                     )
-                    _n_ok   = sum(1 for r in _cyc_rows if r["status"] == "OK")
-                    _n_fail = sum(1 for r in _cyc_rows if r["status"] == "FAILED")
+                    _n_ok   = (_cyc_df["status"] == "OK").sum()
+                    _n_fail = (_cyc_df["status"] == "FAILED").sum()
                     sc1, sc2 = st.columns(2)
-                    sc1.metric("✅ OK cycles",     _n_ok)
-                    sc2.metric("❌ Failed cycles", _n_fail)
+                    sc1.metric("✅ OK cycles",     int(_n_ok))
+                    sc2.metric("❌ Failed cycles", int(_n_fail))
                 else:
                     st.caption("No cycles yet for this strategy.")
             except Exception as _cye:
                 st.caption(f"Error reading cycles: {str(_cye)[:80]}")
-
-        _conn3.close()
     except Exception as _ce:
         st.error(f"Could not read cycle history: {_ce}")
 

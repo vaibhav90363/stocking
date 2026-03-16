@@ -235,7 +235,7 @@ class TradingRepository:
             if db_url not in cls._pools:  # double-checked locking
                 cls._pools[db_url] = ThreadedConnectionPool(
                     minconn=1,
-                    maxconn=5,  # 3 engines × 2 concurrent conns (main + keepalive) = 6 max; 5 per-pool is safe
+                    maxconn=50,  # Increased for multi-strategy threads + dashboard sessions
                     dsn=db_url,
                     cursor_factory=RealDictCursor,
                     keepalives=1,
@@ -254,12 +254,26 @@ class TradingRepository:
             self.db_url = db_path_or_url
 
         self.suffix = suffix
-        self.conn = None
+        # BUG-THREAD-SAFE-01 fix: use thread-local storage for self.conn.
+        # This prevents concurrent threads (Engine vs Logger vs Keep-alive) 
+        # from overwriting each other's connection pointers and leaking them.
+        self._local = threading.local()
+
         # BUG-02 fix: per-instance lock serialises all DB calls. A threading.Lock
         # is ~56 bytes — negligible on the 512 MB budget.
         self._lock: threading.Lock = threading.RLock()
         # Initialize pool on startup
         self.get_pool(self.db_url)
+
+    @property
+    def conn(self) -> Any | None:
+        """Get the connection for the current thread."""
+        return getattr(self._local, "conn", None)
+
+    @conn.setter
+    def conn(self, value: Any | None) -> None:
+        """Set the connection for the current thread."""
+        self._local.conn = value
 
     def _ensure_connection(self) -> None:
         """Secure a connection for the current operation from the pool."""
@@ -310,7 +324,21 @@ class TradingRepository:
             )
             existing = {row["tablename"] for row in _chk.fetchall()}
 
-        if existing >= EXPECTED_TABLES:
+        # NEW-MIGRATION-CHECK: Also verify columns that were added in later migrations.
+        # Even if the table exists, it might be missing columns like 'last_price_seen'.
+        has_columns = False
+        if "symbol_state" in existing:
+            with self.conn.cursor() as _colchk:
+                _colchk.execute(
+                    """
+                    SELECT column_name FROM information_schema.columns 
+                    WHERE table_name='symbol_state' AND column_name='last_price_seen'
+                    """
+                )
+                if _colchk.fetchone():
+                    has_columns = True
+
+        if existing >= EXPECTED_TABLES and has_columns:
             # Schema is complete — skip all DDL to avoid lock contention
             if self.get_engine_enabled() is None:
                 self.set_engine_enabled(False)
