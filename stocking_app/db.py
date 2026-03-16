@@ -804,13 +804,15 @@ class TradingRepository:
     @retry_on_disconnect()
     def has_acted_buy_today(self, symbol: str, day_iso: str) -> bool:
         """
-        Check if a BUY signal has already been acted upon for this symbol on a specific day.
-        'day_iso' should match the 'ts' used in the signals table (e.g. YYYY-MM-DDT00:00:00+00:00).
+        Check if a BUY signal has already been acted upon for this symbol on the same calendar date.
+        'day_iso' is used to extract the date part for comparison.
         """
+        # day_iso format is typically YYYY-MM-DDTHH:MM:SS+00:00
+        date_part = day_iso.split("T")[0]
         with self.conn.cursor() as cur:
             cur.execute(
-                "SELECT 1 FROM signals WHERE symbol=%s AND ts=%s AND signal_type='BUY' AND acted=1 LIMIT 1",
-                (symbol, day_iso)
+                "SELECT 1 FROM signals WHERE symbol=%s AND ts LIKE %s AND signal_type='BUY' AND acted=1 LIMIT 1",
+                (symbol, f"{date_part}%")
             )
             return cur.fetchone() is not None
 

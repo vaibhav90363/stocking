@@ -554,18 +554,24 @@ class ScalableEngine:
             + (f"  | {compute_errors} errors" if compute_errors else "")
         )
 
-        # Log each signal found — BUG-21 fix: guard against None price before :.4f format
-        for p in buys:
-            _price = p.get("signal_price") or p.get("last_price")
-            _price_str = f"{_price:.4f}" if _price is not None else "N/A"
-            self.log.info(f"       🟢 BUY   {p['symbol']:<16}  @ {_price_str}  [{p.get('signal_reason','')}]")
-        for p in sells:
-            _price = p.get("signal_price") or p.get("last_price")
-            _price_str = f"{_price:.4f}" if _price is not None else "N/A"
-            self.log.info(f"       🔴 SELL  {p['symbol']:<16}  @ {_price_str}  [{p.get('signal_reason','')}]")
-        self.log.info(f"  [3/3] PERSIST")
         persist_start = time.monotonic()
         open_positions = self.repo.get_open_positions()
+        
+        # Log signals — FILTERED based on actual portfolio state
+        # BUG-LOG-FILTERING: Prevent confusing logs where it shows a "SELL" for 
+        # a stock the user doesn't even own yet.
+        for p in buys:
+            if p['symbol'] not in open_positions:
+                _price = p.get("signal_price") or p.get("last_price")
+                _price_str = f"{_price:.4f}" if _price is not None else "N/A"
+                self.log.info(f"       🟢 BUY   {p['symbol']:<16}  @ {_price_str}  [{p.get('signal_reason','')}]")
+        
+        for p in sells:
+            if p['symbol'] in open_positions:
+                _price = p.get("signal_price") or p.get("last_price")
+                _price_str = f"{_price:.4f}" if _price is not None else "N/A"
+                self.log.info(f"       🔴 SELL  {p['symbol']:<16}  @ {_price_str}  [{p.get('signal_reason','')}]")
+
         position_prices: dict[str, tuple[float, str]] = {}
 
         actions_taken = []
