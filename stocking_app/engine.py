@@ -148,6 +148,9 @@ class ScalableEngine:
         self.ZERO_FETCH_SLEEP_EXTRA = 60
         self._empty_fetch_counts: dict[str, int] = {}
         self._dead_symbols: set[str] = set()
+
+        # Two-phase fetch: full backfill on first cycle, incremental after
+        self._bootstrap_done = False
         self.DEAD_SYMBOL_THRESHOLD = 5
 
     def stop(self) -> None:
@@ -337,8 +340,6 @@ class ScalableEngine:
         symbols = self.repo.get_monitor_symbols()
         total = len(symbols)
 
-        self.log.info(f"  [1/3] FETCH  — {total} symbols  (lookback={self.cfg.fetch_lookback_days}d)")
-
         if total == 0:
             self.log.warning("  No symbols in universe — skipping cycle.")
             run_ended = utc_now_iso()
@@ -363,6 +364,49 @@ class ScalableEngine:
         if len(live_symbols) < len(symbols):
             self.log.debug(f"  Skipping {len(symbols)-len(live_symbols)} dead/de-listed symbols.")
 
+        # ── Two-phase fetch: bootstrap once, then incremental ──────────────
+        # On first cycle (or after restart), check which symbols still need
+        # their full historical backfill.  On subsequent cycles, only fetch
+        # the last `fetch_lookback_days` (typically 2d) for symbols whose
+        # latest candle is stale — avoids re-downloading ~20,000 bars every
+        # 5 minutes when only ~200 new bars exist.
+        if not self._bootstrap_done:
+            # First cycle: check which symbols are missing historical data
+            symbols_needing_backfill = self.repo.get_symbols_needing_daily_fetch(live_symbols)
+            if symbols_needing_backfill:
+                fetch_lookback = self.cfg.daily_lookback_days
+                fetch_symbols = symbols_needing_backfill
+                fetch_mode = "bootstrap"
+                self.log.info(
+                    f"  [1/3] FETCH  — {len(fetch_symbols)}/{total} symbols need backfill  "
+                    f"(lookback={fetch_lookback}d, mode=bootstrap)"
+                )
+            else:
+                # All symbols already have today's data (e.g. quick restart)
+                fetch_lookback = self.cfg.fetch_lookback_days
+                fetch_symbols = self.repo.get_symbols_needing_daily_fetch(live_symbols)
+                if not fetch_symbols:
+                    fetch_symbols = live_symbols  # safety: fetch all with short lookback
+                fetch_mode = "incremental"
+                self._bootstrap_done = True
+                self.log.info(
+                    f"  [1/3] FETCH  — {len(fetch_symbols)} symbols  "
+                    f"(lookback={fetch_lookback}d, mode=incremental — bootstrap skipped, data is fresh)"
+                )
+        else:
+            # Subsequent cycles: only fetch symbols that need a refresh
+            symbols_needing_refresh = self.repo.get_symbols_needing_daily_fetch(live_symbols)
+            if symbols_needing_refresh:
+                fetch_symbols = symbols_needing_refresh
+            else:
+                fetch_symbols = live_symbols  # safety fallback
+            fetch_lookback = self.cfg.fetch_lookback_days
+            fetch_mode = "incremental"
+            self.log.info(
+                f"  [1/3] FETCH  — {len(fetch_symbols)}/{total} symbols  "
+                f"(lookback={fetch_lookback}d, mode=incremental)"
+            )
+
         fetched_symbols: list[str] = []
         failed_symbols: list[str] = []
         state = {"total_bars": 0}
@@ -381,18 +425,11 @@ class ScalableEngine:
         _ka_thread.start()
 
         try:
-            # BUG-FIX: We no longer use asyncio. yfinance's internal threading
-            # combined with asyncio.to_thread caused deadlocks on Render.
-            # Use a plain synchronous generator instead.
-            #
             # OOM-FIX: Stream-and-release — upsert each result immediately as
-            # it arrives from the generator instead of accumulating all DataFrames
-            # in a good_results list. At 500 symbols × 90 rows, the old approach
-            # held ~150-200 MB per engine simultaneously (3 engines = ~500 MB peak).
-            # Now each DataFrame is written to DB and freed before the next batch arrives.
+            # it arrives from the generator instead of accumulating all DataFrames.
             gen = fetch_daily_bars_gen(
-                live_symbols,
-                lookback_days=self.cfg.daily_lookback_days,
+                fetch_symbols,
+                lookback_days=fetch_lookback,
                 max_concurrency=self.cfg.max_fetch_concurrency,
             )
             count = 0
@@ -437,6 +474,14 @@ class ScalableEngine:
         finally:
             _keepalive_stop.set()
             _ka_thread.join(timeout=2)
+
+        # Mark bootstrap as done after first successful fetch cycle
+        if fetch_mode == "bootstrap" and fetched_symbols:
+            self._bootstrap_done = True
+            self.log.info(f"       ✓ Bootstrap complete — switching to incremental fetches")
+
+        # OOM-FIX: Explicitly free yfinance temporaries
+        gc.collect()
 
         fetch_seconds = time.monotonic() - fetch_start
 
