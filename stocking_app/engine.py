@@ -1,13 +1,13 @@
 from __future__ import annotations
 
 import asyncio
+import gc
 import logging
 import logging.handlers
 import os
 import signal
 import threading
 import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -94,15 +94,6 @@ class ScalableEngine:
         self.repo = TradingRepository(cfg.database_url or cfg.db_path, suffix=cfg.ticker_suffix)
         self.repo.init_db()
         self._running = True
-        
-        # ── Compute thread pool ─────────────────────────────────────────────
-        # Use threads NOT processes — avoids spawning extra Python interpreters
-        # (~150 MB each). Compute is numpy/pandas heavy which releases the GIL,
-        # so threads get real parallelism without the memory overhead of forks.
-        # On Render's 512 MB free tier this saves ~450 MB across 3 engines.
-        system_cores = os.cpu_count() or 1
-        target_workers = max(1, cfg.compute_workers)
-        self.executor = ThreadPoolExecutor(max_workers=min(target_workers, system_cores))
 
         # Logger writes to <db_path_dir>/logs/engine.log and the Supabase db
         log_dir = Path(cfg.db_path).parent / "logs"
@@ -163,7 +154,6 @@ class ScalableEngine:
         self._running = False
 
     def close(self) -> None:
-        self.executor.shutdown(wait=True, cancel_futures=True)
         self.log.info("Engine shut down cleanly.")
         self.repo.close()
         self.pid_file.unlink(missing_ok=True)
@@ -291,6 +281,19 @@ class ScalableEngine:
                     f"persist={stats.persist_seconds:.1f}s  "
                     f"| total={stats.duration_seconds:.1f}s"
                 )
+                # OOM-MONITOR: Log RSS so we can track memory in Render logs
+                try:
+                    import resource as _resource
+                    rss_bytes = _resource.getrusage(_resource.RUSAGE_SELF).ru_maxrss
+                    # macOS reports in bytes, Linux in KB
+                    import platform as _platform
+                    if _platform.system() == "Darwin":
+                        rss_mb = rss_bytes / (1024 * 1024)
+                    else:
+                        rss_mb = rss_bytes / 1024
+                    self.log.info(f"   📊 Memory RSS: {rss_mb:.0f} MB")
+                except Exception:
+                    pass
 
             except Exception as exc:  # noqa: BLE001
                 run_ended_at = utc_now_iso()
@@ -475,71 +478,69 @@ class ScalableEngine:
         compute_start = time.monotonic()
         compute_payloads: list[dict[str, Any]] = []
 
-        # BUG-10 fix: bulk-load all symbol candle data in 1 DB round-trip
-        self.log.debug(f"Bulk-loading candles for {len(symbols_to_compute)} symbols in 1 query ...")
-        all_bars = self.repo.get_combined_bars_for_symbols(
-            symbols_to_compute,
-            daily_lookback_days=self.cfg.daily_lookback_days,
-        )
-
         # RETRIEVE LAST PRICE MEMORY (for 5-min crossovers)
         prev_prices = self.repo.get_last_prices(symbols_to_compute)
 
-        futures = {}
-        for symbol in symbols_to_compute:
-            # Pop to free memory from the dictionary as we submit to the thread pool
-            df_symbol = all_bars.pop(symbol, None)
-            if df_symbol is None:
-                df_symbol = pd.DataFrame()  # BUG-IMPORT-04 fix: use module-level pd import
-
-            # Get prev_price tuple: (price, ts)
-            prev_data = prev_prices.get(symbol)
-            prev_p = prev_data[0] if prev_data else None
-
-            fut = self.executor.submit(
-                compute_symbol_signal,
-                symbol,
-                df_symbol,
-                self.cfg.exchange_tz,
-                prev_price=prev_p,
-            )
-            futures[fut] = symbol
-
-
-
+        # OOM-FIX: Chunked compute loop — load & compute 50 symbols at a time
+        # instead of bulk-loading all 500 symbols into memory simultaneously.
+        # Each chunk loads ~50×250 rows (~6 MB), computes, then releases before
+        # loading the next chunk. This caps peak memory at ~6 MB per engine
+        # instead of the previous ~60-80 MB per engine (×3 = ~200+ MB).
+        COMPUTE_CHUNK = 50
         compute_errors = 0
         computed_count = 0
         total_to_compute = len(symbols_to_compute)
-        
-        for fut in as_completed(futures):
-            computed_count += 1
-            symbol = futures[fut]
-            try:
-                compute_payloads.append(fut.result())
-            except Exception as exc:  # noqa: BLE001
-                compute_errors += 1
-                compute_payloads.append(
-                    {
-                        "symbol": symbol,
-                        "asof_ts": None,
-                        "last_price": None,
-                        "signal": None,
-                        "signal_price": None,
-                        "signal_reason": f"compute_error:{exc}",
-                    }
-                )
-                
-            # Broadcast live compute progress every 25 symbols (was 10)
-            # Fewer DB writes per cycle: 500 symbols → 20 writes instead of 50
-            if computed_count % 25 == 0 or computed_count == total_to_compute:
-                self.repo.set_engine_heartbeat(
-                    (self.repo.get_engine_heartbeat() or {}) | {
-                        "state": "computing",
-                        "compute_progress": f"{computed_count} / {total_to_compute}",
-                        "compute_count": computed_count,
-                        "compute_total": total_to_compute
-                    }
-                )
+
+        for chunk_start in range(0, total_to_compute, COMPUTE_CHUNK):
+            chunk_syms = symbols_to_compute[chunk_start : chunk_start + COMPUTE_CHUNK]
+
+            # Load candles for this chunk only
+            chunk_bars = self.repo.get_combined_bars_for_symbols(
+                chunk_syms,
+                daily_lookback_days=self.cfg.daily_lookback_days,
+            )
+
+            for symbol in chunk_syms:
+                df_symbol = chunk_bars.pop(symbol, None)
+                if df_symbol is None:
+                    df_symbol = pd.DataFrame()
+
+                prev_data = prev_prices.get(symbol)
+                prev_p = prev_data[0] if prev_data else None
+
+                try:
+                    result = compute_symbol_signal(
+                        symbol, df_symbol, self.cfg.exchange_tz, prev_price=prev_p,
+                    )
+                    compute_payloads.append(result)
+                except Exception as exc:  # noqa: BLE001
+                    compute_errors += 1
+                    compute_payloads.append(
+                        {
+                            "symbol": symbol,
+                            "asof_ts": None,
+                            "last_price": None,
+                            "signal": None,
+                            "signal_price": None,
+                            "signal_reason": f"compute_error:{exc}",
+                        }
+                    )
+
+                computed_count += 1
+                # Broadcast live compute progress every 25 symbols
+                if computed_count % 25 == 0 or computed_count == total_to_compute:
+                    self.repo.set_engine_heartbeat(
+                        (self.repo.get_engine_heartbeat() or {}) | {
+                            "state": "computing",
+                            "compute_progress": f"{computed_count} / {total_to_compute}",
+                            "compute_count": computed_count,
+                            "compute_total": total_to_compute
+                        }
+                    )
+
+            # Release chunk memory before loading next chunk
+            del chunk_bars
+            gc.collect()
 
         compute_seconds = time.monotonic() - compute_start
 

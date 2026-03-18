@@ -235,7 +235,7 @@ class TradingRepository:
             if db_url not in cls._pools:  # double-checked locking
                 cls._pools[db_url] = ThreadedConnectionPool(
                     minconn=1,
-                    maxconn=50,  # Increased for multi-strategy threads + dashboard sessions
+                    maxconn=8,  # 3 engine threads + keepalives + dashboard = ~6 peak
                     dsn=db_url,
                     cursor_factory=RealDictCursor,
                     keepalives=1,
@@ -763,6 +763,11 @@ class TradingRepository:
                 # Sort and drop any exact duplicates just in case
                 combined = df_d.sort_index()
                 combined = combined[~combined.index.duplicated(keep="last")]
+                # OOM-FIX: downcast to float32 — halves memory with no
+                # meaningful precision loss for stock prices.
+                for _col in ("open", "high", "low", "close", "volume"):
+                    if _col in combined.columns:
+                        combined[_col] = combined[_col].astype("float32")
                 result[sym] = combined
 
         # Symbols with no data at all

@@ -26,11 +26,9 @@ class AppConfig:
     # all 3 engines don't burst Yahoo Finance simultaneously from the same IP.
     fetch_start_delay_seconds: int = 0
     # Daily-bar lookback: how many calendar days of 1d bars to fetch & store.
-    # Used for long-horizon weekly fractal computation without loading 5m bars.
-    # 365d ≈ 52 weekly bars — matches reference backtest which fetches from 2023
-    # onwards; enough to always find both upper and lower fractal pivots even in
-    # strongly trending markets where one fractal type is rare over short windows.
-    daily_lookback_days: int = 365
+    # 180d ≈ 36 weekly bars — sufficient for fractal bands (5 bars) + CMO (period=11).
+    # Reduced from 365 to cut peak memory by ~50% on Render's 512 MB tier.
+    daily_lookback_days: int = 180
 
 
 

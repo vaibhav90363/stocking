@@ -506,7 +506,7 @@ def run_dashboard(strategy_name_or_path=None):
                     batch = all_syms[idx : idx + batch_size]
                     status.update(label=f"Scanning {idx + len(batch)} / {len(all_syms)} symbols...")
                     
-                    daily_dict = repo.get_combined_bars_for_symbols(batch, daily_lookback_days=365)
+                    daily_dict = repo.get_combined_bars_for_symbols(batch, daily_lookback_days=cfg.daily_lookback_days)
                     
                     for sym in batch:
                         df = daily_dict.get(sym)
@@ -761,7 +761,7 @@ def run_dashboard(strategy_name_or_path=None):
                                     st.plotly_chart(fig, use_container_width=True)
 
                                     # ── Raw data table ────────────────────────────────────────
-                                    st.markdown("### 🧮 Raw Indicator Data (Full Year)")
+                                    st.markdown(f"### 🧮 Raw Indicator Data ({cfg.daily_lookback_days}d)")
                                     display_df = aligned.copy()
                                     display_df.index = pd.to_datetime(display_df.index)
                                     display_df = display_df.sort_index(ascending=False)
@@ -780,7 +780,7 @@ def run_dashboard(strategy_name_or_path=None):
 
                                     # ── Weekly data table ─────────────────────────────────────
                                     if not weekly_df.empty:
-                                        st.markdown("### 📆 Weekly Bar Data (Full Year)")
+                                        st.markdown(f"### 📆 Weekly Bar Data ({cfg.daily_lookback_days}d)")
                                         wk_display = weekly_df[["open", "high", "low", "close",
                                                                   "upper_fractal_point", "lower_fractal_point",
                                                                   "upper_band_line", "lower_band_line"]].copy()
@@ -939,7 +939,8 @@ def run_dashboard(strategy_name_or_path=None):
         strategy_params = {
             "Exchange Timezone": cfg.exchange_tz,
             "Ticker Suffix": cfg.ticker_suffix,
-            "Fetch Lookback": f"{cfg.fetch_lookback_days} days (5m bars)",
+            "Fetch Lookback": f"{cfg.fetch_lookback_days} days (1D polling)",
+            "Daily Lookback": f"{cfg.daily_lookback_days} days (candle history)",
             "Compute Lookback": f"{cfg.compute_lookback_days} days (daily warmup)",
             "Fractal Left Window": "2 bars",
             "Fractal Right Window": "2 bars",

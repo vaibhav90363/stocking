@@ -45,6 +45,12 @@ def _normalize_ohlcv(data: pd.DataFrame) -> pd.DataFrame:
         data[col] = pd.to_numeric(data[col], errors="coerce")
 
     data = data.dropna(subset=["open", "high", "low", "close"])
+
+    # OOM-FIX: downcast to float32 — halves memory vs float64 default
+    for col in ["open", "high", "low", "close", "volume"]:
+        if col in data.columns:
+            data[col] = data[col].astype("float32")
+
     return data
 
 
