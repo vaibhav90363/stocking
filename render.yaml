@@ -14,6 +14,24 @@ services:
         sync: false
       - key: PYTHONUNBUFFERED
         value: "true"
+      # ── glibc allocator tuning (OOM-FIX-v5) ─────────────────────────
+      # Root cause: glibc ptmalloc2 creates per-thread arenas that
+      # fragment internally. malloc_trim(0) can only free the topmost
+      # chunk, leaving fragmented holes unreclaimable. With 3 engine
+      # threads + helpers, RSS grows monotonically until OOM kill.
+      #
+      # MALLOC_ARENA_MAX=2      — cap arenas to 2 (from 8×cores default)
+      # MALLOC_MMAP_THRESHOLD_  — allocs ≥64 KB use mmap (instantly reclaimable)
+      # MALLOC_TRIM_PAD_        — don't keep padding when trimming
+      # MALLOC_MMAP_MAX_        — allow plenty of concurrent mmap regions
+      - key: MALLOC_ARENA_MAX
+        value: "2"
+      - key: MALLOC_MMAP_THRESHOLD_
+        value: "65536"
+      - key: MALLOC_TRIM_PAD_
+        value: "0"
+      - key: MALLOC_MMAP_MAX_
+        value: "65536"
       # Render injects these automatically — listed here so they propagate
       # through subprocess.Popen env copies into child engine processes.
       - key: RENDER_EXTERNAL_URL

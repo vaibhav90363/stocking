@@ -105,6 +105,11 @@ class ScalableEngine:
         self.log.info(f"  Suffix      : {cfg.ticker_suffix}")
         self.log.info(f"  Cycle       : {cfg.cycle_seconds}s")
         self.log.info(f"  Concurrency : fetch={cfg.max_fetch_concurrency}  compute={cfg.compute_workers}")
+        # OOM-FIX-v5: Log glibc allocator settings so we can verify they took
+        # effect on Render.  MALLOC_ARENA_MAX=2 is the critical fragmentation fix.
+        _arena = os.environ.get('MALLOC_ARENA_MAX', '(not set)')
+        _mmap_thresh = os.environ.get('MALLOC_MMAP_THRESHOLD_', '(not set)')
+        self.log.info(f"  Malloc      : ARENA_MAX={_arena}  MMAP_THRESHOLD={_mmap_thresh}")
         self.log.info("═" * 60)
 
         # ── Startup guard: fail-fast if DATABASE_URL is missing ─────────────
@@ -336,7 +341,7 @@ class ScalableEngine:
                     # Previous: warn=450 / exit=480. 3 engines × ~160 MB each
                     # easily exceeds 480 MB; tighter thresholds add safety margin.
                     RSS_WARN_MB = 420
-                    RSS_EXIT_MB = 460
+                    RSS_EXIT_MB = 450
                     if rss_mb >= RSS_EXIT_MB:
                         self.log.warning(
                             f"   🚨 RSS {rss_mb:.0f} MB ≥ {RSS_EXIT_MB} MB limit! "
