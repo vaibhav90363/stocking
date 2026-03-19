@@ -196,7 +196,7 @@ m5.metric("Total P&L",       f"{total_realized + total_unreal:,.2f}",
 st.divider()
 
 # ── Main tabs ─────────────────────────────────────────────────────────────────
-tab_strategies, tab_health = st.tabs(["📊 Strategies", "🩺 System Health"])
+tab_strategies, tab_health, tab_reset = st.tabs(["📊 Strategies", "🩺 System Health", "🧹 Reset Data"])
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -736,6 +736,135 @@ You'll receive an email if the Render engine process goes down.
 RENDER_HEALTH_URL = "{_render_svc}"
 ```
 """)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# TAB 3 — RESET DATA
+# ═══════════════════════════════════════════════════════════════════════════════
+with tab_reset:
+    st.markdown("## 🧹 Reset Trading Data")
+    st.caption(
+        "Wipe positions, trades, signals, PnL snapshots, metrics, and logs. "
+        "**Universe** (symbol list), **engine state**, and **candle data** are preserved."
+    )
+
+    st.divider()
+
+    # ── Row counts before reset ────────────────────────────────────────────────
+    st.markdown("### 📊 Current Data Volumes")
+    try:
+        from stocking_app.db import TradingRepository as _TRR
+        from stocking_app.config import load_config as _LCR
+        _cfg_r = _LCR()
+        _repo_r = _TRR(_cfg_r.database_url or _cfg_r.db_path)
+
+        _reset_tables = [
+            "positions_ledger", "trade_activity_log", "signals",
+            "pnl_snapshots", "symbol_state", "run_metrics", "system_logs",
+        ]
+        _row_counts: dict[str, int] = {}
+        for _rt in _reset_tables:
+            try:
+                _rc_df = _repo_r.read_df(f"SELECT COUNT(*) AS n FROM {_rt}")
+                _row_counts[_rt] = int(_rc_df["n"].iloc[0]) if not _rc_df.empty else 0
+            except Exception:
+                _row_counts[_rt] = 0
+        _repo_r.close()
+
+        _rc_cols = st.columns(len(_reset_tables))
+        for _col, (_tbl, _cnt) in zip(_rc_cols, _row_counts.items()):
+            _tbl_short = _tbl.replace("_", " ").title()
+            _col.metric(_tbl_short, f"{_cnt:,}")
+
+        _total_rows = sum(v for v in _row_counts.values() if isinstance(v, int))
+    except Exception as _re:
+        st.error(f"Could not read table counts: {_re}")
+        _total_rows = 0
+
+    st.divider()
+
+    # ── Per-strategy reset ─────────────────────────────────────────────────────
+    st.markdown("### 🎯 Reset Single Strategy")
+    st.caption("Only deletes data for the selected strategy's suffix.")
+
+    _strat_options = {f"{sc.name} ({sc.suffix})": sc.suffix for sc in strategies}
+    _selected_label = st.selectbox(
+        "Select strategy to reset",
+        options=list(_strat_options.keys()),
+        key="reset_single_strategy_select",
+    )
+    _selected_suffix = _strat_options[_selected_label] if _selected_label else None
+
+    _confirm_single = st.checkbox(
+        f"I understand this will **permanently delete** all trading data for `{_selected_suffix}`",
+        key="reset_single_confirm",
+    )
+
+    if st.button(
+        f"🗑 Reset {_selected_label}",
+        key="reset_single_btn",
+        type="primary",
+        disabled=not _confirm_single,
+        use_container_width=True,
+    ):
+        try:
+            _cfg_rs = _LCR()
+            _repo_rs = _TRR(_cfg_rs.database_url or _cfg_rs.db_path, suffix=_selected_suffix)
+            deleted = _repo_rs.reset_trading_data(suffix_filter=_selected_suffix)
+            _repo_rs.close()
+
+            total_del = sum(deleted.values())
+            st.success(f"✅ Reset complete for `{_selected_suffix}` — **{total_del:,}** rows deleted.")
+            with st.expander("Details"):
+                for tbl, cnt in deleted.items():
+                    st.write(f"  `{tbl}`: {cnt:,} rows deleted")
+            time.sleep(1)
+            st.rerun()
+        except Exception as _rse:
+            st.error(f"Reset failed: {_rse}")
+
+    st.divider()
+
+    # ── Full reset (all strategies) ────────────────────────────────────────────
+    st.markdown("### ☢️ Reset ALL Strategies")
+    st.warning(
+        "**This will permanently delete ALL trading data across ALL strategies.** "
+        "Positions, trades, signals, PnL, metrics, and logs will be wiped. "
+        "Make sure all engines are **stopped** before proceeding.",
+        icon="⚠️",
+    )
+
+    _confirm_all_1 = st.checkbox(
+        "I confirm I want to delete **all** trading data for **every** strategy",
+        key="reset_all_confirm_1",
+    )
+    _confirm_all_2 = st.checkbox(
+        f"I understand this will remove **{_total_rows:,}** rows and cannot be undone",
+        key="reset_all_confirm_2",
+    )
+
+    if st.button(
+        "☢️ RESET EVERYTHING",
+        key="reset_all_btn",
+        type="primary",
+        disabled=not (_confirm_all_1 and _confirm_all_2),
+        use_container_width=True,
+    ):
+        try:
+            _cfg_ra = _LCR()
+            _repo_ra = _TRR(_cfg_ra.database_url or _cfg_ra.db_path)
+            deleted = _repo_ra.reset_trading_data(suffix_filter=None)
+            _repo_ra.close()
+
+            total_del = sum(deleted.values())
+            st.success(f"✅ Full reset complete — **{total_del:,}** rows deleted across all strategies.")
+            with st.expander("Details"):
+                for tbl, cnt in deleted.items():
+                    st.write(f"  `{tbl}`: {cnt:,} rows deleted")
+            time.sleep(1)
+            st.rerun()
+        except Exception as _rae:
+            st.error(f"Reset failed: {_rae}")
 
 
 # ── Auto-refresh ──────────────────────────────────────────────────────────────

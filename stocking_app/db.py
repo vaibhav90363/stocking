@@ -1032,3 +1032,51 @@ class TradingRepository:
             "SELECT ts, level, message FROM system_logs WHERE suffix = %s ORDER BY id DESC LIMIT %s",
             (self.suffix, limit)
         )
+
+    @retry_on_disconnect()
+    def reset_trading_data(self, suffix_filter: str | None = None) -> dict[str, int]:
+        """Delete all trading data (positions, trades, signals, PnL, metrics, logs).
+
+        Preserves: universe (symbol list), engine_state (enabled/disabled), candles_1d (market data).
+        If suffix_filter is provided, only delete rows matching that suffix.
+        If None, delete ALL rows (full wipe across all strategies).
+
+        Returns dict of {table_name: rows_deleted}.
+        """
+        results: dict[str, int] = {}
+
+        # Tables where rows can be filtered by suffix pattern (symbol LIKE '%suffix')
+        suffix_tables = {
+            "positions_ledger": "symbol",
+            "signals":          "symbol",
+            "trade_activity_log": "symbol",
+        }
+        # Tables with an explicit suffix column
+        suffix_col_tables = {
+            "pnl_snapshots": "suffix",
+            "run_metrics":   "suffix",
+            "system_logs":   "suffix",
+        }
+        # Tables filtered by symbol pattern (symbol LIKE '%suffix')
+        symbol_tables = {
+            "symbol_state": "symbol",
+        }
+
+        with self.conn.cursor() as cur:
+            # 1) Suffix-filterable tables (via symbol LIKE pattern)
+            for table, col in {**suffix_tables, **symbol_tables}.items():
+                if suffix_filter:
+                    cur.execute(f"DELETE FROM {table} WHERE {col} LIKE %s", (f"%{suffix_filter}",))
+                else:
+                    cur.execute(f"DELETE FROM {table}")
+                results[table] = cur.rowcount
+
+            # 2) Tables with explicit suffix column
+            for table, col in suffix_col_tables.items():
+                if suffix_filter:
+                    cur.execute(f"DELETE FROM {table} WHERE {col} = %s", (suffix_filter,))
+                else:
+                    cur.execute(f"DELETE FROM {table}")
+                results[table] = cur.rowcount
+
+        return results
