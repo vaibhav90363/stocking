@@ -95,6 +95,9 @@ def compute_all_indicators(daily: pd.DataFrame, exchange_tz: str) -> pd.DataFram
         direction="backward",
     )
 
+    # OOM-FIX-v2: Release intermediate DataFrames immediately
+    del weekly, weekly_aliased
+
     return aligned
 
 def _compute_latest_signal(aligned: pd.DataFrame, prev_price_override: float | None = None) -> tuple[str | None, float | None, str]:

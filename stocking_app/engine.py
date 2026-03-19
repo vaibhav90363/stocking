@@ -153,6 +153,26 @@ class ScalableEngine:
         self._bootstrap_done = False
         self.DEAD_SYMBOL_THRESHOLD = 5
 
+    @staticmethod
+    def _get_current_rss_mb() -> float:
+        """Return current RSS in MB. Uses /proc/self/status on Linux for
+        actual current RSS (not peak). Falls back to resource module."""
+        try:
+            with open('/proc/self/status', 'r') as f:
+                for line in f:
+                    if line.startswith('VmRSS:'):
+                        # Value is in kB
+                        return int(line.split()[1]) / 1024
+        except (FileNotFoundError, OSError):
+            pass
+        # Fallback (macOS / other): use resource module (reports peak on macOS)
+        import resource as _resource
+        import platform as _platform
+        rss_bytes = _resource.getrusage(_resource.RUSAGE_SELF).ru_maxrss
+        if _platform.system() == "Darwin":
+            return rss_bytes / (1024 * 1024)
+        return rss_bytes / 1024
+
     def stop(self) -> None:
         self._running = False
 
@@ -284,17 +304,30 @@ class ScalableEngine:
                     f"persist={stats.persist_seconds:.1f}s  "
                     f"| total={stats.duration_seconds:.1f}s"
                 )
-                # OOM-MONITOR: Log RSS so we can track memory in Render logs
+                # OOM-MONITOR-v2: Log CURRENT RSS (not peak) so we can track
+                # actual memory usage across cycles. On Linux (Render), read
+                # /proc/self/status → VmRSS for the real current value.
+                # resource.ru_maxrss only reports the high-water mark.
                 try:
-                    import resource as _resource
-                    rss_bytes = _resource.getrusage(_resource.RUSAGE_SELF).ru_maxrss
-                    # macOS reports in bytes, Linux in KB
-                    import platform as _platform
-                    if _platform.system() == "Darwin":
-                        rss_mb = rss_bytes / (1024 * 1024)
-                    else:
-                        rss_mb = rss_bytes / 1024
+                    rss_mb = self._get_current_rss_mb()
                     self.log.info(f"   📊 Memory RSS: {rss_mb:.0f} MB")
+
+                    # OOM-FIX-v2: Memory cap safety valve
+                    RSS_WARN_MB = 450
+                    RSS_EXIT_MB = 480
+                    if rss_mb >= RSS_EXIT_MB:
+                        self.log.warning(
+                            f"   🚨 RSS {rss_mb:.0f} MB ≥ {RSS_EXIT_MB} MB limit! "
+                            f"Exiting cleanly to avoid OOM kill. Render will restart."
+                        )
+                        self.close()
+                        os._exit(0)  # clean exit, Render auto-restarts
+                    elif rss_mb >= RSS_WARN_MB:
+                        self.log.warning(
+                            f"   ⚠ Memory approaching limit: {rss_mb:.0f} MB / 500 MB. "
+                            f"Forcing aggressive GC."
+                        )
+                        gc.collect()
                 except Exception:
                     pass
 
@@ -479,6 +512,19 @@ class ScalableEngine:
         if fetch_mode == "bootstrap" and fetched_symbols:
             self._bootstrap_done = True
             self.log.info(f"       ✓ Bootstrap complete — switching to incremental fetches")
+
+        # OOM-FIX-v2: Purge yfinance's module-level caches that grow unboundedly.
+        # yf.download() stores parsed DataFrames in yf.shared._DFS and errors in
+        # yf.shared._ERRORS — with 500 symbols these add ~10-15 MB per cycle.
+        try:
+            import yfinance as _yf
+            if hasattr(_yf, 'shared'):
+                if hasattr(_yf.shared, '_DFS'):
+                    _yf.shared._DFS.clear()
+                if hasattr(_yf.shared, '_ERRORS'):
+                    _yf.shared._ERRORS.clear()
+        except Exception:
+            pass
 
         # OOM-FIX: Explicitly free yfinance temporaries
         gc.collect()
@@ -701,13 +747,21 @@ class ScalableEngine:
             - datetime.fromisoformat(run_started_at).timestamp()
         )
 
+        # OOM-FIX-v2: Capture counts before deleting payloads
+        n_computed = len(compute_payloads)
+
+        # OOM-FIX-v2: Release large per-cycle allocations immediately
+        del compute_payloads, payload_data, position_prices
+        del open_positions, buys, sells, actions_taken
+        gc.collect()
+
         return CycleStats(
             run_started_at=run_started_at,
             run_ended_at=run_ended_at,
             status="OK",
             symbols_total=total,
             symbols_fetched=len(fetched_symbols),
-            symbols_computed=len(compute_payloads),
+            symbols_computed=n_computed,
             fetch_seconds=fetch_seconds,
             compute_seconds=compute_seconds,
             persist_seconds=persist_seconds,

@@ -770,6 +770,9 @@ class TradingRepository:
                         combined[_col] = combined[_col].astype("float32")
                 result[sym] = combined
 
+            # OOM-FIX-v2: Release intermediate row dicts before next chunk
+            del daily_by_sym
+
         # Symbols with no data at all
         for sym in symbols:
             if sym not in result:

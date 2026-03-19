@@ -115,12 +115,16 @@ def _fetch_daily_batch_blocking(
 
                     df = df.dropna(how="all")
                     bars = _normalize_ohlcv(df)
+                    del df  # OOM-FIX-v2: free per-symbol copy immediately
                     if bars.empty:
                         results.append(FetchResult(symbol=engine_sym, bars=bars, error="No daily candles returned"))
                     else:
                         results.append(FetchResult(symbol=engine_sym, bars=bars, error=None))
                 except Exception as e:
                     results.append(FetchResult(symbol=engine_sym, bars=pd.DataFrame(), error=f"Parse error: {e}"))
+
+            # OOM-FIX-v2: Release bulk download DataFrame before returning
+            del data
             return results
 
         except Exception as exc:
