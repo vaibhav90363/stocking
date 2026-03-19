@@ -106,7 +106,10 @@ def _fetch_daily_batch_blocking(
                 try:
                     if is_multi:
                         if y_sym in data.columns.get_level_values("Ticker"):
-                            df = data.xs(y_sym, level="Ticker", axis=1).copy()
+                            # OOM-FIX-v3: plain xs() returns a view where possible;
+                            # _normalize_ohlcv filters to only OHLCV columns and
+                            # calls .astype() which creates a fresh array anyway.
+                            df = data.xs(y_sym, level="Ticker", axis=1)
                         else:
                             results.append(FetchResult(symbol=engine_sym, bars=pd.DataFrame(), error="Not found in Yahoo batch"))
                             continue

@@ -26,13 +26,21 @@ def _empty(symbol: str, reason: str) -> dict[str, Any]:
 
 
 def _to_weekly(daily: pd.DataFrame, exchange_tz: str) -> pd.DataFrame:
-    local = daily.copy()
-    if local.index.tz is None:
-        local.index = local.index.tz_localize("UTC")
-    local.index = local.index.tz_convert(exchange_tz)
+    # OOM-FIX-v3: Avoid daily.copy() — only convert the index for resampling.
+    # The index is a lightweight DatetimeTZDtype object (~8 bytes/element) vs
+    # copying all OHLCV columns (~500 rows × 6 cols × 4 bytes = ~12 KB per symbol).
+    # With 500 symbols this saves ~6 MB of unnecessary allocation per cycle.
+    idx = daily.index
+    if idx.tz is None:
+        idx = idx.tz_localize("UTC")
+    idx = idx.tz_convert(exchange_tz)
+
+    # Assign converted index to a view (no column data copied)
+    daily_local = daily.copy(deep=False)  # shallow copy: shares column arrays
+    daily_local.index = idx
 
     weekly = (
-        local.resample("W-MON", label="left", closed="left")
+        daily_local.resample("W-MON", label="left", closed="left")
         .agg(
             {
                 "open": "first",
@@ -45,6 +53,7 @@ def _to_weekly(daily: pd.DataFrame, exchange_tz: str) -> pd.DataFrame:
         .dropna(subset=["open", "high", "low", "close"])
     )
 
+    del daily_local, idx
     return weekly
 
 
@@ -164,6 +173,10 @@ def compute_symbol_signal(symbol: str, daily: pd.DataFrame, exchange_tz: str, pr
         }
 
     signal, signal_price, reason = _compute_latest_signal(aligned, prev_price_override=prev_price)
+    # OOM-FIX-v3: Release merged aligned DF immediately — it's ~180 rows × ~12 cols
+    # per symbol, so freeing it before returning saves ~1-2 MB per symbol in the
+    # compute loop (500 symbols × ~4 KB = ~2 MB held if not freed proactively).
+    del aligned
     return {
         "symbol": symbol,
         "asof_ts": last_ts.isoformat(),

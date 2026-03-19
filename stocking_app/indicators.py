@@ -15,8 +15,12 @@ def fractal_chaos_bands(data: pd.DataFrame, left_window: int = 2, right_window: 
 
     Only positions in range [left_window, n - right_window) are candidates,
     ensuring both the left and right comparison windows are fully available.
+
+    OOM-FIX-v3: Operate in-place on the input DataFrame instead of copying it.
+    The caller (compute_all_indicators) always passes a freshly-created weekly DF
+    so in-place mutation is safe and avoids a ~10-20 KB copy per symbol × 500 syms.
     """
-    df = data.copy()
+    df = data  # in-place — no copy needed; caller owns this DF
     n = len(df)
 
     df["upper_fractal_point"] = np.nan

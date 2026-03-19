@@ -784,6 +784,24 @@ class TradingRepository:
     # BUG-INCOMPLETE-03 fix: removed truncated get_all_candles_for_symbols() method.
     # It had no return statement and silently returned None. Use get_combined_bars_for_symbols() instead.
 
+    @retry_on_disconnect()
+    def prune_old_candles(self, max_age_days: int = 210) -> int:
+        """Delete candles_1d rows older than max_age_days.
+
+        OOM-FIX-v4: candles_1d accumulates rows forever. For 500 symbols × 365+
+        days, that's ~180K+ rows the DB query has to scan and Python has to page
+        through. Pruning keeps the table lean and reduces both DB I/O and memory.
+        Called once per cycle after persist — typically max_age_days = lookback + 30.
+        """
+        from datetime import timedelta
+        cutoff = (datetime.now(timezone.utc) - timedelta(days=max_age_days)).replace(
+            hour=0, minute=0, second=0, microsecond=0
+        ).strftime("%Y-%m-%dT00:00:00+00:00")
+        with self.conn.cursor() as cur:
+            cur.execute("DELETE FROM candles_1d WHERE ts < %s", (cutoff,))
+            deleted = cur.rowcount
+        return deleted
+
 
     @retry_on_disconnect()
     def upsert_signal(self, signal: SignalRecord, acted: bool = False) -> None:

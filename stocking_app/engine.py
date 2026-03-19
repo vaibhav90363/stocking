@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import ctypes
 import gc
 import logging
 import logging.handlers
@@ -173,6 +174,24 @@ class ScalableEngine:
             return rss_bytes / (1024 * 1024)
         return rss_bytes / 1024
 
+    @staticmethod
+    def _release_memory() -> None:
+        """Force the OS to reclaim freed heap pages.
+
+        OOM-FIX-v4: gc.collect() frees Python objects but glibc keeps the
+        freed memory mapped (heap fragmentation). malloc_trim(0) tells glibc
+        to release ALL unused heap pages back to the OS. This is the key fix
+        that makes RSS *decrease* after a cycle instead of only growing.
+
+        On macOS (dev), malloc_trim doesn't exist — we just gc.collect().
+        """
+        gc.collect()
+        try:
+            libc = ctypes.CDLL("libc.so.6")
+            libc.malloc_trim(0)
+        except (OSError, AttributeError):
+            pass  # macOS / non-glibc — gc.collect() alone is fine for dev
+
     def stop(self) -> None:
         self._running = False
 
@@ -312,9 +331,12 @@ class ScalableEngine:
                     rss_mb = self._get_current_rss_mb()
                     self.log.info(f"   📊 Memory RSS: {rss_mb:.0f} MB")
 
-                    # OOM-FIX-v2: Memory cap safety valve
-                    RSS_WARN_MB = 450
-                    RSS_EXIT_MB = 480
+                    # OOM-FIX-v3: Lower thresholds — triggers GC and clean-exit
+                    # earlier to stay well below Render's 512 MB hard limit.
+                    # Previous: warn=450 / exit=480. 3 engines × ~160 MB each
+                    # easily exceeds 480 MB; tighter thresholds add safety margin.
+                    RSS_WARN_MB = 420
+                    RSS_EXIT_MB = 460
                     if rss_mb >= RSS_EXIT_MB:
                         self.log.warning(
                             f"   🚨 RSS {rss_mb:.0f} MB ≥ {RSS_EXIT_MB} MB limit! "
@@ -325,9 +347,11 @@ class ScalableEngine:
                     elif rss_mb >= RSS_WARN_MB:
                         self.log.warning(
                             f"   ⚠ Memory approaching limit: {rss_mb:.0f} MB / 500 MB. "
-                            f"Forcing aggressive GC."
+                            f"Forcing aggressive GC + malloc_trim."
                         )
-                        gc.collect()
+                        self._release_memory()
+                        rss_after = self._get_current_rss_mb()
+                        self.log.info(f"   📊 After malloc_trim: {rss_after:.0f} MB (freed {rss_mb - rss_after:.0f} MB)")
                 except Exception:
                     pass
 
@@ -513,21 +537,27 @@ class ScalableEngine:
             self._bootstrap_done = True
             self.log.info(f"       ✓ Bootstrap complete — switching to incremental fetches")
 
-        # OOM-FIX-v2: Purge yfinance's module-level caches that grow unboundedly.
-        # yf.download() stores parsed DataFrames in yf.shared._DFS and errors in
-        # yf.shared._ERRORS — with 500 symbols these add ~10-15 MB per cycle.
+        # OOM-FIX-v4: Purge ALL yfinance module-level caches.
+        # yf.download() stores DataFrames in _DFS, errors in _ERRORS, and
+        # may also cache Ticker objects. With 500 symbols per engine × 3
+        # engines, these grow ~15-20 MB per cycle if not cleared.
         try:
             import yfinance as _yf
             if hasattr(_yf, 'shared'):
-                if hasattr(_yf.shared, '_DFS'):
-                    _yf.shared._DFS.clear()
-                if hasattr(_yf.shared, '_ERRORS'):
-                    _yf.shared._ERRORS.clear()
+                for _attr in ('_DFS', '_ERRORS', '_TRACEBACKS'):
+                    cache = getattr(_yf.shared, _attr, None)
+                    if cache is not None and hasattr(cache, 'clear'):
+                        cache.clear()
+            # Some yfinance versions cache Ticker objects
+            if hasattr(_yf, 'cache') and hasattr(_yf.cache, 'clear'):
+                _yf.cache.clear()
+            if hasattr(_yf.utils, '_CACHE'):
+                _yf.utils._CACHE.clear()
         except Exception:
             pass
 
-        # OOM-FIX: Explicitly free yfinance temporaries
-        gc.collect()
+        # OOM-FIX-v4: Release freed pages back to OS
+        self._release_memory()
 
         fetch_seconds = time.monotonic() - fetch_start
 
@@ -554,7 +584,13 @@ class ScalableEngine:
             + (f"  | {len(failed_symbols)} failed: {', '.join(failed_sample)}" if failed_symbols else "")
         )
 
+        # OOM-FIX-v4: Save count before freeing, then release fetch-phase data.
+        n_fetched = len(fetched_symbols)
+        del failed_symbols
+
         symbols_to_compute = self.repo.get_symbols_pending_compute(fetched_symbols)
+        del fetched_symbols  # no longer needed — symbols_to_compute is the working set
+        self._release_memory()
         self.log.info(f"  [2/3] COMPUTE — {len(symbols_to_compute)} symbols pending")
         
         self.repo.set_engine_heartbeat(
@@ -631,9 +667,12 @@ class ScalableEngine:
 
             # Release chunk memory before loading next chunk
             del chunk_bars
-            gc.collect()
+            self._release_memory()
 
         compute_seconds = time.monotonic() - compute_start
+
+        # OOM-FIX-v3: Release prev_prices dict — no longer needed after compute loop
+        del prev_prices
 
         # Count actual signals
         buys  = [p for p in compute_payloads if p.get("signal") == "BUY"]
@@ -750,17 +789,25 @@ class ScalableEngine:
         # OOM-FIX-v2: Capture counts before deleting payloads
         n_computed = len(compute_payloads)
 
-        # OOM-FIX-v2: Release large per-cycle allocations immediately
+        # OOM-FIX-v4: Release large per-cycle allocations + return heap to OS
         del compute_payloads, payload_data, position_prices
         del open_positions, buys, sells, actions_taken
-        gc.collect()
+        self._release_memory()
+
+        # OOM-FIX-v4: Prune candles older than lookback window + 30d buffer.
+        # candles_1d accumulates rows forever; pruning keeps the table lean
+        # and prevents the DB query payload from growing cycle over cycle.
+        try:
+            self.repo.prune_old_candles(self.cfg.daily_lookback_days + 30)
+        except Exception:
+            pass  # non-critical — don't let prune failure crash the cycle
 
         return CycleStats(
             run_started_at=run_started_at,
             run_ended_at=run_ended_at,
             status="OK",
             symbols_total=total,
-            symbols_fetched=len(fetched_symbols),
+            symbols_fetched=n_fetched,
             symbols_computed=n_computed,
             fetch_seconds=fetch_seconds,
             compute_seconds=compute_seconds,
