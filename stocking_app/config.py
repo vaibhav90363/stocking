@@ -28,7 +28,7 @@ class AppConfig:
     # Daily-bar lookback: how many calendar days of 1d bars to fetch & store.
     # 180d ≈ 36 weekly bars — sufficient for fractal bands (5 bars) + CMO (period=11).
     # Reduced from 365 to cut peak memory by ~50% on Render's 512 MB tier.
-    daily_lookback_days: int = 180
+    daily_lookback_days: int = 120
 
 
 
@@ -76,5 +76,5 @@ def load_config() -> AppConfig:
         market_close=os.getenv("STOCKING_MARKET_CLOSE", def_close),
         auto_schedule=os.getenv("STOCKING_AUTO_SCHEDULE", "1") not in ("0", "false", "False"),
         fetch_start_delay_seconds=int(os.getenv("STOCKING_FETCH_START_DELAY", "0")),
-        daily_lookback_days=int(os.getenv("STOCKING_DAILY_LOOKBACK_DAYS", str(secrets_lookback or "180"))),
+        daily_lookback_days=int(os.getenv("STOCKING_DAILY_LOOKBACK_DAYS", str(secrets_lookback or "120"))),
     )

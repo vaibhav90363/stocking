@@ -340,8 +340,8 @@ class ScalableEngine:
                     # earlier to stay well below Render's 512 MB hard limit.
                     # Previous: warn=450 / exit=480. 3 engines × ~160 MB each
                     # easily exceeds 480 MB; tighter thresholds add safety margin.
-                    RSS_WARN_MB = 420
-                    RSS_EXIT_MB = 450
+                    RSS_WARN_MB = 450
+                    RSS_EXIT_MB = 480
                     if rss_mb >= RSS_EXIT_MB:
                         self.log.warning(
                             f"   🚨 RSS {rss_mb:.0f} MB ≥ {RSS_EXIT_MB} MB limit! "
@@ -615,10 +615,10 @@ class ScalableEngine:
 
         # OOM-FIX: Chunked compute loop — load & compute 50 symbols at a time
         # instead of bulk-loading all 500 symbols into memory simultaneously.
-        # Each chunk loads ~50×250 rows (~6 MB), computes, then releases before
-        # loading the next chunk. This caps peak memory at ~6 MB per engine
+        # Each chunk loads ~20×120 rows (~1.5 MB), computes, then releases before
+        # loading the next chunk. This caps peak memory at ~1.5 MB per engine
         # instead of the previous ~60-80 MB per engine (×3 = ~200+ MB).
-        COMPUTE_CHUNK = 50
+        COMPUTE_CHUNK = 20
         compute_errors = 0
         computed_count = 0
         total_to_compute = len(symbols_to_compute)

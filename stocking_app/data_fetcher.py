@@ -157,7 +157,7 @@ def fetch_daily_bars_gen(
     Daily bars are ~75× smaller than 5m bars so we use bigger batches (50 symbols)
     and higher concurrency — Yahoo is far more lenient with daily interval requests.
     """
-    BATCH_SIZE = 50  # 50 symbols per request is fine for daily interval
+    BATCH_SIZE = 25  # 25 symbols per request is fine for daily interval
 
     batches = [symbols[i : i + BATCH_SIZE] for i in range(0, len(symbols), BATCH_SIZE)]
     # BUG-FIX: yfinance internal threading (threads=True) is NOT thread-safe across
