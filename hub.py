@@ -442,8 +442,8 @@ with tab_strategies:
                             except Exception:
                                 return ""
                         st.dataframe(
-                            trades_df.style.applymap(_side_color, subset=["side"])
-                                           .applymap(_pnl_clr,    subset=["pnl"]),
+                            trades_df.style.map(_side_color, subset=["side"])
+                                           .map(_pnl_clr,    subset=["pnl"]),
                             use_container_width=True, hide_index=True,
                         )
 
@@ -496,8 +496,8 @@ with tab_strategies:
 
     st.dataframe(
         cmp_df.style
-            .applymap(_state_color, subset=["State"])
-            .applymap(_pnl_color,   subset=["Realized P&L", "Unrealized", "Total P&L"]),
+            .map(_state_color, subset=["State"])
+            .map(_pnl_color,   subset=["Realized P&L", "Unrealized", "Total P&L"]),
         use_container_width=True, hide_index=True,
     )
 
@@ -671,7 +671,7 @@ with tab_health:
                         if val == "FAILED": return "color:#f87171;font-weight:700"
                         return ""
                     st.dataframe(
-                        _cyc_df.style.applymap(_cyc_color, subset=["status"]),
+                        _cyc_df.style.map(_cyc_color, subset=["status"]),
                         use_container_width=True, hide_index=True,
                     )
                     _n_ok   = (_cyc_df["status"] == "OK").sum()

@@ -314,7 +314,7 @@ def run_dashboard(strategy_name_or_path=None):
                 if val == "FAILED": return "background-color:#450a0a; color:#f87171"
                 return ""
             st.dataframe(
-                history.style.applymap(_color_status, subset=["status"]),
+                history.style.map(_color_status, subset=["status"]),
                 use_container_width=True, hide_index=True,
             )
 
@@ -377,7 +377,7 @@ def run_dashboard(strategy_name_or_path=None):
 
             st.dataframe(
                 positions.style
-                    .applymap(_color_pnl, subset=["unrealized_pnl", "pct_chg"])
+                    .map(_color_pnl, subset=["unrealized_pnl", "pct_chg"])
                     .format({"avg_price": "{:.4f}", "last_price": "{:.4f}",
                              "unrealized_pnl": "{:+,.2f}", "pct_chg": "{:+.2f}%"}),
                 use_container_width=True, hide_index=True,
@@ -458,7 +458,7 @@ def run_dashboard(strategy_name_or_path=None):
                 return m.get(val, "")
 
             st.dataframe(
-                filtered.style.applymap(_color_sync, subset=["sync_status"]),
+                filtered.style.map(_color_sync, subset=["sync_status"]),
                 use_container_width=True, hide_index=True,
             )
             st.caption(f"Showing {len(filtered)} of {len(sync_df)} symbols")
@@ -853,8 +853,8 @@ def run_dashboard(strategy_name_or_path=None):
 
             st.dataframe(
                 signals.style
-                    .applymap(_sig_type_color, subset=["signal_type"])
-                    .applymap(_acted_color, subset=["acted"]),
+                    .map(_sig_type_color, subset=["signal_type"])
+                    .map(_acted_color, subset=["acted"]),
                 use_container_width=True, hide_index=True,
             )
         else:
@@ -916,8 +916,8 @@ def run_dashboard(strategy_name_or_path=None):
 
             st.dataframe(
                 trades.style
-                    .applymap(_side_color, subset=["side"])
-                    .applymap(_pnl_color, subset=["pnl"]),
+                    .map(_side_color, subset=["side"])
+                    .map(_pnl_color, subset=["pnl"]),
                 use_container_width=True, hide_index=True,
             )
 
