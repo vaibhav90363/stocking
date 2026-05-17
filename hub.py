@@ -2,10 +2,12 @@
 from __future__ import annotations
 
 import json
+import math
 import os
 import sys
 import time
-from datetime import datetime, timezone
+from collections import defaultdict
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pandas as pd
@@ -15,6 +17,7 @@ from streamlit_autorefresh import st_autorefresh
 ROOT = Path(__file__).resolve().parent
 sys.path.insert(0, str(ROOT))
 
+from stocking_app.config import load_config
 from stocking_app.strategy_loader import discover_strategies, StrategyConfig
 
 # ── Page Config — MUST be first Streamlit call ───────────────────────────────
@@ -122,6 +125,296 @@ def _read_strategy_state(sc: StrategyConfig) -> dict:
     return result
 
 
+_BENCHMARKS = {
+    ".US": ("Nasdaq 100", "^NDX", ["QQQ", "^IXIC"]),
+    ".L":  ("FTSE All-Share", "^FTAS", ["^FTSE", "ISF.L"]),
+    ".NS": ("Nifty 500", "^CRSLDX", ["^NSEI", "INDY"]),
+}
+
+
+def _fmt_pct(value: float | None) -> str:
+    if value is None or pd.isna(value):
+        return "—"
+    return f"{float(value):,.2f}%"
+
+
+def _fmt_num(value: float | None) -> str:
+    if value is None or pd.isna(value):
+        return "—"
+    return f"{float(value):,.2f}"
+
+
+def _compound_returns(returns: pd.Series) -> tuple[float | None, int]:
+    factor = 1.0
+    count = 0
+    for value in returns.dropna():
+        try:
+            r = float(value)
+        except Exception:
+            continue
+        if not math.isfinite(r):
+            continue
+        factor *= (1.0 + r)
+        count += 1
+    if count == 0:
+        return None, 0
+    return factor - 1.0, count
+
+
+def _fetch_benchmark_close(symbol: str, start_date: str, end_date: str, fallbacks: tuple[str, ...]) -> tuple[str | None, pd.Series]:
+    """Fetch daily benchmark closes from Yahoo Finance."""
+    try:
+        import yfinance as yf
+    except Exception:
+        return None, pd.Series(dtype=float)
+
+    start = pd.Timestamp(start_date).date()
+    end = pd.Timestamp(end_date).date() + timedelta(days=4)
+    for ticker in (symbol, *fallbacks):
+        try:
+            df = yf.download(
+                ticker,
+                start=str(start),
+                end=str(end),
+                interval="1d",
+                auto_adjust=True,
+                progress=False,
+                threads=False,
+            )
+            if df is None or df.empty:
+                continue
+            close = df["Close"]
+            if isinstance(close, pd.DataFrame):
+                close = close.iloc[:, 0]
+            close = close.dropna()
+            if close.empty:
+                continue
+            close.index = pd.to_datetime(close.index).date
+            close = close[close.index <= pd.Timestamp(end_date).date()]
+            if len(close) >= 2:
+                return ticker, close
+        except Exception:
+            continue
+    return None, pd.Series(dtype=float)
+
+
+def _deployed_capital_series(trades: pd.DataFrame, dates: list) -> tuple[pd.Series, float, float, float]:
+    """Reconstruct deployed cost basis through time from BUY/SELL rows."""
+    if trades.empty:
+        return pd.Series(dtype=float), 0.0, 0.0, 0.0
+
+    rows_by_day: dict[object, list[dict]] = defaultdict(list)
+    for row in trades.to_dict("records"):
+        rows_by_day[pd.Timestamp(row["ts"]).date()].append(row)
+
+    all_dates = sorted(set(dates) | set(rows_by_day.keys()))
+    pos_qty: dict[str, float] = defaultdict(float)
+    pos_cost: dict[str, float] = defaultdict(float)
+    values: dict[object, float] = {}
+    peak = 0.0
+    gross_buys = 0.0
+
+    for day in all_dates:
+        for row in rows_by_day.get(day, []):
+            symbol = str(row["symbol"])
+            side = str(row["side"])
+            qty = float(row["qty"])
+            price = float(row["price"])
+            notional = qty * price
+            if side == "BUY":
+                pos_qty[symbol] += qty
+                pos_cost[symbol] += notional
+                gross_buys += notional
+            elif side.startswith("SELL") and pos_qty[symbol] > 0:
+                avg_cost = pos_cost[symbol] / pos_qty[symbol]
+                close_qty = min(qty, pos_qty[symbol])
+                pos_qty[symbol] -= close_qty
+                pos_cost[symbol] -= close_qty * avg_cost
+                if pos_qty[symbol] <= 1e-9:
+                    pos_qty[symbol] = 0.0
+                    pos_cost[symbol] = 0.0
+
+        deployed = float(sum(pos_cost.values()))
+        peak = max(peak, deployed)
+        values[day] = deployed
+
+    raw = pd.Series(values).sort_index()
+    current = float(raw.iloc[-1]) if not raw.empty else 0.0
+    if not dates:
+        return raw, peak, gross_buys, current
+
+    aligned_index = sorted(set(raw.index) | set(dates))
+    aligned = raw.reindex(aligned_index).sort_index().ffill().reindex(dates).fillna(0.0)
+    return aligned, peak, gross_buys, current
+
+
+def _read_strategy_performance(sc: StrategyConfig) -> dict:
+    """Compute live strategy-vs-index performance from Supabase/Postgres."""
+    from stocking_app.db import TradingRepository
+
+    db_url = _get_db_url()
+    benchmark_name, benchmark_symbol, fallbacks = _BENCHMARKS.get(
+        sc.suffix,
+        (f"{sc.suffix} benchmark", "", []),
+    )
+    result = {
+        "strategy": sc.name,
+        "folder": sc.strategy_dir.name,
+        "suffix": sc.suffix,
+        "benchmark": benchmark_name,
+        "benchmark_symbol": benchmark_symbol,
+        "error": None,
+    }
+    if not db_url:
+        result["error"] = "DATABASE_URL is not configured."
+        return result
+
+    try:
+        repo = TradingRepository(db_url, suffix=sc.suffix)
+        trades = repo.read_df(
+            """
+            SELECT id, symbol, side, qty, price, ts, pnl, reason
+            FROM trade_activity_log
+            WHERE symbol LIKE %s
+            ORDER BY ts ASC, id ASC
+            """,
+            (f"%{sc.suffix}",),
+        )
+        snapshots = repo.read_df(
+            """
+            SELECT ts, realized_pnl, unrealized_pnl, total_pnl, open_positions
+            FROM pnl_snapshots
+            WHERE suffix = %s
+            ORDER BY ts ASC
+            """,
+            (sc.suffix,),
+        )
+        repo.close()
+    except Exception as exc:
+        result["error"] = f"DB read failed: {exc}"
+        return result
+
+    if trades.empty or snapshots.empty:
+        result["error"] = "No trades or P&L snapshots yet."
+        return result
+
+    trades["ts"] = pd.to_datetime(trades["ts"], errors="coerce")
+    snapshots["ts"] = pd.to_datetime(snapshots["ts"], errors="coerce")
+    trades = trades.dropna(subset=["ts"])
+    snapshots = snapshots.dropna(subset=["ts"])
+    if trades.empty or snapshots.empty:
+        result["error"] = "Trade or P&L timestamps are invalid."
+        return result
+
+    first_trade = trades["ts"].min().date()
+    latest_ts = snapshots["ts"].max()
+    latest_date = latest_ts.date()
+    latest = snapshots.sort_values("ts").iloc[-1]
+
+    bench_used = None
+    close = pd.Series(dtype=float)
+    if benchmark_symbol:
+        bench_used, close = _fetch_benchmark_close(
+            benchmark_symbol,
+            str(first_trade),
+            str(latest_date),
+            tuple(fallbacks),
+        )
+
+    dates = list(close.index) if not close.empty else list(pd.date_range(first_trade, latest_date, freq="D").date)
+    deployed, peak_deployed, gross_buys, current_deployed = _deployed_capital_series(trades, dates)
+    avg_deployed = float(deployed.mean()) if not deployed.empty else 0.0
+    total_pnl = float(latest.get("total_pnl", 0.0))
+    realized = float(latest.get("realized_pnl", 0.0))
+    unrealized = float(latest.get("unrealized_pnl", 0.0))
+
+    snap_daily = snapshots.sort_values("ts").groupby(snapshots["ts"].dt.date).tail(1)
+    daily_pnl = snap_daily.set_index(snap_daily["ts"].dt.date)["total_pnl"].astype(float)
+    if dates:
+        pnl_aligned = (
+            daily_pnl.reindex(sorted(set(daily_pnl.index) | set(dates)))
+            .sort_index()
+            .ffill()
+            .reindex(dates)
+            .fillna(0.0)
+        )
+    else:
+        pnl_aligned = daily_pnl
+    pnl_delta = pnl_aligned.diff().fillna(pnl_aligned)
+    prev_deployed = deployed.shift(1).fillna(0.0) if not deployed.empty else pd.Series(dtype=float)
+    avg_day_deployed = ((prev_deployed + deployed) / 2.0).replace(0.0, pd.NA) if not deployed.empty else pd.Series(dtype=float)
+    exposure_returns = (pnl_delta / avg_day_deployed).replace([float("inf"), -float("inf")], pd.NA).dropna()
+    exposure_compounded, exposure_days = _compound_returns(exposure_returns)
+
+    index_return = None
+    exposure_matched_index = None
+    benchmark_first = None
+    benchmark_last = None
+    benchmark_first_date = None
+    benchmark_last_date = None
+    if not close.empty and peak_deployed > 0:
+        benchmark_first = float(close.iloc[0])
+        benchmark_last = float(close.iloc[-1])
+        benchmark_first_date = str(close.index[0])
+        benchmark_last_date = str(close.index[-1])
+        index_return = (benchmark_last / benchmark_first) - 1.0
+        index_daily = close.pct_change().reindex(dates).fillna(0.0)
+        exposure_fraction = (prev_deployed / peak_deployed).clip(0, 1)
+        exposure_matched_index, _ = _compound_returns((index_daily * exposure_fraction).iloc[1:])
+
+    closed = trades[trades["side"].astype(str).str.startswith("SELL")].copy()
+    buys = trades[trades["side"].astype(str) == "BUY"].copy()
+    wins = int((closed["pnl"].astype(float) > 0).sum()) if not closed.empty else 0
+    losses = int((closed["pnl"].astype(float) < 0).sum()) if not closed.empty else 0
+    result.update({
+        "first_trade": str(first_trade),
+        "latest_ts": latest_ts.isoformat(),
+        "latest_date": str(latest_date),
+        "realized_pnl": realized,
+        "unrealized_pnl": unrealized,
+        "total_pnl": total_pnl,
+        "open_positions": int(latest.get("open_positions", 0)),
+        "buys": int(len(buys)),
+        "sells": int(len(closed)),
+        "trade_rows": int(len(trades)),
+        "wins": wins,
+        "losses": losses,
+        "win_rate_pct": (wins / len(closed) * 100.0) if len(closed) else None,
+        "avg_closed_pnl": float(closed["pnl"].astype(float).mean()) if not closed.empty else None,
+        "median_closed_pnl": float(closed["pnl"].astype(float).median()) if not closed.empty else None,
+        "peak_deployed": peak_deployed,
+        "avg_deployed": avg_deployed,
+        "current_deployed": current_deployed,
+        "gross_buy_notional": gross_buys,
+        "yield_on_peak_pct": (total_pnl / peak_deployed * 100.0) if peak_deployed else None,
+        "return_on_avg_deployed_pct": (total_pnl / avg_deployed * 100.0) if avg_deployed else None,
+        "exposure_adjusted_compounded_pct": (exposure_compounded * 100.0) if exposure_compounded is not None else None,
+        "exposure_adjusted_days": exposure_days,
+        "benchmark_symbol": bench_used or benchmark_symbol,
+        "benchmark_first": benchmark_first,
+        "benchmark_last": benchmark_last,
+        "benchmark_first_date": benchmark_first_date,
+        "benchmark_last_date": benchmark_last_date,
+        "index_fully_invested_pct": (index_return * 100.0) if index_return is not None else None,
+        "index_exposure_matched_pct": (exposure_matched_index * 100.0) if exposure_matched_index is not None else None,
+        "excess_exposure_strategy_vs_index_pp": (
+            (exposure_compounded - exposure_matched_index) * 100.0
+            if exposure_compounded is not None and exposure_matched_index is not None else None
+        ),
+        "excess_vs_full_index_pp": (
+            (total_pnl / peak_deployed - index_return) * 100.0
+            if peak_deployed and index_return is not None else None
+        ),
+        "excess_vs_exposure_matched_pp": (
+            (total_pnl / peak_deployed - exposure_matched_index) * 100.0
+            if peak_deployed and exposure_matched_index is not None else None
+        ),
+        "top_closed_winners": closed.sort_values("pnl", ascending=False).head(10),
+        "top_closed_losers": closed.sort_values("pnl", ascending=True).head(10),
+    })
+    return result
+
+
 st.markdown("""
 <style>
 [data-testid="stMetricValue"] { font-size: 1.3rem; font-weight: 700; }
@@ -196,7 +489,12 @@ m5.metric("Total P&L",       f"{total_realized + total_unreal:,.2f}",
 st.divider()
 
 # ── Main tabs ─────────────────────────────────────────────────────────────────
-tab_strategies, tab_health, tab_reset = st.tabs(["📊 Strategies", "🩺 System Health", "🧹 Reset Data"])
+tab_strategies, tab_perf, tab_health, tab_reset = st.tabs([
+    "📊 Strategies",
+    "📈 Performance",
+    "🩺 System Health",
+    "🧹 Reset Data",
+])
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -503,7 +801,177 @@ with tab_strategies:
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# TAB 2 — SYSTEM HEALTH
+# TAB 2 — PERFORMANCE
+# ═══════════════════════════════════════════════════════════════════════════════
+with tab_perf:
+    st.markdown("## Strategy Performance vs Index")
+    st.caption(
+        "Live Supabase data and benchmark prices are recomputed on every dashboard rerun."
+    )
+    if st.button("🔄 Refresh performance", key="perf_refresh"):
+        st.rerun()
+
+    with st.spinner("Reading Supabase trades and benchmark prices …"):
+        perf_results = [_read_strategy_performance(sc) for sc in strategies]
+
+    summary_rows = []
+    for perf in perf_results:
+        summary_rows.append({
+            "Strategy": perf.get("strategy"),
+            "Exchange": perf.get("suffix"),
+            "Period": (
+                f"{perf.get('first_trade')} → {perf.get('latest_date')}"
+                if not perf.get("error") else "—"
+            ),
+            "Total P&L": round(perf.get("total_pnl", 0.0), 2) if not perf.get("error") else None,
+            "Peak Capital": round(perf.get("peak_deployed", 0.0), 2) if not perf.get("error") else None,
+            "Strict Peak Yield": round(perf.get("yield_on_peak_pct", 0.0), 2) if perf.get("yield_on_peak_pct") is not None else None,
+            "Avg Deployed Return": round(perf.get("return_on_avg_deployed_pct", 0.0), 2) if perf.get("return_on_avg_deployed_pct") is not None else None,
+            "Exposure Strategy": round(perf.get("exposure_adjusted_compounded_pct", 0.0), 2) if perf.get("exposure_adjusted_compounded_pct") is not None else None,
+            "Full Index": round(perf.get("index_fully_invested_pct", 0.0), 2) if perf.get("index_fully_invested_pct") is not None else None,
+            "Exposure Index": round(perf.get("index_exposure_matched_pct", 0.0), 2) if perf.get("index_exposure_matched_pct") is not None else None,
+            "Strict Alpha vs Exposure": round(perf.get("excess_vs_exposure_matched_pp", 0.0), 2) if perf.get("excess_vs_exposure_matched_pp") is not None else None,
+            "Exposure Alpha": round(perf.get("excess_exposure_strategy_vs_index_pp", 0.0), 2) if perf.get("excess_exposure_strategy_vs_index_pp") is not None else None,
+            "Win Rate": round(perf.get("win_rate_pct", 0.0), 1) if perf.get("win_rate_pct") is not None else None,
+            "Error": perf.get("error") or "",
+        })
+
+    summary_df = pd.DataFrame(summary_rows)
+    st.markdown("### Summary")
+
+    def _perf_color(val):
+        try:
+            v = float(val)
+            return "color:#4ade80" if v > 0 else ("color:#f87171" if v < 0 else "")
+        except Exception:
+            return ""
+
+    pct_cols = [
+        "Strict Peak Yield",
+        "Avg Deployed Return",
+        "Exposure Strategy",
+        "Full Index",
+        "Exposure Index",
+        "Strict Alpha vs Exposure",
+        "Exposure Alpha",
+        "Win Rate",
+    ]
+    num_cols = ["Total P&L", "Peak Capital"]
+    if not summary_df.empty:
+        st.dataframe(
+            summary_df.style
+                .map(_perf_color, subset=[
+                    "Total P&L",
+                    "Strict Peak Yield",
+                    "Avg Deployed Return",
+                    "Exposure Strategy",
+                    "Full Index",
+                    "Exposure Index",
+                    "Strict Alpha vs Exposure",
+                    "Exposure Alpha",
+                ])
+                .format({c: "{:,.2f}" for c in num_cols if c in summary_df.columns})
+                .format({c: "{:,.2f}%" for c in pct_cols if c in summary_df.columns}),
+            use_container_width=True,
+            hide_index=True,
+        )
+
+    st.divider()
+    market_tabs = st.tabs([f"{p.get('suffix', '')} {p.get('strategy', 'Strategy').split('—')[-1].strip()}" for p in perf_results])
+
+    for subtab, perf in zip(market_tabs, perf_results):
+        with subtab:
+            st.markdown(f"### {perf.get('strategy')}")
+            st.caption(f"Folder: `{perf.get('folder')}`  ·  Exchange: `{perf.get('suffix')}`")
+            if perf.get("error"):
+                st.warning(perf["error"])
+                continue
+
+            st.caption(
+                f"Period: `{perf.get('first_trade')}` to `{perf.get('latest_date')}`  ·  "
+                f"Benchmark: `{perf.get('benchmark')}` / `{perf.get('benchmark_symbol')}`"
+            )
+            k1, k2, k3, k4, k5 = st.columns(5)
+            k1.metric("Total P&L", _fmt_num(perf.get("total_pnl")), delta=_fmt_num(perf.get("total_pnl")))
+            k2.metric("Strict Peak Yield", _fmt_pct(perf.get("yield_on_peak_pct")))
+            k3.metric("Avg Deployed Return", _fmt_pct(perf.get("return_on_avg_deployed_pct")))
+            k4.metric("Full Index Return", _fmt_pct(perf.get("index_fully_invested_pct")))
+            k5.metric("Exposure Index", _fmt_pct(perf.get("index_exposure_matched_pct")))
+
+            a1, a2, a3, a4 = st.columns(4)
+            a1.metric("Alpha vs Full Index", _fmt_pct(perf.get("excess_vs_full_index_pp")))
+            a2.metric("Strict Alpha vs Exposure", _fmt_pct(perf.get("excess_vs_exposure_matched_pp")))
+            a3.metric("Exposure Strategy", _fmt_pct(perf.get("exposure_adjusted_compounded_pct")))
+            a4.metric("Exposure Alpha", _fmt_pct(perf.get("excess_exposure_strategy_vs_index_pp")))
+
+            c1, c2, c3, c4, c5 = st.columns(5)
+            c1.metric("Peak Capital", _fmt_num(perf.get("peak_deployed")))
+            c2.metric("Average Deployed", _fmt_num(perf.get("avg_deployed")))
+            c3.metric("Current Deployed", _fmt_num(perf.get("current_deployed")))
+            c4.metric("Gross Buy Notional", _fmt_num(perf.get("gross_buy_notional")))
+            c5.metric("Open Positions", perf.get("open_positions", 0))
+
+            chart_values = pd.DataFrame({
+                "Return %": {
+                    "Strict peak yield": perf.get("yield_on_peak_pct"),
+                    "Avg deployed return": perf.get("return_on_avg_deployed_pct"),
+                    "Exposure strategy": perf.get("exposure_adjusted_compounded_pct"),
+                    "Fully invested index": perf.get("index_fully_invested_pct"),
+                    "Exposure-matched index": perf.get("index_exposure_matched_pct"),
+                }
+            }).dropna()
+            if not chart_values.empty:
+                st.bar_chart(chart_values)
+
+            st.markdown("#### Trade Distribution")
+            d1, d2, d3, d4, d5 = st.columns(5)
+            d1.metric("Buys", perf.get("buys", 0))
+            d2.metric("Closed Sells", perf.get("sells", 0))
+            d3.metric("Win Rate", _fmt_pct(perf.get("win_rate_pct")))
+            d4.metric("Wins / Losses", f"{perf.get('wins', 0)} / {perf.get('losses', 0)}")
+            d5.metric("Median Closed P&L", _fmt_num(perf.get("median_closed_pnl")))
+
+            top_winners = perf.get("top_closed_winners")
+            top_losers = perf.get("top_closed_losers")
+            w_col, l_col = st.columns(2)
+            with w_col:
+                with st.expander("Top closed winners", expanded=True):
+                    if isinstance(top_winners, pd.DataFrame) and not top_winners.empty:
+                        st.dataframe(
+                            top_winners[["symbol", "qty", "price", "ts", "pnl", "reason"]]
+                                .assign(ts=lambda df: pd.to_datetime(df["ts"]).dt.strftime("%Y-%m-%d")),
+                            use_container_width=True,
+                            hide_index=True,
+                        )
+                    else:
+                        st.caption("No closed winners yet.")
+            with l_col:
+                with st.expander("Top closed losers", expanded=True):
+                    if isinstance(top_losers, pd.DataFrame) and not top_losers.empty:
+                        st.dataframe(
+                            top_losers[["symbol", "qty", "price", "ts", "pnl", "reason"]]
+                                .assign(ts=lambda df: pd.to_datetime(df["ts"]).dt.strftime("%Y-%m-%d")),
+                            use_container_width=True,
+                            hide_index=True,
+                        )
+                    else:
+                        st.caption("No closed losers yet.")
+
+            with st.expander("Definitions"):
+                st.markdown(
+                    """
+                    - **Strict Peak Yield** = latest total P&L / maximum deployed cost basis at any time.
+                    - **Average Deployed Return** = latest total P&L / average deployed cost basis across benchmark trading days.
+                    - **Exposure Strategy** compounds daily P&L change over average deployed capital for that day.
+                    - **Exposure Index** compounds the benchmark only at the strategy's deployed-capital fraction.
+                    - **Strict Alpha vs Exposure** compares strict peak yield to the exposure-matched benchmark return.
+                    - **Exposure Alpha** compares exposure-adjusted strategy compounding to the exposure-matched benchmark return.
+                    """
+                )
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# TAB 3 — SYSTEM HEALTH
 # ═══════════════════════════════════════════════════════════════════════════════
 with tab_health:
     import requests as _requests
