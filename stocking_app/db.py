@@ -804,6 +804,50 @@ class TradingRepository:
 
 
     @retry_on_disconnect()
+    def prune_old_pnl_snapshots(self, max_age_days: int = 30) -> int:
+        """Delete pnl_snapshots rows older than max_age_days to cap table growth."""
+        from datetime import timedelta
+        cutoff = (datetime.now(timezone.utc) - timedelta(days=max_age_days)).replace(
+            microsecond=0
+        ).isoformat()
+        with self.conn.cursor() as cur:
+            cur.execute("DELETE FROM pnl_snapshots WHERE ts < %s", (cutoff,))
+            return cur.rowcount
+
+    @retry_on_disconnect()
+    def prune_old_run_metrics(self, max_age_days: int = 14) -> int:
+        """Delete run_metrics rows older than max_age_days to cap table growth."""
+        from datetime import timedelta
+        cutoff = (datetime.now(timezone.utc) - timedelta(days=max_age_days)).replace(
+            microsecond=0
+        ).isoformat()
+        with self.conn.cursor() as cur:
+            cur.execute("DELETE FROM run_metrics WHERE run_started_at < %s", (cutoff,))
+            return cur.rowcount
+
+    @retry_on_disconnect()
+    def prune_old_system_logs(self, max_age_days: int = 7) -> int:
+        """Delete system_logs rows older than max_age_days to cap table growth."""
+        from datetime import timedelta
+        cutoff = (datetime.now(timezone.utc) - timedelta(days=max_age_days)).replace(
+            microsecond=0
+        ).isoformat()
+        with self.conn.cursor() as cur:
+            cur.execute("DELETE FROM system_logs WHERE ts < %s", (cutoff,))
+            return cur.rowcount
+
+    @retry_on_disconnect()
+    def prune_old_signals(self, max_age_days: int = 60) -> int:
+        """Delete signals rows older than max_age_days to cap table growth."""
+        from datetime import timedelta
+        cutoff = (datetime.now(timezone.utc) - timedelta(days=max_age_days)).replace(
+            microsecond=0
+        ).isoformat()
+        with self.conn.cursor() as cur:
+            cur.execute("DELETE FROM signals WHERE created_at < %s", (cutoff,))
+            return cur.rowcount
+
+    @retry_on_disconnect()
     def upsert_signal(self, signal: SignalRecord, acted: bool = False) -> None:
         with self.conn.cursor() as cur:
             cur.execute(

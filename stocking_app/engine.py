@@ -804,6 +804,10 @@ class ScalableEngine:
         # and prevents the DB query payload from growing cycle over cycle.
         try:
             self.repo.prune_old_candles(self.cfg.daily_lookback_days + 30)
+            self.repo.prune_old_pnl_snapshots(30)
+            self.repo.prune_old_run_metrics(14)
+            self.repo.prune_old_system_logs(7)
+            self.repo.prune_old_signals(60)
         except Exception:
             pass  # non-critical — don't let prune failure crash the cycle
 
