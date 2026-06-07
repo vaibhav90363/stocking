@@ -53,6 +53,14 @@ def _to_weekly(daily: pd.DataFrame, exchange_tz: str) -> pd.DataFrame:
         .dropna(subset=["open", "high", "low", "close"])
     )
 
+    # Drop the last (current, incomplete) weekly bar so fractal and CMO calculations
+    # are never based on a partial week.  A week that started on Monday but whose
+    # data only covers Mon–Wed will have a misleadingly low high/close that changes
+    # by Friday, causing unstable fractal confirmations and false CMO crossovers.
+    # The most-recent COMPLETE week is always at index -2 before this drop, -1 after.
+    if len(weekly) > 1:
+        weekly = weekly.iloc[:-1]
+
     del daily_local, idx
     return weekly
 
@@ -109,12 +117,21 @@ def compute_all_indicators(daily: pd.DataFrame, exchange_tz: str) -> pd.DataFram
 
     return aligned
 
-def _compute_latest_signal(aligned: pd.DataFrame, prev_price_override: float | None = None) -> tuple[str | None, float | None, str]:
+STOP_LOSS_PCT = 0.12  # exit if position is down 12% from buy price
+
+
+def _compute_latest_signal(
+    aligned: pd.DataFrame,
+    prev_price_override: float | None = None,
+    has_position: bool = False,
+    entry_price: float | None = None,
+) -> tuple[str | None, float | None, str]:
 
     critical = [
         "close",
         "weekly_upper_band",
-        "weekly_lower_band",
+        # weekly_lower_band is NOT in critical: it's not used in any signal logic,
+        # and including it would drop all rows for stocks with no confirmed lower fractal.
         "ema_cmo",
         "sma_cmo",
         "weekly_ema_cmo",
@@ -132,16 +149,51 @@ def _compute_latest_signal(aligned: pd.DataFrame, prev_price_override: float | N
     # sensitivity on daily data polling.
     prev_close = prev_price_override if prev_price_override is not None else prev["close"]
 
-    buy_cross = prev_close <= prev["weekly_upper_band"] and curr["close"] > curr["weekly_upper_band"]
+    # BUG-BAND-DROP: Only buy when the upper band has NOT dropped since the previous
+    # bar.  A new lower weekly fractal shrinks the band, making price appear to have
+    # crossed resistance when it never actually broke the prior high.  Requiring
+    # curr_band >= prev_band ensures we only enter on genuine breakouts.
+    buy_cross = (
+        prev_close <= prev["weekly_upper_band"]
+        and curr["close"] > curr["weekly_upper_band"]
+        and curr["weekly_upper_band"] >= prev["weekly_upper_band"]
+    )
     daily_sell_cross = curr["ema_cmo"] < curr["sma_cmo"] and prev["ema_cmo"] >= prev["sma_cmo"]
     weekly_sell_cross = (
         curr["weekly_ema_cmo"] < curr["weekly_sma_cmo"]
         and prev["weekly_ema_cmo"] >= prev["weekly_sma_cmo"]
     )
 
+    # Stop-loss: exit immediately if the position is down beyond STOP_LOSS_PCT from
+    # the entry price.  Checked before CMO signals so it always takes priority.
+    if has_position and entry_price is not None and entry_price > 0:
+        drawdown = (float(curr["close"]) - entry_price) / entry_price
+        if drawdown <= -STOP_LOSS_PCT:
+            return "SELL", float(curr["close"]), f"stop_loss_{abs(drawdown)*100:.1f}pct"
+
     if daily_sell_cross or weekly_sell_cross:
         trigger = "daily_cmo_crossdown" if daily_sell_cross else "weekly_cmo_crossdown"
         return "SELL", float(curr["close"]), trigger
+
+    # BUG-MISSED-CROSSOVER: The crossover conditions above only fire on the exact bar
+    # of the cross.  If the engine was down that day the signal is lost forever and a
+    # held position bleeds indefinitely.  For positions we already hold, also sell
+    # when the CMO has been persistently bearish across two consecutive bars — this
+    # catches missed crossover exits without generating spurious SELLs on stocks we
+    # don't own (the engine filters to open_positions before acting).
+    if has_position:
+        daily_bearish = curr["ema_cmo"] < curr["sma_cmo"] and prev["ema_cmo"] < prev["sma_cmo"]
+        weekly_bearish = (
+            curr["weekly_ema_cmo"] < curr["weekly_sma_cmo"]
+            and prev["weekly_ema_cmo"] < prev["weekly_sma_cmo"]
+        )
+        if daily_bearish or weekly_bearish:
+            trigger = (
+                "daily_cmo_bearish_missed_crossover_exit"
+                if daily_bearish
+                else "weekly_cmo_bearish_missed_crossover_exit"
+            )
+            return "SELL", float(curr["close"]), trigger
 
     if buy_cross:
         return "BUY", float(curr["weekly_upper_band"]), "daily_close_crossed_weekly_upper_band"
@@ -149,7 +201,7 @@ def _compute_latest_signal(aligned: pd.DataFrame, prev_price_override: float | N
     return None, None, "no_signal"
 
 
-def compute_symbol_signal(symbol: str, daily: pd.DataFrame, exchange_tz: str, prev_price: float | None = None) -> dict[str, Any]:
+def compute_symbol_signal(symbol: str, daily: pd.DataFrame, exchange_tz: str, prev_price: float | None = None, has_position: bool = False, entry_price: float | None = None) -> dict[str, Any]:
     """
     Compute the latest signal for a symbol given its 1d candle DataFrame.
     """
@@ -172,7 +224,7 @@ def compute_symbol_signal(symbol: str, daily: pd.DataFrame, exchange_tz: str, pr
             "signal_reason": "insufficient_weekly_bars",
         }
 
-    signal, signal_price, reason = _compute_latest_signal(aligned, prev_price_override=prev_price)
+    signal, signal_price, reason = _compute_latest_signal(aligned, prev_price_override=prev_price, has_position=has_position, entry_price=entry_price)
     # OOM-FIX-v3: Release merged aligned DF immediately — it's ~180 rows × ~12 cols
     # per symbol, so freeing it before returning saves ~1-2 MB per symbol in the
     # compute loop (500 symbols × ~4 KB = ~2 MB held if not freed proactively).

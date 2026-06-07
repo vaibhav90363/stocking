@@ -610,6 +610,12 @@ class ScalableEngine:
         compute_start = time.monotonic()
         compute_payloads: list[dict[str, Any]] = []
 
+        # Fetch open positions before the compute loop so we can pass has_position
+        # to the strategy — this enables persistent-bearish sell detection for held
+        # positions (catches exits that would otherwise be missed when the engine was
+        # down on the exact crossover day).
+        open_positions = self.repo.get_open_positions()
+
         # RETRIEVE LAST PRICE MEMORY (for 5-min crossovers)
         prev_prices = self.repo.get_last_prices(symbols_to_compute)
 
@@ -639,10 +645,14 @@ class ScalableEngine:
 
                 prev_data = prev_prices.get(symbol)
                 prev_p = prev_data[0] if prev_data else None
+                pos_data = open_positions.get(symbol)
+                entry_p = float(pos_data["avg_price"]) if pos_data and pos_data.get("avg_price") else None
 
                 try:
                     result = compute_symbol_signal(
                         symbol, df_symbol, self.cfg.exchange_tz, prev_price=prev_p,
+                        has_position=symbol in open_positions,
+                        entry_price=entry_p,
                     )
                     compute_payloads.append(result)
                 except Exception as exc:  # noqa: BLE001
@@ -691,8 +701,8 @@ class ScalableEngine:
         )
 
         persist_start = time.monotonic()
-        open_positions = self.repo.get_open_positions()
-        
+        # open_positions was fetched before the compute loop (re-used here for action routing)
+
         # Log signals — FILTERED based on actual portfolio state
         # BUG-LOG-FILTERING: Prevent confusing logs where it shows a "SELL" for 
         # a stock the user doesn't even own yet.
