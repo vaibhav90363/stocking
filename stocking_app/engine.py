@@ -340,8 +340,8 @@ class ScalableEngine:
                     # earlier to stay well below Render's 512 MB hard limit.
                     # Previous: warn=450 / exit=480. 3 engines × ~160 MB each
                     # easily exceeds 480 MB; tighter thresholds add safety margin.
-                    RSS_WARN_MB = 450
-                    RSS_EXIT_MB = 480
+                    RSS_WARN_MB = 430
+                    RSS_EXIT_MB = 460
                     if rss_mb >= RSS_EXIT_MB:
                         self.log.warning(
                             f"   🚨 RSS {rss_mb:.0f} MB ≥ {RSS_EXIT_MB} MB limit! "
