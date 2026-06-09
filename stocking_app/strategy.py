@@ -127,17 +127,11 @@ def _compute_latest_signal(
     entry_price: float | None = None,
 ) -> tuple[str | None, float | None, str]:
 
-    critical = [
-        "close",
-        "weekly_upper_band",
-        # weekly_lower_band is NOT in critical: it's not used in any signal logic,
-        # and including it would drop all rows for stocks with no confirmed lower fractal.
-        "ema_cmo",
-        "sma_cmo",
-        "weekly_ema_cmo",
-        "weekly_sma_cmo",
-    ]
-    aligned = aligned.dropna(subset=critical)
+    # BUY only needs close + weekly_upper_band (fractal breakout — no CMO involved).
+    # SELL additionally needs CMO columns. Drop rows where the fractal band is missing
+    # first; then check CMO availability separately only when evaluating SELL.
+    buy_critical = ["close", "weekly_upper_band"]
+    aligned = aligned.dropna(subset=buy_critical)
     if len(aligned) < 2:
         return None, None, "insufficient_rows_after_indicator_warmup"
 
@@ -158,8 +152,18 @@ def _compute_latest_signal(
         and curr["close"] > curr["weekly_upper_band"]
         and curr["weekly_upper_band"] >= prev["weekly_upper_band"]
     )
-    daily_sell_cross = curr["ema_cmo"] < curr["sma_cmo"] and prev["ema_cmo"] >= prev["sma_cmo"]
-    weekly_sell_cross = (
+
+    # CMO columns may be NaN when candle history is short (indicator warmup).
+    # SELL signals require them; skip SELL checks rather than blocking BUY.
+    cmo_ready = not (
+        pd.isna(curr["ema_cmo"]) or pd.isna(curr["sma_cmo"])
+        or pd.isna(prev["ema_cmo"]) or pd.isna(prev["sma_cmo"])
+        or pd.isna(curr["weekly_ema_cmo"]) or pd.isna(curr["weekly_sma_cmo"])
+        or pd.isna(prev["weekly_ema_cmo"]) or pd.isna(prev["weekly_sma_cmo"])
+    )
+
+    daily_sell_cross = cmo_ready and curr["ema_cmo"] < curr["sma_cmo"] and prev["ema_cmo"] >= prev["sma_cmo"]
+    weekly_sell_cross = cmo_ready and (
         curr["weekly_ema_cmo"] < curr["weekly_sma_cmo"]
         and prev["weekly_ema_cmo"] >= prev["weekly_sma_cmo"]
     )
@@ -181,7 +185,7 @@ def _compute_latest_signal(
     # when the CMO has been persistently bearish across two consecutive bars — this
     # catches missed crossover exits without generating spurious SELLs on stocks we
     # don't own (the engine filters to open_positions before acting).
-    if has_position:
+    if has_position and cmo_ready:
         daily_bearish = curr["ema_cmo"] < curr["sma_cmo"] and prev["ema_cmo"] < prev["sma_cmo"]
         weekly_bearish = (
             curr["weekly_ema_cmo"] < curr["weekly_sma_cmo"]
