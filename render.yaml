@@ -3,7 +3,7 @@ services:
     name: stocking-web-engine
     env: python
     plan: free
-    buildCommand: pip install -r requirements.txt
+    buildCommand: pip install -r requirements.txt && apt-get install -y libjemalloc2 || true
     startCommand: python3 run_strategy.py --all-strategies --mode live
     envVars:
       - key: DATABASE_URL
@@ -32,6 +32,14 @@ services:
         value: "0"
       - key: MALLOC_MMAP_MAX_
         value: "65536"
+      # ── jemalloc — replaces glibc ptmalloc2 ─────────────────────────
+      # ptmalloc2 cannot return fragmented heap pages to the OS even after
+      # gc.collect() + malloc_trim(0), causing RSS to ratchet upward ~1 MB
+      # per cycle forever.  jemalloc uses size-class arenas + extent-based
+      # deallocation that actively returns freed pages to the OS, keeping
+      # RSS flat across incremental cycles.
+      - key: LD_PRELOAD
+        value: /usr/lib/x86_64-linux-gnu/libjemalloc.so.2
       # Render injects these automatically — listed here so they propagate
       # through subprocess.Popen env copies into child engine processes.
       - key: RENDER_EXTERNAL_URL

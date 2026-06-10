@@ -14,6 +14,17 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+# ── Nightly restart coordination ─────────────────────────────────────────────
+# All 3 engines share a process. Only ONE should trigger the nightly restart.
+# We track which UTC dates have already been restarted using a module-level set
+# protected by a lock so the first engine to check wins and the others skip.
+_nightly_restart_lock = threading.Lock()
+_nightly_restart_dates: set[str] = set()  # "YYYY-MM-DD" strings
+
+# UTC hour at which to do the planned nightly restart (22:00 UTC = all markets
+# closed: NSE closes ~10:00 UTC, LSE ~15:30 UTC, NASDAQ ~21:00 UTC).
+NIGHTLY_RESTART_UTC_HOUR = 22
+
 import pandas as pd
 
 from .config import AppConfig, load_config
@@ -233,6 +244,30 @@ class ScalableEngine:
 
         cycle_num = 0
         while self._running:
+            # ── Nightly planned restart ──────────────────────────────────────
+            # Once per day at NIGHTLY_RESTART_UTC_HOUR (22:00 UTC) the process
+            # does a clean os._exit(0) so Render restarts it with a fresh heap.
+            # This prevents the glibc fragmentation ratchet from accumulating
+            # across a full trading day (~96 cycles × 1 MB = ~100 MB growth).
+            # Render restarts the service and since all candles are in Supabase,
+            # bootstrap is skipped — back live in under 2 minutes.
+            # Only runs when bootstrap is done (don't interrupt initial fetch).
+            _now_utc = datetime.now(timezone.utc)
+            if self._bootstrap_done and _now_utc.hour == NIGHTLY_RESTART_UTC_HOUR:
+                _today = _now_utc.strftime("%Y-%m-%d")
+                with _nightly_restart_lock:
+                    _should_restart = _today not in _nightly_restart_dates
+                    if _should_restart:
+                        _nightly_restart_dates.add(_today)
+                if _should_restart:
+                    self.log.info(
+                        f"🌙 Nightly planned restart at {NIGHTLY_RESTART_UTC_HOUR:02d}:00 UTC "
+                        f"({_today}) — clearing heap fragmentation. "
+                        f"Render will restart; bootstrap will be skipped (candles are fresh)."
+                    )
+                    self.close()
+                    os._exit(0)
+
             # ── Market-hours auto-scheduler ─────────────────────────────────
             mkt = get_market_status(
                 self.cfg.exchange_tz,
