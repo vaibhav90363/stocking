@@ -275,6 +275,14 @@ def main():
         engines: list[ScalableEngine] = []
         engine_threads: dict[str, dict] = {}
 
+        # Sequential bootstrap semaphore — only one engine fetches its full
+        # history at a time. Prevents the combined RSS spike (NSE 500 symbols +
+        # LSE 434 symbols bootstrapping simultaneously = ~480 MB on a 512 MB
+        # instance). Each engine acquires this before its first 150-day fetch
+        # and releases immediately after, so the next engine can start while
+        # the first runs its (lightweight) compute + persist phase.
+        _bootstrap_sem = threading.Semaphore(1)
+
         def _run_engine_thread(engine: ScalableEngine, name: str) -> None:
             """Run one strategy engine. Called from a daemon thread."""
             try:
@@ -299,7 +307,7 @@ def main():
             )
             print(f"  --> {sc.name}  (suffix={sc.suffix}, delay={cfg.fetch_start_delay_seconds}s)")
 
-            engine = ScalableEngine(cfg)
+            engine = ScalableEngine(cfg, bootstrap_semaphore=_bootstrap_sem)
             engines.append(engine)
 
             t = threading.Thread(

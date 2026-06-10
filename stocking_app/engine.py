@@ -90,11 +90,14 @@ class CycleStats:
 
 # ── Engine ───────────────────────────────────────────────────────────────────
 class ScalableEngine:
-    def __init__(self, cfg: AppConfig):
+    def __init__(self, cfg: AppConfig, bootstrap_semaphore=None):
         self.cfg = cfg
         self.repo = TradingRepository(cfg.database_url or cfg.db_path, suffix=cfg.ticker_suffix)
         self.repo.init_db()
         self._running = True
+        # Semaphore shared across engines so only one bootstraps at a time.
+        # Eliminates the memory spike from simultaneous 150-day fetches.
+        self._bootstrap_semaphore = bootstrap_semaphore
 
         # Logger writes to <db_path_dir>/logs/engine.log and the Supabase db
         log_dir = Path(cfg.db_path).parent / "logs"
@@ -361,6 +364,14 @@ class ScalableEngine:
                     pass
 
             except Exception as exc:  # noqa: BLE001
+                # If run_once() threw before releasing the bootstrap semaphore,
+                # release it here so other engines aren't blocked forever.
+                if self._bootstrap_semaphore is not None and not self._bootstrap_done:
+                    try:
+                        self._bootstrap_semaphore.release()
+                    except Exception:
+                        pass
+
                 run_ended_at = utc_now_iso()
                 duration = time.monotonic() - loop_start
                 failed = CycleStats(
@@ -432,6 +443,20 @@ class ScalableEngine:
         # the last `fetch_lookback_days` (typically 2d) for symbols whose
         # latest candle is stale — avoids re-downloading ~20,000 bars every
         # 5 minutes when only ~200 new bars exist.
+        #
+        # BOOTSTRAP-SEM: acquire before bootstrap so only one engine downloads
+        # its full history at a time. With 3 engines bootstrapping in parallel
+        # the combined RSS spikes to ~480 MB (NSE 500 + LSE 434 symbols × 150d).
+        # Sequential bootstrap keeps peak memory to one engine's worth (~250 MB).
+        # The semaphore is released as soon as bootstrap fetch is done so the
+        # next engine can start while this one runs compute + persist.
+        _sem_acquired = False
+        if not self._bootstrap_done and self._bootstrap_semaphore is not None:
+            self.log.info("  [bootstrap] Waiting for bootstrap slot (another engine is bootstrapping) …")
+            self._bootstrap_semaphore.acquire()
+            _sem_acquired = True
+            self.log.info("  [bootstrap] Bootstrap slot acquired — starting full history fetch …")
+
         if not self._bootstrap_done:
             # First cycle: check which symbols are missing historical data
             symbols_needing_backfill = self.repo.get_symbols_needing_daily_fetch(live_symbols)
@@ -541,6 +566,13 @@ class ScalableEngine:
         if fetch_mode == "bootstrap" and fetched_symbols:
             self._bootstrap_done = True
             self.log.info(f"       ✓ Bootstrap complete — switching to incremental fetches")
+
+        # Release bootstrap semaphore now — fetch is done, compute+persist are
+        # lightweight so the next engine can start its bootstrap immediately.
+        if _sem_acquired:
+            self._bootstrap_semaphore.release()
+            _sem_acquired = False
+            self.log.info("  [bootstrap] Bootstrap slot released — next engine can start.")
 
         # OOM-FIX-v4: Purge ALL yfinance module-level caches.
         # yf.download() stores DataFrames in _DFS, errors in _ERRORS, and
