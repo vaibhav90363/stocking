@@ -526,10 +526,13 @@ class TradingRepository:
                 (f"%{self.suffix}",)
             )
             row = cur.fetchone()
+        total  = int(row["total"]  or 0)
+        active = int(row["active"] or 0)
         return {
-            "total": int(row["total"] or 0),
+            "total":    total,
             "selected": int(row["selected"] or 0),
-            "active": int(row["active"] or 0),
+            "active":   active,
+            "dead":     total - active,
         }
 
     @retry_on_disconnect()

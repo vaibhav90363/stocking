@@ -238,7 +238,13 @@ def run_dashboard(strategy_name_or_path=None):
     _dot = "🟢" if state in ("running", "starting", "fetching", "computing") else ("🟡" if state in ("paused", "paused_market_closed") else "⚫")
 
     k1.metric("Engine",         f"{_dot} {engine_status_str}")
-    k2.metric("Universe",       uni_summary["active"])
+    _dead = uni_summary["dead"]
+    k2.metric(
+        "Universe",
+        f"{uni_summary['active']} / {uni_summary['total']}",
+        delta=f"{_dead} dead" if _dead > 0 else "all active",
+        delta_color="inverse" if _dead > 0 else "normal",
+    )
     k3.metric("Open Positions", n_open)
     k4.metric("Realized P&L",   f"{realized:,.2f}")
     k5.metric("Unrealized P&L", f"{unrealized:,.2f}", delta=f"{unrealized:+,.0f}")
@@ -395,10 +401,20 @@ def run_dashboard(strategy_name_or_path=None):
     # ══════════════════════════════════════════════════════════════════════════════
     with tab_universe:
         st.markdown('<p class="section-header">Universe Overview</p>', unsafe_allow_html=True)
-        u1, u2, u3 = st.columns(3)
-        u1.metric("Total Symbols",    uni_summary["total"])
+        u1, u2, u3, u4 = st.columns(4)
+        u1.metric("Total Symbols",      uni_summary["total"])
         u2.metric("Active (monitored)", uni_summary["active"])
-        u3.metric("Selected",          uni_summary["selected"])
+        u3.metric("Selected",           uni_summary["selected"])
+        _dead_count = uni_summary["dead"]
+        u4.metric(
+            "Dead (suppressed)",
+            _dead_count,
+            delta="circuit-breaker fired" if _dead_count > 0 else "none",
+            delta_color="inverse" if _dead_count > 0 else "normal",
+            help="Symbols marked inactive by the dead-symbol circuit breaker after repeated empty fetches. "
+                 "Usually caused by yfinance rate limits during restarts, not genuine delistings. "
+                 "Use the Reset Data tab to restore them.",
+        )
 
         st.markdown('<p class="section-header">Symbol Sync Status</p>', unsafe_allow_html=True)
         st.caption("Shows when data was last fetched (candles) and last computed (signals) for each symbol.")
