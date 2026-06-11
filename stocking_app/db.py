@@ -634,7 +634,7 @@ class TradingRepository:
             return
         now = utc_now_iso()
         # rows: (symbol, last_candle_ts, last_compute_ts, updated_at, last_price_seen, last_price_seen_at)
-        rows = [(sym, None, now, now, lp, ts) for sym, _, lp, ts in data]
+        rows = [(sym, None, now, now, lp, now) for sym, _, lp, ts in data]
         from psycopg2.extras import execute_values
         with self.conn.cursor() as cur:
             execute_values(
@@ -904,7 +904,7 @@ class TradingRepository:
                     last_price=EXCLUDED.last_price,
                     last_updated_at=EXCLUDED.last_updated_at
                 """,
-                (symbol, qty, price, ts, price, now),
+                (symbol, qty, price, now, price, now),
             )
             cur.execute(
                 """
@@ -945,7 +945,8 @@ class TradingRepository:
 
     @retry_on_disconnect()
     def update_position_prices(self, prices: dict[str, tuple[float, str]]) -> None:
-        rows = [(price, ts, sym) for sym, (price, ts) in prices.items()]
+        now = utc_now_iso()
+        rows = [(price, now, sym) for sym, (price, ts) in prices.items()]
         from psycopg2.extras import execute_batch
         with self.conn.cursor() as cur:
             execute_batch(
