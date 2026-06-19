@@ -154,16 +154,24 @@ def _compute_latest_signal(
     )
 
     # CMO columns may be NaN when candle history is short (indicator warmup).
-    # SELL signals require them; skip SELL checks rather than blocking BUY.
-    cmo_ready = not (
+    # Split readiness checks: daily crossover only needs daily CMO; weekly crossover
+    # needs weekly CMO. Previously a single cmo_ready gate required ALL 8 values —
+    # weekly_sma_cmo needs CMO_PERIOD+SMA_PERIOD (~22) weekly bars which can exceed
+    # the lookback window, silently blocking daily sells forever (BUG-CMO-READY).
+    daily_cmo_ready = not (
         pd.isna(curr["ema_cmo"]) or pd.isna(curr["sma_cmo"])
         or pd.isna(prev["ema_cmo"]) or pd.isna(prev["sma_cmo"])
-        or pd.isna(curr["weekly_ema_cmo"]) or pd.isna(curr["weekly_sma_cmo"])
+    )
+    weekly_cmo_ready = daily_cmo_ready and not (
+        pd.isna(curr["weekly_ema_cmo"]) or pd.isna(curr["weekly_sma_cmo"])
         or pd.isna(prev["weekly_ema_cmo"]) or pd.isna(prev["weekly_sma_cmo"])
     )
+    # For missed-crossover detection (requires both timeframes to confirm), use
+    # weekly_cmo_ready so we don't fire on partial data.
+    cmo_ready = weekly_cmo_ready
 
-    daily_sell_cross = cmo_ready and curr["ema_cmo"] < curr["sma_cmo"] and prev["ema_cmo"] >= prev["sma_cmo"]
-    weekly_sell_cross = cmo_ready and (
+    daily_sell_cross = daily_cmo_ready and curr["ema_cmo"] < curr["sma_cmo"] and prev["ema_cmo"] >= prev["sma_cmo"]
+    weekly_sell_cross = weekly_cmo_ready and (
         curr["weekly_ema_cmo"] < curr["weekly_sma_cmo"]
         and prev["weekly_ema_cmo"] >= prev["weekly_sma_cmo"]
     )
@@ -185,9 +193,9 @@ def _compute_latest_signal(
     # when the CMO has been persistently bearish across two consecutive bars — this
     # catches missed crossover exits without generating spurious SELLs on stocks we
     # don't own (the engine filters to open_positions before acting).
-    if has_position and cmo_ready:
+    if has_position and daily_cmo_ready:
         daily_bearish = curr["ema_cmo"] < curr["sma_cmo"] and prev["ema_cmo"] < prev["sma_cmo"]
-        weekly_bearish = (
+        weekly_bearish = weekly_cmo_ready and (
             curr["weekly_ema_cmo"] < curr["weekly_sma_cmo"]
             and prev["weekly_ema_cmo"] < prev["weekly_sma_cmo"]
         )
