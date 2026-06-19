@@ -13,6 +13,23 @@ CMO_SMA_PERIOD = 11
 FRACTAL_LEFT_WINDOW = 2
 FRACTAL_RIGHT_WINDOW = 2
 
+# Minimum daily_lookback_days needed for weekly_sma_cmo to be non-NaN.
+# Chain: CMO needs CMO_PERIOD weekly bars, then SMA needs CMO_SMA_PERIOD more.
+# Add 1 because _to_weekly() drops the current incomplete week (+7 days buffer).
+WEEKLY_CMO_SMA_MIN_BARS = CMO_PERIOD + CMO_SMA_PERIOD + 1   # = 23 weekly bars
+MIN_DAILY_LOOKBACK_DAYS = WEEKLY_CMO_SMA_MIN_BARS * 7 + 14  # = 175 days (safe buffer)
+
+
+def validate_lookback(daily_lookback_days: int) -> None:
+    """Raise at engine startup if the lookback is too short for weekly SMA warmup."""
+    if daily_lookback_days < MIN_DAILY_LOOKBACK_DAYS:
+        raise ValueError(
+            f"daily_lookback_days={daily_lookback_days} is too short. "
+            f"weekly_sma_cmo needs {WEEKLY_CMO_SMA_MIN_BARS} complete weekly bars "
+            f"({MIN_DAILY_LOOKBACK_DAYS} days minimum). "
+            f"Set daily_lookback_days >= {MIN_DAILY_LOOKBACK_DAYS} in strategy.yaml."
+        )
+
 
 def _empty(symbol: str, reason: str) -> dict[str, Any]:
     return {

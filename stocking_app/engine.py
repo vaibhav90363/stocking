@@ -31,7 +31,7 @@ from .config import AppConfig, load_config
 from .data_fetcher import FetchResult, fetch_daily_bars_gen
 from .db import SignalRecord, TradingRepository, utc_now_iso
 from .market_schedule import market_status as get_market_status
-from .strategy import compute_symbol_signal
+from .strategy import compute_symbol_signal, validate_lookback
 
 
 # ── Logging setup ─────────────────────────────────────────────────────────────
@@ -125,6 +125,13 @@ class ScalableEngine:
         _mmap_thresh = os.environ.get('MALLOC_MMAP_THRESHOLD_', '(not set)')
         self.log.info(f"  Malloc      : ARENA_MAX={_arena}  MMAP_THRESHOLD={_mmap_thresh}")
         self.log.info("═" * 60)
+
+        # ── Startup guard: fail-fast if lookback is too short for weekly CMO SMA ──
+        try:
+            validate_lookback(cfg.daily_lookback_days)
+        except ValueError as _e:
+            self.log.error(f"ENGINE STARTUP FAILED: {_e}")
+            raise RuntimeError(str(_e)) from _e
 
         # ── Startup guard: fail-fast if DATABASE_URL is missing ─────────────
         if not cfg.database_url:
@@ -784,6 +791,21 @@ class ScalableEngine:
                 _price = p.get("signal_price") or p.get("last_price")
                 _price_str = f"{_price:.4f}" if _price is not None else "N/A"
                 self.log.info(f"       🔴 SELL  {p['symbol']:<16}  @ {_price_str}  [{p.get('signal_reason','')}]")
+
+        # Warn when a held position produced no signal due to indicator warmup.
+        # This means CMO values are NaN — the position is unprotected by exit logic.
+        _warmup_reasons = {"insufficient_rows_after_indicator_warmup", "insufficient_weekly_bars", "no_daily_candles"}
+        for p in compute_payloads:
+            if (
+                p["symbol"] in open_positions
+                and p.get("signal") is None
+                and p.get("signal_reason") in _warmup_reasons
+            ):
+                self.log.warning(
+                    f"       ⚠ HELD POSITION {p['symbol']} has no indicator data "
+                    f"(reason: {p.get('signal_reason')}) — CMO exit logic is inactive. "
+                    f"Check daily_lookback_days >= {self.cfg.daily_lookback_days} has sufficient history."
+                )
 
         position_prices: dict[str, tuple[float, str]] = {}
 
