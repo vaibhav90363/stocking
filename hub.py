@@ -916,8 +916,8 @@ with tab_perf:
                     "Strict Alpha vs Exposure",
                     "Exposure Alpha",
                 ])
-                .format({c: "{:,.2f}" for c in num_cols if c in summary_df.columns})
-                .format({c: "{:,.2f}%" for c in pct_cols if c in summary_df.columns}),
+                .format({c: "{:,.2f}" for c in num_cols if c in summary_df.columns}, na_rep="—")
+                .format({c: "{:,.2f}%" for c in pct_cols if c in summary_df.columns}, na_rep="—"),
             use_container_width=True,
             hide_index=True,
         )
