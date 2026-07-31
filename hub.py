@@ -52,6 +52,40 @@ if "strategy" in st.query_params:
 
 
 
+# ── Cached read wrappers ─────────────────────────────────────────────────────
+# EGRESS-FIX: this page previously had zero caching, so every 10s auto-refresh
+# — and any other widget interaction, since Streamlit reruns the whole script
+# on any of them — re-ran every query below unconditionally, once per
+# strategy card. Wrapping read-only repo calls in st.cache_data means
+# repeated calls within the TTL window reuse the last result instead of
+# re-querying Supabase. Arguments prefixed with an underscore are excluded
+# from Streamlit's cache-key hashing (needed for unhashable objects like
+# TradingRepository or StrategyConfig) — an explicit hashable key (e.g. a
+# suffix string) is passed alongside so different strategies still get
+# distinct cache entries.
+CACHE_TTL_SECONDS = 30
+
+
+@st.cache_data(ttl=CACHE_TTL_SECONDS)
+def _cached_read_df(_repo, sql, params=()):
+    return _repo.read_df(sql, params)
+
+
+@st.cache_data(ttl=CACHE_TTL_SECONDS)
+def _cached_get_recent_logs(_repo, limit, cache_key_suffix=""):
+    # cache_key_suffix (no leading underscore -> DOES count toward the cache
+    # key) must be passed (e.g. the strategy suffix) by any call site that
+    # loops over multiple repos/strategies in the same process — otherwise
+    # every strategy's card would collide onto one cached result, since
+    # _repo itself is excluded from the cache-key hash.
+    return _repo.get_recent_logs(limit)
+
+
+@st.cache_data(ttl=CACHE_TTL_SECONDS)
+def _cached_get_universe_summary(_repo):
+    return _repo.get_universe_summary()
+
+
 def _get_db_url() -> str:
     """Centralised DB URL resolution — avoids creating a load_config() per card."""
     from stocking_app.config import load_config
@@ -61,12 +95,18 @@ def _get_db_url() -> str:
 
 # ── Helper — read live state from a strategy's DB ─────────────────────────────
 def _read_strategy_state(sc: StrategyConfig) -> dict:
+    return _read_strategy_state_cached(sc, sc.suffix)
+
+
+@st.cache_data(ttl=CACHE_TTL_SECONDS)
+def _read_strategy_state_cached(_sc: StrategyConfig, cache_key_suffix: str) -> dict:
     """Read live state using TradingRepository (pooled connections).
 
     BUG-TIMEOUT-11 fix: previously used raw psycopg2.connect() per card,
     creating un-pooled connections that could exhaust Supabase limits.
     """
     from stocking_app.db import TradingRepository
+    sc = _sc
     db_url = _get_db_url()
 
     result = {
@@ -249,9 +289,15 @@ def _deployed_capital_series(trades: pd.DataFrame, dates: list) -> tuple[pd.Seri
 
 
 def _read_strategy_performance(sc: StrategyConfig) -> dict:
+    return _read_strategy_performance_cached(sc, sc.suffix)
+
+
+@st.cache_data(ttl=CACHE_TTL_SECONDS)
+def _read_strategy_performance_cached(_sc: StrategyConfig, cache_key_suffix: str) -> dict:
     """Compute live strategy-vs-index performance from Supabase/Postgres."""
     from stocking_app.db import TradingRepository
 
+    sc = _sc
     db_url = _get_db_url()
     benchmark_name, benchmark_symbol, fallbacks = _BENCHMARKS.get(
         sc.suffix,
@@ -436,9 +482,9 @@ with st.sidebar:
     st.caption("Manages all strategy instances")
     if st.button("🔄 Refresh", use_container_width=True):
         st.rerun()
-    auto = st.checkbox("⏱ Auto-refresh (10s)", value=False)
+    auto = st.checkbox("⏱ Auto-refresh (30s)", value=False)
     if auto:
-        st_autorefresh(interval=10 * 1000, key="hub_refresh")
+        st_autorefresh(interval=30 * 1000, key="hub_refresh")
     st.divider()
     st.markdown("### 📊 Strategy Dashboards")
     strat_dirs = [
@@ -628,7 +674,7 @@ with tab_strategies:
                     from stocking_app.db import TradingRepository as _TRLog
                     _cfg_log = load_config()
                     _repo_log = _TRLog(_cfg_log.database_url or _cfg_log.db_path, suffix=sc.suffix)
-                    _log_df = _repo_log.get_recent_logs(limit=10)
+                    _log_df = _cached_get_recent_logs(_repo_log, 10, sc.suffix)
                     _repo_log.close()
                     if not _log_df.empty:
                         lines = _log_df["message"].tolist()
@@ -1015,7 +1061,7 @@ with tab_health:
             from stocking_app.db import TradingRepository as _TR
             _cfg_h = _lc()
             _repo_h = _TR(_cfg_h.database_url or _cfg_h.db_path)
-            _uni = _repo_h.get_universe_summary()
+            _uni = _cached_get_universe_summary(_repo_h)
             _repo_h.close()
             st.markdown(_badge(True, "✅ Connected"), unsafe_allow_html=True)
             st.caption(f"Universe: **{_uni['total']}** symbols · **{_uni['active']}** active")
@@ -1116,7 +1162,7 @@ with tab_health:
             st.markdown(f"**{_cyc_sc.name}** (`{_cyc_sc.suffix}`):")
             try:
                 _repo_c = _TRC(_cfg_c.database_url or _cfg_c.db_path, suffix=_cyc_sc.suffix)
-                _cyc_df = _repo_c.read_df("""
+                _cyc_df = _cached_read_df(_repo_c, """
                         SELECT
                             run_started_at,
                             status,
@@ -1171,7 +1217,7 @@ with tab_health:
         _counts = {}
         for _t in _tables:
             try:
-                _df_t = _repo5.read_df(f"SELECT COUNT(*) AS n FROM {_t}")
+                _df_t = _cached_read_df(_repo5, f"SELECT COUNT(*) AS n FROM {_t}")
                 _counts[_t] = int(_df_t["n"].iloc[0]) if not _df_t.empty else 0
             except Exception:
                 _counts[_t] = "—"
@@ -1233,7 +1279,7 @@ with tab_reset:
         _row_counts: dict[str, int] = {}
         for _rt in _reset_tables:
             try:
-                _rc_df = _repo_r.read_df(f"SELECT COUNT(*) AS n FROM {_rt}")
+                _rc_df = _cached_read_df(_repo_r, f"SELECT COUNT(*) AS n FROM {_rt}")
                 _row_counts[_rt] = int(_rc_df["n"].iloc[0]) if not _rc_df.empty else 0
             except Exception:
                 _row_counts[_rt] = 0

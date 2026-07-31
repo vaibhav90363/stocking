@@ -10,7 +10,7 @@ import signal
 import threading
 import time
 from dataclasses import asdict, dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -180,6 +180,18 @@ class ScalableEngine:
         self._bootstrap_done = False
         self.DEAD_SYMBOL_THRESHOLD = 5
 
+        # EGRESS-FIX: in-process cache of each symbol's daily-bar window so the
+        # compute loop doesn't re-pull the full daily_lookback_days history from
+        # Supabase every cycle (see _get_chunk_bars). Reset on process restart,
+        # which happens at least nightly (NIGHTLY_RESTART_UTC_HOUR), so a stale
+        # or missing entry always just falls back to a full fetch.
+        self._candle_cache: dict[str, pd.DataFrame] = {}
+        # Small buffer window for incremental cache refreshes — big enough to
+        # bridge a weekend/holiday gap, small relative to daily_lookback_days
+        # (e.g. 120), and always well under one engine's ~24h max lifetime
+        # between nightly restarts so no data can fall through the gap.
+        self.CACHE_DELTA_LOOKBACK_DAYS = 5
+
     @staticmethod
     def _get_current_rss_mb() -> float:
         """Return current RSS in MB. Uses /proc/self/status on Linux for
@@ -217,6 +229,65 @@ class ScalableEngine:
             libc.malloc_trim(0)
         except (OSError, AttributeError):
             pass  # macOS / non-glibc — gc.collect() alone is fine for dev
+
+    def _get_chunk_bars(self, chunk_syms: list[str]) -> dict[str, pd.DataFrame]:
+        """Fetch daily bars for a chunk of symbols, using self._candle_cache to
+        avoid re-pulling the full daily_lookback_days window from Supabase on
+        every cycle.
+
+        EGRESS-FIX: previously every cycle re-fetched the entire lookback
+        window (e.g. 120 days) for every symbol pending compute — and since
+        Yahoo's current-day candle updates every 5 minutes, that was ~all
+        symbols, every cycle, all day. Symbols already warm in the cache now
+        only pull a small recent delta (CACHE_DELTA_LOOKBACK_DAYS) that gets
+        merged into the cached frame, cutting per-cycle network transfer from
+        O(daily_lookback_days) to O(days since the last cache hit) rows per
+        symbol. First-time (cold) symbols still get the full fetch.
+
+        NOTE: compute_all_indicators() mutates its input DataFrame in place
+        (adds cmo/ema_cmo/sma_cmo columns) — harmless when the frame is
+        discarded every cycle, but it would silently pollute self._candle_cache
+        now that the same object persists across cycles. So every DataFrame
+        handed back to the caller is a cheap shallow copy (shares the
+        underlying column arrays, no data duplication) — new-column
+        assignment on a shallow copy creates a new block there without
+        touching the cached original.
+        """
+        fresh_syms = [s for s in chunk_syms if s not in self._candle_cache]
+        cached_syms = [s for s in chunk_syms if s in self._candle_cache]
+
+        if fresh_syms:
+            full = self.repo.get_combined_bars_for_symbols(
+                fresh_syms, daily_lookback_days=self.cfg.daily_lookback_days,
+            )
+            self._candle_cache.update(full)
+
+        if cached_syms:
+            delta = self.repo.get_combined_bars_for_symbols(
+                cached_syms, daily_lookback_days=self.CACHE_DELTA_LOOKBACK_DAYS,
+            )
+            cutoff = (
+                datetime.now(timezone.utc) - timedelta(days=self.cfg.daily_lookback_days)
+            ).replace(hour=0, minute=0, second=0, microsecond=0)
+
+            for sym in cached_syms:
+                new_rows = delta.get(sym)
+                if new_rows is None or new_rows.empty:
+                    continue  # nothing new this cycle — keep the existing cached frame
+
+                existing = self._candle_cache[sym]
+                if existing.empty:
+                    # existing is a columnless placeholder (symbol had no data before) —
+                    # concatenating with it triggers a pandas empty/all-NA concat warning,
+                    # so just take the new rows directly instead.
+                    merged = new_rows
+                else:
+                    merged = pd.concat([existing, new_rows])
+                    merged = merged[~merged.index.duplicated(keep="last")].sort_index()
+                merged = merged[merged.index >= cutoff]
+                self._candle_cache[sym] = merged
+
+        return {sym: self._candle_cache[sym].copy(deep=False) for sym in chunk_syms if sym in self._candle_cache}
 
     def stop(self) -> None:
         self._running = False
@@ -706,11 +777,8 @@ class ScalableEngine:
         for chunk_start in range(0, total_to_compute, COMPUTE_CHUNK):
             chunk_syms = symbols_to_compute[chunk_start : chunk_start + COMPUTE_CHUNK]
 
-            # Load candles for this chunk only
-            chunk_bars = self.repo.get_combined_bars_for_symbols(
-                chunk_syms,
-                daily_lookback_days=self.cfg.daily_lookback_days,
-            )
+            # Load candles for this chunk only (cache-aware — see _get_chunk_bars)
+            chunk_bars = self._get_chunk_bars(chunk_syms)
 
             for symbol in chunk_syms:
                 df_symbol = chunk_bars.pop(symbol, None)

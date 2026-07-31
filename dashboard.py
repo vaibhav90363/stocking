@@ -13,6 +13,43 @@ from streamlit_autorefresh import st_autorefresh
 from stocking_app.config import load_config
 from stocking_app.db import TradingRepository
 
+# ── Cached read wrappers ─────────────────────────────────────────────────────
+# EGRESS-FIX: this page previously had zero caching, so every 10s auto-refresh
+# — and any other widget interaction, since Streamlit reruns the whole script
+# on any of them — re-ran every query below unconditionally. Wrapping
+# read-only repo calls in st.cache_data means repeated calls within the TTL
+# window reuse the last result instead of re-querying Supabase. `_repo` is
+# prefixed with an underscore so Streamlit doesn't try to hash the
+# (unhashable) repository object — only the SQL/params/limit determine the
+# cache key.
+CACHE_TTL_SECONDS = 30
+
+
+@st.cache_data(ttl=CACHE_TTL_SECONDS)
+def _cached_read_df(_repo, sql, params=()):
+    return _repo.read_df(sql, params)
+
+
+@st.cache_data(ttl=CACHE_TTL_SECONDS)
+def _cached_get_universe_summary(_repo):
+    return _repo.get_universe_summary()
+
+
+@st.cache_data(ttl=CACHE_TTL_SECONDS)
+def _cached_get_open_positions(_repo):
+    return _repo.get_open_positions()
+
+
+@st.cache_data(ttl=CACHE_TTL_SECONDS)
+def _cached_get_recent_logs(_repo, limit):
+    return _repo.get_recent_logs(limit)
+
+
+@st.cache_data(ttl=60)
+def _cached_get_combined_bars(_repo, symbols, daily_lookback_days):
+    return _repo.get_combined_bars_for_symbols(list(symbols), daily_lookback_days)
+
+
 # ── Page Config ───────────────────────────────────────────────────────────────
 if not st.session_state.get("_hub_hosted", False):
     st.set_page_config(
@@ -189,9 +226,9 @@ def run_dashboard(strategy_name_or_path=None):
             st.markdown(f"**{k}:** `{v}`")
 
         st.divider()
-        auto = st.checkbox("⏱ Auto-refresh (10s)", value=False)
+        auto = st.checkbox("⏱ Auto-refresh (30s)", value=False)
         if auto:
-            st_autorefresh(interval=10 * 1000, key="dash_refresh")
+            st_autorefresh(interval=30 * 1000, key="dash_refresh")
         if st.button("🔄 Refresh now", use_container_width=True):
             st.rerun()
 
@@ -204,11 +241,12 @@ def run_dashboard(strategy_name_or_path=None):
     )
 
     # Pull top-level numbers
-    uni_summary  = repo.get_universe_summary()
-    open_pos_map = repo.get_open_positions()
+    uni_summary  = _cached_get_universe_summary(repo)
+    open_pos_map = _cached_get_open_positions(repo)
     n_open       = len(open_pos_map)
 
-    pnl_snap = repo.read_df(
+    pnl_snap = _cached_read_df(
+        repo,
         "SELECT realized_pnl, unrealized_pnl, total_pnl FROM pnl_snapshots WHERE suffix=%s ORDER BY ts DESC LIMIT 1",
         (cfg.ticker_suffix,)
     )
@@ -216,7 +254,8 @@ def run_dashboard(strategy_name_or_path=None):
     unrealized = float(pnl_snap["unrealized_pnl"].iloc[0]) if not pnl_snap.empty else 0.0
     total_pnl  = float(pnl_snap["total_pnl"].iloc[0])      if not pnl_snap.empty else 0.0
 
-    latest_run = repo.read_df(
+    latest_run = _cached_read_df(
+        repo,
         "SELECT * FROM run_metrics WHERE suffix=%s ORDER BY id DESC LIMIT 1",
         (cfg.ticker_suffix,)
     )
@@ -292,7 +331,8 @@ def run_dashboard(strategy_name_or_path=None):
             st.info("No cycle data yet — engine hasn't run a full cycle.")
 
         st.markdown('<p class="section-header">Cycle History (last 50)</p>', unsafe_allow_html=True)
-        history = repo.read_df(
+        history = _cached_read_df(
+            repo,
             """
             SELECT id AS cycle,
                    SUBSTR(CAST(run_started_at AS TEXT),1,19) AS started,
@@ -325,7 +365,8 @@ def run_dashboard(strategy_name_or_path=None):
             )
 
         st.markdown('<p class="section-header">P&L Over Time</p>', unsafe_allow_html=True)
-        pnl_hist = repo.read_df(
+        pnl_hist = _cached_read_df(
+            repo,
             """
             SELECT ts, realized_pnl, unrealized_pnl, total_pnl
             FROM pnl_snapshots WHERE suffix = %s ORDER BY ts ASC LIMIT 500
@@ -345,7 +386,8 @@ def run_dashboard(strategy_name_or_path=None):
     with tab_portfolio:
         st.markdown('<p class="section-header">Open Positions</p>', unsafe_allow_html=True)
 
-        positions = repo.read_df(
+        positions = _cached_read_df(
+            repo,
             """
             SELECT symbol,
                    qty,
@@ -419,7 +461,8 @@ def run_dashboard(strategy_name_or_path=None):
         st.markdown('<p class="section-header">Symbol Sync Status</p>', unsafe_allow_html=True)
         st.caption("Shows when data was last fetched (candles) and last computed (signals) for each symbol.")
 
-        sync_df = repo.read_df(
+        sync_df = _cached_read_df(
+            repo,
             """
             SELECT
                 u.symbol,
@@ -601,7 +644,8 @@ def run_dashboard(strategy_name_or_path=None):
             st.info("No active symbols in universe.")
         else:
             # Get list of all active symbols
-            active_df = repo.read_df(
+            active_df = _cached_read_df(
+                repo,
                 "SELECT symbol FROM universe WHERE is_active=1 AND symbol LIKE %s ORDER BY symbol",
                 (f"%{cfg.ticker_suffix}",)
             )
@@ -614,9 +658,10 @@ def run_dashboard(strategy_name_or_path=None):
                 if selected_symbol:
                     with st.spinner(f"Loading data for {selected_symbol}..."):
                         # Fetch the raw daily bars
-                        daily_bars_dict = repo.get_combined_bars_for_symbols(
-                            [selected_symbol],
-                            daily_lookback_days=cfg.daily_lookback_days
+                        daily_bars_dict = _cached_get_combined_bars(
+                            repo,
+                            (selected_symbol,),
+                            cfg.daily_lookback_days,
                         )
                         
                         daily = daily_bars_dict.get(selected_symbol)
@@ -820,7 +865,8 @@ def run_dashboard(strategy_name_or_path=None):
     with tab_signals:
         st.markdown('<p class="section-header">Signal Summary</p>', unsafe_allow_html=True)
 
-        sig_summary = repo.read_df(
+        sig_summary = _cached_read_df(
+            repo,
             """
             SELECT
                 signal_type,
@@ -843,7 +889,8 @@ def run_dashboard(strategy_name_or_path=None):
         sig_filter = st.multiselect("Filter by type", ["BUY", "SELL"], default=["BUY", "SELL"])
         acted_filter = st.checkbox("Acted only", value=False)
 
-        signals = repo.read_df(
+        signals = _cached_read_df(
+            repo,
             """
             SELECT id, symbol, SUBSTR(ts,1,19) AS ts, signal_type, ROUND(price::NUMERIC,4) AS price, reason, acted
             FROM signals
@@ -883,7 +930,8 @@ def run_dashboard(strategy_name_or_path=None):
     with tab_ledger:
         st.markdown('<p class="section-header">Trade Activity Log</p>', unsafe_allow_html=True)
 
-        trades = repo.read_df(
+        trades = _cached_read_df(
+            repo,
             """
             SELECT id,
                    symbol,
@@ -1002,7 +1050,7 @@ def run_dashboard(strategy_name_or_path=None):
         n_lines = st.slider("Lines to show", min_value=20, max_value=500, value=100, step=20)
 
         # Read from Supabase instead of local file system
-        logs_df = repo.get_recent_logs(limit=n_lines)
+        logs_df = _cached_get_recent_logs(repo, n_lines)
         
         if not logs_df.empty:
             # Construct a code block to simulate a terminal view
